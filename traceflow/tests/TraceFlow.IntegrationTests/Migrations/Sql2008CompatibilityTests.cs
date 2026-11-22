@@ -39,8 +39,8 @@ public class Sql2008CompatibilityTests : IClassFixture<Sql2008Fixture>
         var root = Path.Combine(AppContext.BaseDirectory, "db", "migrations");
         Assert.True(Directory.Exists(root), $"迁移脚本目录不存在: {root}");
         var files = Directory.GetFiles(root, "*.sql");
-        // 门禁必须覆盖全部已交付脚本（0001–0006），防止漏扫。
-        foreach (var prefix in new[] { "0001", "0002", "0003", "0004", "0005", "0006" })
+        // 门禁必须覆盖全部已交付脚本（0001–0007），防止漏扫。
+        foreach (var prefix in new[] { "0001", "0002", "0003", "0004", "0005", "0006", "0007" })
             Assert.Contains(files, f => Path.GetFileName(f).StartsWith(prefix + "_", StringComparison.OrdinalIgnoreCase));
 
         var forbidden = new[]
