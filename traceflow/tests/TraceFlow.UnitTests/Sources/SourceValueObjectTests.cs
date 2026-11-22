@@ -49,6 +49,34 @@ public class SourceValueObjectTests
     }
 
     [Fact]
+    public void Line_hash_delimiter_shift_does_not_collide()
+    {
+        // 自由文本含 "|" 不得把内容挪过字段边界（SYNC-01/02 变更检测依赖此哈希）。
+        var a = SourceHasher.LineHash("1", "SP0001", 2m, "盒|P1", "", "2027-05", "81234567890123456789", "SALE");
+        var b = SourceHasher.LineHash("1", "SP0001", 2m, "盒", "P1", "2027-05", "81234567890123456789", "SALE");
+        Assert.NotEqual(a, b);
+    }
+
+    [Fact]
+    public void Line_hash_pipe_in_batch_does_not_collide()
+    {
+        // 未转义时两行拼接串完全相同（盒|P1|2027-05|...），真实碰撞 → 行变更漏检。
+        var a = SourceHasher.LineHash("1", "SP0001", 2m, "盒|P1", "2027-05", "8123", "T", "SALE");
+        var b = SourceHasher.LineHash("1", "SP0001", 2m, "盒", "P1|2027-05", "8123", "T", "SALE");
+        Assert.NotEqual(a, b);
+    }
+
+    [Fact]
+    public void Line_hash_backslash_escape_does_not_collide()
+    {
+        // 若只转义 "|" 而不加倍 "\"：A 的 unit 尾随反斜杠+分隔符 与 B 的转义竖线同为 盒\|P1，
+        // 且尾部 SALE\|X 与 SALE\+分隔符+X 同形 → 拼接串碰撞。反斜杠必须先加倍。
+        var a = SourceHasher.LineHash("1", "SP0001", 2m, @"盒\", "P1", "", "", "SALE|X");
+        var b = SourceHasher.LineHash("1", "SP0001", 2m, "盒|P1", "", "", @"SALE\", "X");
+        Assert.NotEqual(a, b);
+    }
+
+    [Fact]
     public void Document_hash_order_insensitive_via_sorted_inputs()
     {
         var a = SourceHasher.DocumentHash("000123", new DateTime(2026, 11, 20, 6, 0, 0, DateTimeKind.Utc), new[] { "aa", "bb" });

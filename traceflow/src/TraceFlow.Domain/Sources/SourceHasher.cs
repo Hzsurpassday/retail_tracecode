@@ -9,13 +9,16 @@ public static class SourceHasher
 {
     public static string LineHash(string lineKey, string productId, decimal qty, string? unit,
         string? batch, string? expiry, string? traceCodeRaw, string eventKind)
-        => Sha(string.Join("|", lineKey, productId,
-            qty.ToString("0.000000", CultureInfo.InvariantCulture),
-            unit ?? "", batch ?? "", expiry ?? "", traceCodeRaw ?? "", eventKind));
+        => Sha(string.Join("|", Esc(lineKey), Esc(productId),
+            Esc(qty.ToString("0.000000", CultureInfo.InvariantCulture)),
+            Esc(unit), Esc(batch), Esc(expiry), Esc(traceCodeRaw), Esc(eventKind)));
 
     public static string DocumentHash(string docKey, DateTime? businessUtc, IReadOnlyList<string> sortedLineHashes)
-        => Sha(docKey + "|" + (businessUtc?.ToString("yyyy-MM-ddTHH:mm:ss.fff", CultureInfo.InvariantCulture) ?? "")
+        => Sha(Esc(docKey) + "|" + Esc(businessUtc?.ToString("yyyy-MM-ddTHH:mm:ss.fff", CultureInfo.InvariantCulture))
             + "|" + string.Join(";", sortedLineHashes));
+
+    // 自由文本可能含 "|" 或 "\"：先加倍反斜杠再转义竖线，杜绝字段边界挪移碰撞（所有拼接段统一转义）。
+    private static string Esc(string? s) => (s ?? "").Replace("\\", "\\\\").Replace("|", "\\|");
 
     private static string Sha(string s) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(s)));
 }
