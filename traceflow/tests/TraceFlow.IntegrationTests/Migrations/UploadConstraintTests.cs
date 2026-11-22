@@ -29,10 +29,10 @@ public class UploadConstraintTests : IClassFixture<Sql2008Fixture>
         await using var c = await _fx.OpenAsync();
         var orgId = await SeedOrgAsync(c);
         await c.ExecuteAsync(@"INSERT INTO dbo.upload_task(org_id,env,event_key,task_type,source_hash,payload_hash,state)
-                               VALUES(@orgId,N'LIVE',N'O1|KSOA|L1|SALE',N'RETAIL_321',REPLICATE('a',64),REPLICATE('b',64),N'BLOCKED')", new { orgId });
+                               VALUES(@orgId,N'LIVE',N'O1|KSOA|L1|SALE',N'RETAIL_321',REPLICATE('a',64),REPLICATE('b',64),N'Blocked')", new { orgId });
         var ex = await Assert.ThrowsAsync<SqlException>(() => c.ExecuteAsync(
             @"INSERT INTO dbo.upload_task(org_id,env,event_key,task_type,source_hash,payload_hash,state)
-              VALUES(@orgId,N'LIVE',N'O1|KSOA|L1|SALE',N'RETAIL_321',REPLICATE('c',64),REPLICATE('d',64),N'BLOCKED')", new { orgId }));
+              VALUES(@orgId,N'LIVE',N'O1|KSOA|L1|SALE',N'RETAIL_321',REPLICATE('c',64),REPLICATE('d',64),N'Blocked')", new { orgId }));
         Assert.True(ex.Number is 2601 or 2627);
     }
 
@@ -42,9 +42,9 @@ public class UploadConstraintTests : IClassFixture<Sql2008Fixture>
         await using var c = await _fx.OpenAsync();
         var orgId = await SeedOrgAsync(c);
         await c.ExecuteAsync(@"INSERT INTO dbo.upload_task(org_id,env,event_key,task_type,source_hash,payload_hash,state)
-                               VALUES(@orgId,N'LIVE',N'O1|KSOA|L2|SALE',N'RETAIL_321',REPLICATE('a',64),REPLICATE('b',64),N'BLOCKED')", new { orgId });
+                               VALUES(@orgId,N'LIVE',N'O1|KSOA|L2|SALE',N'RETAIL_321',REPLICATE('a',64),REPLICATE('b',64),N'Blocked')", new { orgId });
         await c.ExecuteAsync(@"INSERT INTO dbo.upload_task(org_id,env,event_key,task_type,source_hash,payload_hash,state)
-                               VALUES(@orgId,N'MOCK',N'O1|KSOA|L2|SALE',N'RETAIL_321',REPLICATE('a',64),REPLICATE('b',64),N'BLOCKED')", new { orgId });
+                               VALUES(@orgId,N'MOCK',N'O1|KSOA|L2|SALE',N'RETAIL_321',REPLICATE('a',64),REPLICATE('b',64),N'Blocked')", new { orgId });
     }
 
     [Fact]
@@ -53,16 +53,16 @@ public class UploadConstraintTests : IClassFixture<Sql2008Fixture>
         await using var c = await _fx.OpenAsync();
         var orgId = await SeedOrgAsync(c);
         var taskId = await c.ExecuteScalarAsync<long>(@"INSERT INTO dbo.upload_task(org_id,env,event_key,task_type,source_hash,payload_hash,state)
-            OUTPUT inserted.id VALUES(@orgId,N'LIVE',N'O1|KSOA|L3|SALE',N'RETAIL_321',REPLICATE('a',64),REPLICATE('b',64),N'BLOCKED')", new { orgId });
+            OUTPUT inserted.id VALUES(@orgId,N'LIVE',N'O1|KSOA|L3|SALE',N'RETAIL_321',REPLICATE('a',64),REPLICATE('b',64),N'Blocked')", new { orgId });
         await c.ExecuteAsync(@"INSERT INTO dbo.upload_part(task_id,org_id,env,part_index,bill_code,payload_json,payload_hash,code_set_hash,state)
-                               VALUES(@taskId,@orgId,N'LIVE',0,N'TF1',N'{}',REPLICATE('b',64),REPLICATE('c',64),N'BLOCKED')", new { taskId, orgId });
+                               VALUES(@taskId,@orgId,N'LIVE',0,N'TF1',N'{}',REPLICATE('b',64),REPLICATE('c',64),N'Blocked')", new { taskId, orgId });
         var ex = await Assert.ThrowsAsync<SqlException>(() => c.ExecuteAsync(
             @"INSERT INTO dbo.upload_part(task_id,org_id,env,part_index,bill_code,payload_json,payload_hash,code_set_hash,state)
-              VALUES(@taskId,@orgId,N'LIVE',1,N'TF1',N'{}',REPLICATE('b',64),REPLICATE('c',64),N'BLOCKED')", new { taskId, orgId }));
+              VALUES(@taskId,@orgId,N'LIVE',1,N'TF1',N'{}',REPLICATE('b',64),REPLICATE('c',64),N'Blocked')", new { taskId, orgId }));
         Assert.True(ex.Number is 2601 or 2627); // UQ_part_billcode（org+env+bill_code，IDEM-02）
         var ex2 = await Assert.ThrowsAsync<SqlException>(() => c.ExecuteAsync(
             @"INSERT INTO dbo.upload_part(task_id,org_id,env,part_index,bill_code,payload_json,payload_hash,code_set_hash,state)
-              VALUES(@taskId,@orgId,N'LIVE',0,N'TF1-DUP',N'{}',REPLICATE('b',64),REPLICATE('c',64),N'BLOCKED')", new { taskId, orgId }));
+              VALUES(@taskId,@orgId,N'LIVE',0,N'TF1-DUP',N'{}',REPLICATE('b',64),REPLICATE('c',64),N'Blocked')", new { taskId, orgId }));
         Assert.True(ex2.Number is 2601 or 2627); // UQ_part_index（task+part_index）
     }
 
@@ -72,9 +72,9 @@ public class UploadConstraintTests : IClassFixture<Sql2008Fixture>
         await using var c = await _fx.OpenAsync();
         var orgId = await SeedOrgAsync(c);
         var taskId = await c.ExecuteScalarAsync<long>(@"INSERT INTO dbo.upload_task(org_id,env,event_key,task_type,source_hash,payload_hash,state)
-            OUTPUT inserted.id VALUES(@orgId,N'LIVE',N'O1|KSOA|L4|SALE',N'RETAIL_321',REPLICATE('a',64),REPLICATE('b',64),N'BLOCKED')", new { orgId });
+            OUTPUT inserted.id VALUES(@orgId,N'LIVE',N'O1|KSOA|L4|SALE',N'RETAIL_321',REPLICATE('a',64),REPLICATE('b',64),N'Blocked')", new { orgId });
         var partId = await c.ExecuteScalarAsync<long>(@"INSERT INTO dbo.upload_part(task_id,org_id,env,part_index,bill_code,payload_json,payload_hash,code_set_hash,state)
-            OUTPUT inserted.id VALUES(@taskId,@orgId,N'LIVE',0,N'TF2',N'{}',REPLICATE('b',64),REPLICATE('c',64),N'BLOCKED')", new { taskId, orgId });
+            OUTPUT inserted.id VALUES(@taskId,@orgId,N'LIVE',0,N'TF2',N'{}',REPLICATE('b',64),REPLICATE('c',64),N'Blocked')", new { taskId, orgId });
         var codeId = await c.ExecuteScalarAsync<long>("INSERT INTO dbo.trace_code(code_normalized,code_raw,format) OUTPUT inserted.id VALUES(N'81234567890123456705',N'81234567890123456705',N'Supported')");
         var attemptId = await c.ExecuteScalarAsync<long>(@"INSERT INTO dbo.upload_attempt(task_id,part_id,attempt_no,attempt_kind,env,fencing_token)
             OUTPUT inserted.id VALUES(@taskId,@partId,1,N'QUERY',N'LIVE',1)", new { taskId, partId });

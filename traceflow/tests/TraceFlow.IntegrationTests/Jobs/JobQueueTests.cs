@@ -1,6 +1,7 @@
 using Dapper;
 using Microsoft.Data.SqlClient;
 using TraceFlow.Infrastructure.Jobs;
+using TraceFlow.Infrastructure.Security;
 using Xunit;
 
 namespace TraceFlow.IntegrationTests.Jobs;
@@ -28,7 +29,7 @@ public class JobQueueTests : IClassFixture<Sql2008Fixture>
     {
         await using var c = await _fx.OpenAsync();
         var orgId = await SeedOrgAsync(c);
-        var q = new JobQueue(_fx.ConnectionString);
+        var q = new JobQueue(_fx.ConnectionString, new AuditLog());
         await using var tx = (SqlTransaction)await c.BeginTransactionAsync();
         var id = await q.EnqueueAsync(c, tx, orgId, env, kind, intent, null, null, default);
         await tx.CommitAsync();
@@ -40,8 +41,8 @@ public class JobQueueTests : IClassFixture<Sql2008Fixture>
     {
         var kind = NewKind("tj-");
         var id = await SeedJobAsync(kind, "claim-race-" + Guid.NewGuid());
-        var q1 = new JobQueue(_fx.ConnectionString);
-        var q2 = new JobQueue(_fx.ConnectionString);
+        var q1 = new JobQueue(_fx.ConnectionString, new AuditLog());
+        var q2 = new JobQueue(_fx.ConnectionString, new AuditLog());
         var t1 = q1.ClaimAsync("w1", "LIVE", new[] { kind }, TimeSpan.FromMinutes(5), default);
         var t2 = q2.ClaimAsync("w2", "LIVE", new[] { kind }, TimeSpan.FromMinutes(5), default);
         var results = await Task.WhenAll(t1, t2);
@@ -56,7 +57,7 @@ public class JobQueueTests : IClassFixture<Sql2008Fixture>
     {
         var kind = NewKind("tj-");
         var id = await SeedJobAsync(kind, "complete-" + Guid.NewGuid());
-        var q = new JobQueue(_fx.ConnectionString);
+        var q = new JobQueue(_fx.ConnectionString, new AuditLog());
         var claim = await q.ClaimAsync("w1", "LIVE", new[] { kind }, TimeSpan.FromMinutes(5), default);
         Assert.NotNull(claim);
         Assert.Equal(id, claim!.Id);
@@ -70,7 +71,7 @@ public class JobQueueTests : IClassFixture<Sql2008Fixture>
     {
         var kind = NewKind("tj-");
         var id = await SeedJobAsync(kind, "lease-" + Guid.NewGuid());
-        var q = new JobQueue(_fx.ConnectionString);
+        var q = new JobQueue(_fx.ConnectionString, new AuditLog());
         var first = await q.ClaimAsync("w1", "LIVE", new[] { kind }, TimeSpan.FromMinutes(5), default);
         Assert.NotNull(first);
         Assert.Equal(id, first!.Id);
@@ -104,7 +105,7 @@ public class JobQueueTests : IClassFixture<Sql2008Fixture>
     {
         var kind = NewKind("tj-");
         var id = await SeedJobAsync(kind, "resched-" + Guid.NewGuid());
-        var q = new JobQueue(_fx.ConnectionString);
+        var q = new JobQueue(_fx.ConnectionString, new AuditLog());
         var claim = await q.ClaimAsync("w1", "LIVE", new[] { kind }, TimeSpan.FromMinutes(5), default);
         Assert.NotNull(claim);
         Assert.Equal(id, claim!.Id);
@@ -123,7 +124,7 @@ public class JobQueueTests : IClassFixture<Sql2008Fixture>
         var intent = "rollback-" + Guid.NewGuid();
         await using var c = await _fx.OpenAsync();
         var orgId = await SeedOrgAsync(c);
-        var q = new JobQueue(_fx.ConnectionString);
+        var q = new JobQueue(_fx.ConnectionString, new AuditLog());
         await using (var tx = (SqlTransaction)await c.BeginTransactionAsync())
         {
             await q.EnqueueAsync(c, tx, orgId, "LIVE", kind, intent, null, null, default);
@@ -139,7 +140,7 @@ public class JobQueueTests : IClassFixture<Sql2008Fixture>
         var kind = NewKind("te-");
         var intent = "env-" + Guid.NewGuid();
         var id = await SeedJobAsync(kind, intent, "MOCK");
-        var q = new JobQueue(_fx.ConnectionString);
+        var q = new JobQueue(_fx.ConnectionString, new AuditLog());
         Assert.Null(await q.ClaimAsync("w1", "LIVE", new[] { kind }, TimeSpan.FromMinutes(5), default));
         var mock = await q.ClaimAsync("w1", "MOCK", new[] { kind }, TimeSpan.FromMinutes(5), default);
         Assert.NotNull(mock);
@@ -153,7 +154,7 @@ public class JobQueueTests : IClassFixture<Sql2008Fixture>
         var kind = NewKind("tr-");
         await using var c = await _fx.OpenAsync();
         var orgId = await SeedOrgAsync(c);
-        var q = new JobQueue(_fx.ConnectionString);
+        var q = new JobQueue(_fx.ConnectionString, new AuditLog());
         long genericId, uploadId;
         await using (var tx = (SqlTransaction)await c.BeginTransactionAsync())
         {
@@ -181,7 +182,7 @@ public class JobQueueTests : IClassFixture<Sql2008Fixture>
     {
         var kind = NewKind("tj-");
         var id = await SeedJobAsync(kind, "fail-" + Guid.NewGuid());
-        var q = new JobQueue(_fx.ConnectionString);
+        var q = new JobQueue(_fx.ConnectionString, new AuditLog());
         var claim = await q.ClaimAsync("w1", "LIVE", new[] { kind }, TimeSpan.FromMinutes(5), default);
         Assert.NotNull(claim);
         Assert.Equal(id, claim!.Id);

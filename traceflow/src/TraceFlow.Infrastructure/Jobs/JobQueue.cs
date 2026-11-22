@@ -7,7 +7,12 @@ namespace TraceFlow.Infrastructure.Jobs;
 public sealed class JobQueue : IJobQueue
 {
     private readonly string _conn;
-    public JobQueue(string connectionString) => _conn = connectionString;
+    private readonly IAuditLog _audit;
+    public JobQueue(string connectionString, IAuditLog audit)
+    {
+        _conn = connectionString;
+        _audit = audit;
+    }
 
     public async Task<long> EnqueueAsync(SqlConnection conn, SqlTransaction tx, long orgId, string env,
         string jobKind, string intentKey, string? payloadJson, DateTime? nextRunAtUtc, CancellationToken ct)
@@ -86,10 +91,30 @@ OUTPUT inserted.id AS Id, inserted.job_kind AS JobKind, inserted.intent_key AS I
     {
         await using var conn = new SqlConnection(_conn);
         await conn.OpenAsync(ct);
+        await using var tx = (SqlTransaction)await conn.BeginTransactionAsync(ct);
         // upload-dispatch 失租不在此回收：必须走发送恢复→受理未知→回查（JOB-02）
-        return await conn.ExecuteAsync(@"
+        var expired = (await conn.QueryAsync<(long Id, string JobKind, string IntentKey, string Env, string? LeaseOwner)>(@"
+SELECT id AS Id, job_kind AS JobKind, intent_key AS IntentKey, env AS Env, lease_owner AS LeaseOwner
+FROM dbo.outbox_job WITH (UPDLOCK, READPAST)
+WHERE job_state = N'RUNNING' AND lease_until < SYSUTCDATETIME() AND job_kind <> N'upload-dispatch'",
+            transaction: tx)).ToList();
+        if (expired.Count == 0)
+        {
+            await tx.CommitAsync(ct);
+            return 0;
+        }
+        var rows = await conn.ExecuteAsync(@"
 UPDATE dbo.outbox_job
 SET job_state=N'PENDING', lease_owner=NULL, lease_until=NULL, next_run_at=SYSUTCDATETIME()
-WHERE job_state=N'RUNNING' AND lease_until < SYSUTCDATETIME() AND job_kind <> N'upload-dispatch'");
+WHERE job_state=N'RUNNING' AND lease_until < SYSUTCDATETIME() AND job_kind <> N'upload-dispatch'",
+            transaction: tx);
+        // 设计 §4.8：租约回收事件只读留痕（M0 携带 5）
+        foreach (var j in expired)
+            await _audit.AppendAsync(conn, tx, new AuditEntry("SYSTEM", "Worker", "job.lease.recovered", "outbox_job",
+                j.Id.ToString(), null, null,
+                System.Text.Json.JsonSerializer.Serialize(new { j.JobKind, j.IntentKey, prevOwner = j.LeaseOwner }),
+                null, null, j.Env));
+        await tx.CommitAsync(ct);
+        return rows;
     }
 }

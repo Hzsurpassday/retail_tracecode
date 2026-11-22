@@ -1,5 +1,6 @@
 using Dapper;
 using TraceFlow.Infrastructure.Jobs;
+using TraceFlow.Infrastructure.Security;
 using Xunit;
 
 namespace TraceFlow.IntegrationTests.Jobs;
@@ -30,7 +31,7 @@ OUTPUT inserted.id VALUES(@orgId,N'LIVE',N'O1|KSOA|REC-'+@suffix+N'|SALE',N'RETA
         var partId = await c.ExecuteScalarAsync<long>(@"
 INSERT INTO dbo.upload_part(task_id,org_id,env,part_index,bill_code,payload_json,payload_hash,code_set_hash,state)
 OUTPUT inserted.id VALUES(@taskId,@orgId,N'LIVE',0,N'TFREC'+@suffix,N'{}',REPLICATE('b',64),REPLICATE('c',64),N'Dispatching')", new { taskId, orgId, suffix });
-        var q = new JobQueue(_fx.ConnectionString);
+        var q = new JobQueue(_fx.ConnectionString, new AuditLog());
         await using var tx = (Microsoft.Data.SqlClient.SqlTransaction)await c.BeginTransactionAsync();
         var jobId = await q.EnqueueAsync(c, tx, orgId, "LIVE", "upload-dispatch", $"part:{partId}", null, null, default);
         await tx.CommitAsync();
@@ -48,7 +49,7 @@ OUTPUT inserted.id VALUES(@taskId,@orgId,N'LIVE',0,N'TFREC'+@suffix,N'{}',REPLIC
     {
         var suffix = Guid.NewGuid().ToString("N")[..8];
         var (taskId, partId) = await SeedDispatchingPartAsync(suffix, leaseExpired: true);
-        var svc = new SendRecoveryService(_fx.ConnectionString, new JobQueue(_fx.ConnectionString));
+        var svc = new SendRecoveryService(_fx.ConnectionString, new JobQueue(_fx.ConnectionString, new AuditLog()));
         var n = await svc.RecoverAsync(default);
         Assert.True(n >= 1);
         await using var c = await _fx.OpenAsync();
@@ -64,7 +65,7 @@ OUTPUT inserted.id VALUES(@taskId,@orgId,N'LIVE',0,N'TFREC'+@suffix,N'{}',REPLIC
     {
         var suffix = Guid.NewGuid().ToString("N")[..8];
         var (_, partId) = await SeedDispatchingPartAsync(suffix, leaseExpired: false);
-        var svc = new SendRecoveryService(_fx.ConnectionString, new JobQueue(_fx.ConnectionString));
+        var svc = new SendRecoveryService(_fx.ConnectionString, new JobQueue(_fx.ConnectionString, new AuditLog()));
         await svc.RecoverAsync(default);
         await using var c = await _fx.OpenAsync();
         Assert.Equal("Dispatching", await c.ExecuteScalarAsync<string>("SELECT state FROM dbo.upload_part WHERE id=@partId", new { partId }));
@@ -75,7 +76,7 @@ OUTPUT inserted.id VALUES(@taskId,@orgId,N'LIVE',0,N'TFREC'+@suffix,N'{}',REPLIC
     {
         var suffix = Guid.NewGuid().ToString("N")[..8];
         var (_, partId) = await SeedDispatchingPartAsync(suffix, leaseExpired: true);
-        var svc = new SendRecoveryService(_fx.ConnectionString, new JobQueue(_fx.ConnectionString));
+        var svc = new SendRecoveryService(_fx.ConnectionString, new JobQueue(_fx.ConnectionString, new AuditLog()));
         await svc.RecoverAsync(default);
         await svc.RecoverAsync(default);
         await using var c = await _fx.OpenAsync();
@@ -88,7 +89,7 @@ OUTPUT inserted.id VALUES(@taskId,@orgId,N'LIVE',0,N'TFREC'+@suffix,N'{}',REPLIC
     {
         var suffix = Guid.NewGuid().ToString("N")[..8];
         var (taskId, partId) = await SeedDispatchingPartAsync(suffix, leaseExpired: false);
-        var svc = new SendRecoveryService(_fx.ConnectionString, new JobQueue(_fx.ConnectionString));
+        var svc = new SendRecoveryService(_fx.ConnectionString, new JobQueue(_fx.ConnectionString, new AuditLog()));
         await svc.AppendStaleEvidenceAsync(taskId, partId, 99, "UPLOAD", 1, "{\"response_success\":true}", default);
         await using var c = await _fx.OpenAsync();
         Assert.Equal("Dispatching", await c.ExecuteScalarAsync<string>("SELECT state FROM dbo.upload_part WHERE id=@partId", new { partId }));
@@ -103,7 +104,7 @@ OUTPUT inserted.id VALUES(@taskId,@orgId,N'LIVE',0,N'TFREC'+@suffix,N'{}',REPLIC
     {
         var suffix = Guid.NewGuid().ToString("N")[..8];
         var (_, partId) = await SeedDispatchingPartAsync(suffix, leaseExpired: false, claimJob: false);
-        var svc = new SendRecoveryService(_fx.ConnectionString, new JobQueue(_fx.ConnectionString));
+        var svc = new SendRecoveryService(_fx.ConnectionString, new JobQueue(_fx.ConnectionString, new AuditLog()));
         var n = await svc.RecoverAsync(default);
         Assert.True(n >= 1);
         await using var c = await _fx.OpenAsync();

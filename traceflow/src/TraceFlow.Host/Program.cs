@@ -13,8 +13,8 @@ builder.Host.UseWindowsService();
 if (args.Contains("--init-admin"))
     return await AdminInitializer.RunAsync(args, builder.Configuration);
 
-var connectionString = builder.Configuration.GetConnectionString("TraceFlow")
-    ?? throw new InvalidOperationException("缺少 ConnectionStrings:TraceFlow（部署配置提供，不入 Git）");
+var connectionString = builder.Configuration.GetConnectionString("TraceFlow");
+if (string.IsNullOrWhiteSpace(connectionString)) throw new InvalidOperationException("缺少 ConnectionStrings:TraceFlow（部署配置提供，不入 Git）");
 // 配置大小写不敏感，启动规范化为大写 LIVE/MOCK（非法值启动失败）；安全默认 MOCK，LIVE 须门禁后显式开启
 var env = (builder.Configuration["TraceFlow:Env"] ?? "Mock").ToUpperInvariant();
 if (env is not ("MOCK" or "LIVE"))
@@ -24,7 +24,7 @@ var webOnly = args.Contains("--web-only");
 
 builder.Services.AddSingleton(new DbOptions(connectionString));
 builder.Services.AddSingleton(new EnvOptions(env));
-builder.Services.AddSingleton<IJobQueue>(new JobQueue(connectionString));
+builder.Services.AddSingleton<IJobQueue>(sp => new JobQueue(connectionString, sp.GetRequiredService<IAuditLog>()));
 builder.Services.AddSingleton<ISendRecoveryService>(sp => new SendRecoveryService(connectionString, sp.GetRequiredService<IJobQueue>()));
 builder.Services.AddSingleton<IPermissionService>(new PermissionService(connectionString));
 builder.Services.AddSingleton<IAuditLog, AuditLog>();
