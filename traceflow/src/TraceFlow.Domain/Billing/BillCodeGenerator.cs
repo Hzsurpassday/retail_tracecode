@@ -4,7 +4,8 @@ namespace TraceFlow.Domain.Billing;
 
 public static class BillCodeGenerator
 {
-    private const string Digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    // Base35：字母表剔除分隔符 'P'，保证 body 永不含 'P'，与分部后缀 "P{n}" 无碰撞（I-1）
+    private const string Digits = "0123456789ABCDEFGHIJKLMNOQRSTUVWXYZ";
 
     public static string Generate(BillCodeContract contract, long taskId, int partIndex)
     {
@@ -14,7 +15,7 @@ public static class BillCodeGenerator
         if (taskId <= 0) throw new ArgumentOutOfRangeException(nameof(taskId));
         if (partIndex < 0) throw new ArgumentOutOfRangeException(nameof(partIndex));
 
-        var body = Base36(taskId);
+        var body = Base35(taskId);
         var code = partIndex == 0
             ? contract.Prefix + body
             : contract.Prefix + body + "P" + partIndex.ToString(CultureInfo.InvariantCulture);
@@ -23,11 +24,11 @@ public static class BillCodeGenerator
         return code;
     }
 
-    private static string Base36(long value)
+    private static string Base35(long value)
     {
-        Span<char> buf = stackalloc char[13];
+        Span<char> buf = stackalloc char[13]; // 35^12 < long.MaxValue < 35^13，13 位足够
         var i = buf.Length;
-        while (value > 0) { buf[--i] = Digits[(int)(value % 36)]; value /= 36; }
+        while (value > 0) { buf[--i] = Digits[(int)(value % 35)]; value /= 35; }
         return new string(buf[i..]);
     }
 }

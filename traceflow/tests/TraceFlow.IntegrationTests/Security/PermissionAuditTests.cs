@@ -46,4 +46,30 @@ public class PermissionAuditTests : IClassFixture<Sql2008Fixture>
         Assert.Equal("{\"v\":1}", row.Before);
         Assert.Equal("{\"v\":2}", row.After);
     }
+
+    // I-4：停用用户（is_active=0）即使 user_permission 授权行仍在，HasAsync/ForUserAsync 也必须 fail-closed。
+    // 用户名带 Guid 后缀避免跨测试/跨运行碰撞；种子沿用 IF NOT EXISTS 幂等模式。
+    [Fact]
+    public async Task Deactivated_user_loses_permissions_immediately()
+    {
+        await using var c = await _fx.OpenAsync();
+        var username = "deact-" + Guid.NewGuid().ToString("N");
+        var userId = await c.ExecuteScalarAsync<long>(@"
+IF NOT EXISTS (SELECT 1 FROM dbo.app_user WHERE username=@u)
+    INSERT INTO dbo.app_user(username,display_name,password_hash) VALUES(@u,N'停用测试',N'x');
+SELECT id FROM dbo.app_user WHERE username=@u", new { u = username });
+        var svc = new PermissionService(_fx.ConnectionString);
+        await using (var tx = (Microsoft.Data.SqlClient.SqlTransaction)await c.BeginTransactionAsync())
+        {
+            await svc.GrantAsync(c, tx, userId, "master:match", "admin");
+            await tx.CommitAsync();
+        }
+        Assert.True(await svc.HasAsync(userId, "master:match"));
+        Assert.Contains("master:match", await svc.ForUserAsync(userId));
+
+        await c.ExecuteAsync("UPDATE dbo.app_user SET is_active=0 WHERE id=@userId", new { userId });
+
+        Assert.False(await svc.HasAsync(userId, "master:match"));
+        Assert.Empty(await svc.ForUserAsync(userId));
+    }
 }

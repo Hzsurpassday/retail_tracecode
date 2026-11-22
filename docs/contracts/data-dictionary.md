@@ -36,4 +36,4 @@
 
 ## 环境隔离（Live/Mock）
 
-`upstream_bill`、`download_progress`、`code_event`、`code_claim`、`inbound_allocation`、`verification`、`upload_task`、`upload_part`、`upload_attempt`、`outbox_job`、`reconciliation_run`、`audit_log` 均含 `env` 列（LIVE/MOCK，多数有 CHECK）；Mock 与 Live 数据互不串扰（CodeConstraintTests.Mock_and_live_claims_isolated、UploadConstraintTests.Mock_task_with_same_event_key_isolated、JobQueueTests.Claim_only_returns_jobs_of_requested_env）。宿主默认 `TraceFlow:Env=Mock`，Live 须门禁后显式开启。
+`upstream_bill`、`download_progress`、`code_event`、`code_claim`、`inbound_allocation`、`verification`、`upload_task`、`upload_part`、`upload_attempt`、`outbox_job`、`reconciliation_run`、`audit_log` 均含 `env` 列（LIVE/MOCK，多数有 CHECK）；Mock 与 Live 数据互不串扰（CodeConstraintTests.Mock_and_live_claims_isolated、UploadConstraintTests.Mock_task_with_same_event_key_isolated、JobQueueTests.Claim_only_returns_jobs_of_requested_env）。宿主配置 `TraceFlow:Env` 大小写不敏感、启动规范化为 LIVE/MOCK（默认 MOCK；非法值启动失败），LIVE 须门禁后显式开启。

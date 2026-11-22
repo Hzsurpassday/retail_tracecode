@@ -1,6 +1,6 @@
 # M0 门禁报告（TraceFlow 单门店追溯系统）
 
-日期：2026-11-22。分支：`m0-foundation`，代码基线 HEAD `73f3d6f`（Task 1–14）+ Task 15 文档交付。
+日期：2026-11-22。分支：`m0-foundation`，代码基线 HEAD `d275a97`（Task 1–15）+ 最终评审修复（I-1 Base35 bill_code 碰撞、I-2 env 启动规范化、I-3 Worker 循环日志、I-4 停用用户即时失权）。
 配套：`docs/contracts/openapi.yaml`、`adapter-facts.md`、`source-mapping.md`、`data-dictionary.md`、`fixtures/`（8 个）、`docs/traceability/matrix.md`（114 需求行）。
 
 ## 结论（不标记 M0 全门禁通过）
@@ -51,7 +51,7 @@ dotnet build traceflow/TraceFlow.sln -c Release
 已成功生成。
     0 个警告
     0 个错误
-已用时间 00:00:03.16
+已用时间 00:00:06.95
 ```
 
 **结果：0 警告 0 错误（TreatWarningsAsErrors 生效），7 个项目全部编译。**
@@ -65,10 +65,10 @@ dotnet test traceflow/tests/TraceFlow.UnitTests -c Release --no-build
 真实输出：
 
 ```
-已通过! - 失败: 0，通过: 84，已跳过: 0，总计: 84，持续时间: 177 ms - TraceFlow.UnitTests.dll (net8.0)
+已通过! - 失败: 0，通过: 87，已跳过: 0，总计: 87，持续时间: 169 ms - TraceFlow.UnitTests.dll (net8.0)
 ```
 
-**结果：84/84 通过。**（BillCodeGeneratorTests 6、TraceCodeNormalizerTests 7、QtyTests 8、UnitRatioTests 5、DpapiProtectorTests 2、UploadStateMachineTests 理论行 55、UnitTest1 1）
+**结果：87/87 通过。**（BillCodeGeneratorTests 9（含 I-1 碰撞回归/结构/40 万唯一性扫描 3 个新增）、TraceCodeNormalizerTests 7、QtyTests 8、UnitRatioTests 5、DpapiProtectorTests 2、UploadStateMachineTests 理论行 55、UnitTest1 1）
 
 ### 3. 集成测试（授权降级运行）
 
@@ -81,11 +81,11 @@ dotnet test traceflow/tests/TraceFlow.IntegrationTests -c Release --no-build
 真实输出：
 
 ```
-已通过! - 失败: 0，通过: 44，已跳过: 0，总计: 44，持续时间: 2 s - TraceFlow.IntegrationTests.dll (net8.0)
+已通过! - 失败: 0，通过: 45，已跳过: 0，总计: 45，持续时间: 2 s - TraceFlow.IntegrationTests.dll (net8.0)
 ```
 
-**结果：44/44 通过（SQL Server 2019 15.0.2000.5，授权降级；2008 R2 待补验）。**
-覆盖：ApiGateTests 7（含 AT-065/AT-066）、JobQueueTests 9、SendRecoveryTests 5、CodeConstraintTests 5、MasterConstraintTests 3、MigratorTests 3、Sql2008CompatibilityTests 3、UploadConstraintTests 4、IdempotencyStoreTests 2、PermissionAuditTests 2、UnitTest1 1。
+**结果：45/45 通过（SQL Server 2019 15.0.2000.5，授权降级；2008 R2 待补验）。**
+覆盖：ApiGateTests 7（含 AT-065/AT-066）、JobQueueTests 9、SendRecoveryTests 5、CodeConstraintTests 5、MasterConstraintTests 3、MigratorTests 3、Sql2008CompatibilityTests 3、UploadConstraintTests 4、IdempotencyStoreTests 2、PermissionAuditTests 3（含 I-4 停用即时失权 1 个新增）、UnitTest1 1。
 每个测试类经 `Sql2008Fixture` 自建 `TraceFlow_Test_<guid>` 临时库并在 Dispose 时 DROP；运行后无残留（见 ③ 末尾核查）。
 
 ### 4. 前端构建
@@ -138,7 +138,7 @@ version|name|checksum|applied_at|success
 6|0006_upload.sql|8150CED244D824BE4DD78D5E80C999EA8E702A3B68C7433E75740569F0928FBE|2026-11-22 07:29:31.431|1
 ```
 
-checksum 为迁移文件字节 SHA-256（MigrationRunner 计算）；6/6 success=1。二次运行幂等跳过与 checksum 不一致即停由 `MigratorTests.Second_run_is_idempotent_skip`、`Checksum_mismatch_stops_and_does_not_partially_apply` 覆盖（本次 44/44 中通过）。
+checksum 为迁移文件字节 SHA-256（MigrationRunner 计算）；6/6 success=1。二次运行幂等跳过与 checksum 不一致即停由 `MigratorTests.Second_run_is_idempotent_skip`、`Checksum_mismatch_stops_and_does_not_partially_apply` 覆盖（本次 45/45 中通过）。
 
 4. 清理：`ALTER DATABASE [TraceFlow_GateReport_1209413116] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [TraceFlow_GateReport_1209413116]`（退出码 0）。
 5. 残留核查（真实查询）：`SELECT name FROM sys.databases WHERE name LIKE 'TraceFlow%'` → **0 行**（无 TraceFlow_GateReport_*、无 TraceFlow_Test_* 残留）。说明：DROP 后首次列表查询曾短暂捕获到该库名（teardown 时序），复查确认已删除，最终核查为空。
@@ -158,7 +158,7 @@ checksum 为迁移文件字节 SHA-256（MigrationRunner 计算）；6/6 success
 
 ### 运行时门禁
 
-- **2008 R2 真实实例验证未完成（AT-070）**：本报告全部数据库证据来自 SQL Server 2019（授权降级）。交付前必须在真实 10.50.x 实例重跑全部 44 个集成测试并替换本报告 ①③ 证据。静态语法门禁已通过，不能替代运行时验证。
+- **2008 R2 真实实例验证未完成（AT-070）**：本报告全部数据库证据来自 SQL Server 2019（授权降级）。交付前必须在真实 10.50.x 实例重跑全部 45 个集成测试并替换本报告 ①③ 证据。静态语法门禁已通过，不能替代运行时验证。
 
 ### M1–M4 功能缺口（按追踪矩阵逐条列明，此处汇总）
 

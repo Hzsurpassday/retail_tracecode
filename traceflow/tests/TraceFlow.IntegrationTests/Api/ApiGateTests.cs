@@ -124,7 +124,7 @@ IF NOT EXISTS (SELECT 1 FROM dbo.user_permission WHERE user_id=@id AND permissio
         resp.EnsureSuccessStatusCode();
         var body = await resp.Content.ReadAsStringAsync();
         Assert.Contains("openIngestExceptions", body);
-        Assert.Contains("Mock", body); // 环境标记持续可见
+        Assert.Contains("MOCK", body); // 环境标记持续可见（启动规范化为大写，I-2）
     }
 
     [Fact]

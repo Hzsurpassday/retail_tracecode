@@ -15,7 +15,10 @@ if (args.Contains("--init-admin"))
 
 var connectionString = builder.Configuration.GetConnectionString("TraceFlow")
     ?? throw new InvalidOperationException("缺少 ConnectionStrings:TraceFlow（部署配置提供，不入 Git）");
-var env = builder.Configuration["TraceFlow:Env"] ?? "Mock"; // 安全默认 Mock；Live 须门禁后显式开启
+// 配置大小写不敏感，启动规范化为大写 LIVE/MOCK（非法值启动失败）；安全默认 MOCK，LIVE 须门禁后显式开启
+var env = (builder.Configuration["TraceFlow:Env"] ?? "Mock").ToUpperInvariant();
+if (env is not ("MOCK" or "LIVE"))
+    throw new InvalidOperationException("TraceFlow:Env 必须为 MOCK 或 LIVE（大小写不敏感）");
 var workerOnly = args.Contains("--worker-only");
 var webOnly = args.Contains("--web-only");
 

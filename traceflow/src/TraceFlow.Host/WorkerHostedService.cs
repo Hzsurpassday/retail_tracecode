@@ -7,13 +7,14 @@ public sealed class WorkerHostedService : BackgroundService
     private readonly IJobQueue _queue;
     private readonly ISendRecoveryService _recovery;
     private readonly IReadOnlyDictionary<string, IJobHandler> _handlers;
+    private readonly ILogger<WorkerHostedService> _logger;
     private readonly string _env;
     private readonly string _workerId = $"{Environment.MachineName}-{Guid.NewGuid():N}";
     private DateTime _lastRecovery = DateTime.MinValue;
 
-    public WorkerHostedService(IJobQueue queue, ISendRecoveryService recovery, IEnumerable<IJobHandler> handlers, EnvOptions envOptions)
+    public WorkerHostedService(IJobQueue queue, ISendRecoveryService recovery, IEnumerable<IJobHandler> handlers, EnvOptions envOptions, ILogger<WorkerHostedService> logger)
     {
-        _queue = queue; _recovery = recovery; _env = envOptions.Env;
+        _queue = queue; _recovery = recovery; _env = envOptions.Env; _logger = logger;
         _handlers = handlers.ToDictionary(h => h.Kind);
     }
 
@@ -28,6 +29,7 @@ public sealed class WorkerHostedService : BackgroundService
                     await _queue.RecoverExpiredLeasesAsync(stoppingToken);
                     await _recovery.RecoverAsync(stoppingToken); // 失租发送→受理未知→只回查（JOB-02）
                     _lastRecovery = DateTime.UtcNow;
+                    _logger.LogDebug("Worker 恢复扫描完成（租约回收 + 发送恢复回查）");
                 }
                 if (_handlers.Count > 0)
                 {
@@ -50,7 +52,11 @@ public sealed class WorkerHostedService : BackgroundService
                 }
             }
             catch (OperationCanceledException) { break; }
-            catch { /* 数据库瞬断：保留任务，下轮重试（JOB-05） */ }
+            catch (Exception ex)
+            {
+                // 数据库瞬断：保留任务，下轮重试（JOB-05）；不再静默吞异常（I-3）
+                _logger.LogWarning(ex, "Worker 循环异常，保留任务下轮重试");
+            }
             await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken);
         }
     }

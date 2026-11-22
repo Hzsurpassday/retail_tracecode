@@ -154,7 +154,7 @@ components:
           type: object
           required: [env, openIngestExceptions, pendingJobs, uploadTasksByState]
           properties:
-            env: { type: string, enum: [LIVE, MOCK], description: 当前环境（默认 Mock；Live 须门禁后显式开启） }
+            env: { type: string, enum: [LIVE, MOCK], description: 当前环境（配置大小写不敏感，启动规范化为 LIVE/MOCK；默认 MOCK，LIVE 须门禁后显式开启） }
             openIngestExceptions: { type: integer, description: ingest_exception status=OPEN 计数 }
             pendingJobs: { type: integer, description: 当前 env 下 outbox_job PENDING 计数 }
             uploadTasksByState: { type: object, additionalProperties: { type: integer }, description: 当前 env 下 upload_task 按 state 分组计数 }

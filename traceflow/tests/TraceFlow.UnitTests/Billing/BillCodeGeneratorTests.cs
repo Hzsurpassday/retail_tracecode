@@ -54,4 +54,38 @@ public class BillCodeGeneratorTests
         Assert.Throws<ArgumentOutOfRangeException>(() => BillCodeGenerator.Generate(Contract, 0, 0));
         Assert.Throws<ArgumentOutOfRangeException>(() => BillCodeGenerator.Generate(Contract, 1, -1));
     }
+
+    // I-1 回归：旧 Base36 字母表含分隔符 'P'，Base36(2197)="1P1" 与 taskId=1/part=1 的 "1"+"P1" 碰撞。
+    // Base35（剔除 P）下 2197 = 1·35² + 27·35 + 27 → 数字 1,S,S → "1SS"，碰撞消除。
+    [Fact]
+    public void Separator_collision_regression_base35()
+    {
+        Assert.Equal("TF1SS", BillCodeGenerator.Generate(Contract, 2197, 0)); // 1·1225 + 27·35 + 27 = 2197
+        Assert.Equal("TF1P1", BillCodeGenerator.Generate(Contract, 1, 1));
+        Assert.NotEqual(BillCodeGenerator.Generate(Contract, 2197, 0),
+                        BillCodeGenerator.Generate(Contract, 1, 1));
+        // 12345 = 10·35² + 2·35 + 25 → A(10),2,Q(25)（P 剔除后索引 25 = 'Q'）
+        Assert.Equal("TFA2Q", BillCodeGenerator.Generate(Contract, 12345, 0));
+    }
+
+    [Fact]
+    public void Body_never_contains_separator_P()
+    {
+        for (long taskId = 1; taskId <= 1000; taskId++)
+        {
+            var code = BillCodeGenerator.Generate(Contract, taskId, 0);
+            var body = code["TF".Length..];
+            Assert.DoesNotContain('P', body);
+        }
+    }
+
+    [Fact]
+    public void Uniqueness_sweep_100k_tasks_4_parts()
+    {
+        var codes = new HashSet<string>(400_000);
+        for (long taskId = 1; taskId <= 100_000; taskId++)
+            for (var part = 0; part <= 3; part++)
+                codes.Add(BillCodeGenerator.Generate(Contract, taskId, part));
+        Assert.Equal(400_000, codes.Count);
+    }
 }
