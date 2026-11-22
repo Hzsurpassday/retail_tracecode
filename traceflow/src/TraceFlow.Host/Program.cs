@@ -32,6 +32,15 @@ builder.Services.AddSingleton<ISecretProtector, DpapiProtector>();
 builder.Services.AddSingleton<IIdempotencyStore, IdempotencyStore>();
 builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Settings.SettingsService(
     connectionString, sp.GetRequiredService<ISecretProtector>()));
+var sourceMode = builder.Configuration["TraceFlow:SourceMode"] ?? "fixture";
+builder.Services.AddSingleton<ISourceAdapter>(TraceFlow.Infrastructure.Sources.SourceAdapterFactory.Create(
+    sourceMode, Path.Combine(AppContext.BaseDirectory, "fixtures", "ksoa")));
+builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Sources.SyncScheduler(
+    connectionString, sp.GetRequiredService<IJobQueue>(),
+    sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(), env));
+builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Sources.SourceSyncJobHandler(
+    connectionString, sp.GetRequiredService<ISourceAdapter>(),
+    sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(), sp.GetRequiredService<IAuditLog>()));
 builder.Services.AddSingleton(sp => new IdempotencyExecutor(connectionString, sp.GetRequiredService<IIdempotencyStore>()));
 builder.Services.AddSingleton<IAuthorizationHandler, PermissionHandler>();
 
@@ -56,7 +65,10 @@ if (!workerOnly)
     builder.Services.AddAntiforgery(o => o.HeaderName = "X-CSRF-TOKEN");
 }
 if (!webOnly)
+{
     builder.Services.AddHostedService<WorkerHostedService>();
+    builder.Services.AddHostedService<SyncSchedulerHostedService>();
+}
 
 var app = builder.Build();
 await TraceFlow.Infrastructure.Bootstrap.OrgBootstrap.EnsureAsync(connectionString);
@@ -81,6 +93,7 @@ if (!workerOnly)
     app.MapAuthEndpoints(connectionString);
     app.MapAdminEndpoints(connectionString);
     app.MapSettingsEndpoints(connectionString);
+    app.MapOpsEndpoints(connectionString, env);
     app.MapDashboardEndpoints(connectionString, env);
     app.MapHealthEndpoints(connectionString, env);
     app.MapFallbackToFile("index.html");
