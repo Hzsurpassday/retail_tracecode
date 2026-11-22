@@ -32,6 +32,10 @@ builder.Services.AddSingleton<ISecretProtector, DpapiProtector>();
 builder.Services.AddSingleton<IIdempotencyStore, IdempotencyStore>();
 builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Settings.SettingsService(
     connectionString, sp.GetRequiredService<ISecretProtector>()));
+builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Master.ImportService(
+    connectionString, sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(),
+    sp.GetRequiredService<IJobQueue>(), sp.GetRequiredService<IAuditLog>()));
+builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Jobs.ImportStageJobHandler(connectionString));
 var sourceMode = builder.Configuration["TraceFlow:SourceMode"] ?? "fixture";
 builder.Services.AddSingleton<ISourceAdapter>(TraceFlow.Infrastructure.Sources.SourceAdapterFactory.Create(
     sourceMode, Path.Combine(AppContext.BaseDirectory, "fixtures", "ksoa")));
@@ -93,6 +97,7 @@ if (!workerOnly)
     app.MapAuthEndpoints(connectionString);
     app.MapAdminEndpoints(connectionString);
     app.MapSettingsEndpoints(connectionString);
+    app.MapImportEndpoints(connectionString, env);
     app.MapOpsEndpoints(connectionString, env);
     app.MapDashboardEndpoints(connectionString, env);
     app.MapHealthEndpoints(connectionString, env);
