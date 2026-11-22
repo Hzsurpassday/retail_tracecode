@@ -14,8 +14,8 @@ public static class AdminEndpoints
     {
         // 幂等执行器包裹（API-02）：handler 只取 HttpContext，避免 minimal-API JSON 绑定提前消费请求体，
         // 由 action 内重读已缓冲的 Body（执行器已重置 Position=0）反序列化 CreateUserRequest。
-        app.MapPost("/api/v1/admin/users", (HttpContext ctx, IAuditLog audit) =>
-            IdempotencyExecutor.RunAsync(ctx, connectionString, async (conn, tx, ct) =>
+        app.MapPost("/api/v1/admin/users", (HttpContext ctx, IAuditLog audit, IdempotencyExecutor idem) =>
+            idem.RunAsync(ctx, async (conn, tx, ct) =>
             {
                 ctx.Request.Body.Position = 0;
                 var req = await JsonSerializer.DeserializeAsync<CreateUserRequest>(ctx.Request.Body,

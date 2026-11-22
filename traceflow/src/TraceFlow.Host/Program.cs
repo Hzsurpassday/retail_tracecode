@@ -30,6 +30,7 @@ builder.Services.AddSingleton<IPermissionService>(new PermissionService(connecti
 builder.Services.AddSingleton<IAuditLog, AuditLog>();
 builder.Services.AddSingleton<ISecretProtector, DpapiProtector>();
 builder.Services.AddSingleton<IIdempotencyStore, IdempotencyStore>();
+builder.Services.AddSingleton(sp => new IdempotencyExecutor(connectionString, sp.GetRequiredService<IIdempotencyStore>()));
 builder.Services.AddSingleton<IAuthorizationHandler, PermissionHandler>();
 
 if (!workerOnly)

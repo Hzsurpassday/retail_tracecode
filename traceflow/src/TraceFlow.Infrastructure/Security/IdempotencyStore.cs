@@ -9,8 +9,8 @@ public sealed class IdempotencyStore : IIdempotencyStore
     public async Task<IdempotencyHit?> TryGetAsync(SqlConnection conn, SqlTransaction tx, string key, string requestHash, long userId, CancellationToken ct)
     {
         var row = await conn.QuerySingleOrDefaultAsync<(string Hash, int Status, string Body)?>(
-            "SELECT request_hash AS Hash, response_status AS Status, response_body AS Body FROM dbo.idempotency_record WHERE idem_key=@key",
-            new { key }, tx);
+            "SELECT request_hash AS Hash, response_status AS Status, response_body AS Body FROM dbo.idempotency_record WHERE idem_key=@key AND user_id=@userId",
+            new { key, userId }, tx);
         if (row is null) return null;
         if (!string.Equals(row.Value.Hash.Trim(), requestHash, StringComparison.OrdinalIgnoreCase))
             throw new IdempotencyConflictException();
