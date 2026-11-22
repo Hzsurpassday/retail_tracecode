@@ -5291,7 +5291,9 @@ public static class ImportEndpoints
 SELECT id,file_kind,file_name,file_hash,total_rows,success_rows,failed_rows,status,staged_by,staged_at,committed_by,committed_at,ver
 FROM dbo.import_batch
 WHERE org_id=(SELECT id FROM dbo.organization WHERE is_active=1) AND file_kind=@kind AND file_hash=@hash",
-                new { kind = fileKind, hash = fileHash }, cancellationToken: ctx.RequestAborted));
+                // T10 评审修复（controller ruling）：file_hash 为 BIN2 大写存储，POST 接受任意大小写；
+                // GET 必须归一化大写，否则小写 hex 客户端暂存成功后预览定位 404（写收读拒不对称）。
+                new { kind = fileKind, hash = fileHash.ToUpperInvariant() }, cancellationToken: ctx.RequestAborted));
             if (b is null)
                 return Results.Json(new { code = "NOT_FOUND", message = "批次不存在", retryable = false, requestId = ctx.TraceIdentifier }, statusCode: 404);
             return Results.Ok(new { data = ToView(b), requestId = ctx.TraceIdentifier });
