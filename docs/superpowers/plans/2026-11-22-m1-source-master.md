@@ -867,22 +867,27 @@ using System.Text;
 
 namespace TraceFlow.Domain.Sources;
 
-/// <summary>SYNC-01/02：行/单内容摘要（变更检测与稳定期两轮一致判定）。SHA256 大写 hex。</summary>
+/// <summary>SYNC-01/02：行/单内容摘要（变更检测与稳定期两轮一致判定）。SHA256 大写 hex。
+/// 执行期裁决（Task 2 fix round 1）：自由文本字段统一转义分隔符，防边界移位碰撞。</summary>
 public static class SourceHasher
 {
     public static string LineHash(string lineKey, string productId, decimal qty, string? unit,
         string? batch, string? expiry, string? traceCodeRaw, string eventKind)
-        => Sha(string.Join("|", lineKey, productId,
-            qty.ToString("0.000000", CultureInfo.InvariantCulture),
-            unit ?? "", batch ?? "", expiry ?? "", traceCodeRaw ?? "", eventKind));
+        => Sha(string.Join("|", Esc(lineKey), Esc(productId),
+            Esc(qty.ToString("0.000000", CultureInfo.InvariantCulture)),
+            Esc(unit), Esc(batch), Esc(expiry), Esc(traceCodeRaw), Esc(eventKind)));
 
     public static string DocumentHash(string docKey, DateTime? businessUtc, IReadOnlyList<string> sortedLineHashes)
-        => Sha(docKey + "|" + (businessUtc?.ToString("yyyy-MM-ddTHH:mm:ss.fff", CultureInfo.InvariantCulture) ?? "")
+        => Sha(Esc(docKey) + "|" + Esc(businessUtc?.ToString("yyyy-MM-ddTHH:mm:ss.fff", CultureInfo.InvariantCulture))
             + "|" + string.Join(";", sortedLineHashes));
+
+    private static string Esc(string? s) => (s ?? "").Replace("\\", "\\\\").Replace("|", "\\|");
 
     private static string Sha(string s) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(s)));
 }
 ```
+
+Task 2 回归测试（fix round 1 追加，`SourceValueObjectTests`）：`Line_hash_delimiter_shift_does_not_collide`（unit="盒|P1"/batch="" vs unit="盒"/batch="P1" 守卫对）、`Line_hash_pipe_in_batch_does_not_collide`（真实旧码碰撞对，RED 证据）、`Line_hash_backslash_escape_does_not_collide`（反斜杠双写守卫）。
 
 `traceflow/src/TraceFlow.Domain/Sources/SyncPolicy.cs`：
 
