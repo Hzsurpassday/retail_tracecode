@@ -96,6 +96,26 @@ IF NOT EXISTS (SELECT 1 FROM dbo.user_permission WHERE user_id=@id AND permissio
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
     }
 
+    // AUTH-02 全局 CSRF 中间件负向门禁：Missing_csrf_rejected 只覆盖登录端点内部校验（匿名路径，中间件跳过）。
+    // 本测试覆盖已认证 /api 变更路径。须用 admin（system:manage）：管线中 UseAuthorization 在 CSRF 中间件之前
+    // （WebApplication 自动前置路由），viewer 会先被授权短路 403，无论中间件是否存在——无法证伪。
+    // admin 通过授权后由全局中间件拒绝：400 + CSRF_INVALID（API-01 契约），且库不变。
+    [Fact]
+    public async Task Authenticated_mutation_without_csrf_header_rejected_400()
+    {
+        var (client, _) = await LoginAsync("admin", "Admin-Password-123");
+        client.DefaultRequestHeaders.Remove("X-CSRF-TOKEN"); // 已认证会话，但去掉令牌头
+        var req = new HttpRequestMessage(HttpMethod.Post, "/api/v1/admin/users")
+        { Content = JsonContent.Create(new { username = "csrf-probe", password = "1234567890", reason = "test" }) };
+        req.Headers.Add("Idempotency-Key", Guid.NewGuid().ToString()); // 合法请求：仅缺 CSRF 头这一个变量
+        var resp = await client.SendAsync(req);
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        var body = await resp.Content.ReadAsStringAsync();
+        Assert.Contains("CSRF_INVALID", body); // API-01 错误契约 code
+        await using var c = await _fx.OpenAsync();
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.app_user WHERE username=N'csrf-probe'"));
+    }
+
     [Fact]
     public async Task Dashboard_requires_trace_read_and_returns_real_counts()
     {
