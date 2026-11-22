@@ -1,0 +1,14 @@
+# .NET
+[Bb]in/
+[Oo]bj/
+*.user
+# Node / React
+node_modules/
+traceflow/src/TraceFlow.Host/wwwroot/
+#  secrets & local config
+appsettings.Local.json
+*.pfx
+.env
+# 首轮参考代码与用户资料不跟踪不删除
+retail_tracecode/
+zww-md/
