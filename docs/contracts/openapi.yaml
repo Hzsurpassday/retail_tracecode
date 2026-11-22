@@ -1,0 +1,785 @@
+openapi: 3.0.3
+info:
+  title: TraceFlow 内部 API
+  version: 0.1.0
+  description: >
+    PRD §12 最低资源契约。金额/数量/外部ID/rowversion 一律 JSON 字符串（API-01）。
+    变更接口要求 Idempotency-Key 头与 expectedVersion（API-02）。x-phase 标注实现阶段。
+    M0 已实现端点（/auth/*、/admin/*、/dashboard、/health）按真实代码形状描述
+    （traceflow/src/TraceFlow.Host/Endpoints/*.cs）；M1+ 端点为计划契约，尚未实现。
+    已认证请求的所有 /api 变更方法（POST/PUT/DELETE/PATCH）必须携带 X-CSRF-TOKEN 头
+    （全局 antiforgery 中间件，AUTH-02）；/auth/login 与 /auth/logout 匿名可达但自行校验 CSRF。
+    失败统一 code/message/fieldErrors/retryable/requestId；401 未登录、403 无权、
+    409 版本/占用/幂等冲突、422 业务不满足、429 调度限额、503 外部不可用（API-01）。
+servers: [{ url: /api/v1 }]
+components:
+  securitySchemes:
+    cookieAuth: { type: apiKey, in: cookie, name: .tf.auth }
+  parameters:
+    Page: { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+    PageSize: { name: pageSize, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+    IdempotencyKey: { name: Idempotency-Key, in: header, required: true, schema: { type: string, maxLength: 128 } }
+    CsrfToken: { name: X-CSRF-TOKEN, in: header, required: true, schema: { type: string }, description: 会话 CSRF 令牌（GET /auth/session 获取；AUTH-02） }
+    ResourceId: { name: id, in: path, required: true, schema: { type: integer, format: int64 }, description: 本地实体 bigint ID（内部 ID，非外部 ID） }
+  schemas:
+    Error:
+      type: object
+      required: [code, message, retryable, requestId]
+      properties:
+        code: { type: string }
+        message: { type: string }
+        fieldErrors: { type: array, items: { type: object } }
+        retryable: { type: boolean }
+        requestId: { type: string }
+    PageMeta:
+      type: object
+      required: [records, total]
+      properties:
+        records: { type: array, items: { type: object } }
+        total: { type: integer }
+    ConfirmMappingRequest:
+      type: object
+      required: [targetId, expectedVersion, reason]
+      properties:
+        targetId: { type: string }
+        expectedVersion: { type: string, description: rowversion 字符串 }
+        reason: { type: string }
+        evidenceIds: { type: array, items: { type: string } }
+    TracePolicyRequest:
+      type: object
+      required: [classification, reason, expectedVersion]
+      properties:
+        classification: { type: string, enum: [REQUIRED, EXEMPT] }
+        reason: { type: string }
+        expectedVersion: { type: string }
+    AllocationRequest:
+      type: object
+      required: [lines, expectedVersion, reason]
+      properties:
+        lines:
+          type: array
+          items:
+            type: object
+            required: [sourceLineKey, upstreamLineId, codes, quantity]
+            properties:
+              sourceLineKey: { type: string }
+              upstreamLineId: { type: string }
+              codes: { type: array, items: { type: string } }
+              quantity: { type: string, description: decimal(18,6) 字符串 }
+              unitRatio: { type: string, description: "分子/分母" }
+              conversionEvidence: { type: string }
+        expectedVersion: { type: string }
+        reason: { type: string }
+    ReturnConfirmRequest:
+      type: object
+      required: [originalEventKey, codes, expectedVersion, reason]
+      properties:
+        originalEventKey: { type: string }
+        codes: { type: array, items: { type: string } }
+        evidenceIds: { type: array, items: { type: string } }
+        expectedVersion: { type: string }
+        reason: { type: string }
+    TaskActionRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason: { type: string }
+        expectedVersion: { type: string }
+    # ---- M0 已实现端点的真实请求/响应形状（TraceFlow.Host/Endpoints/*.cs） ----
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string }
+        password: { type: string }
+    CreateUserRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string, description: 必填非空；重复用户名 409 CONFLICT }
+        password: { type: string, minLength: 10, description: 至少 10 位，否则 422 VALIDATION }
+        displayName: { type: string, nullable: true }
+        reason: { type: string, nullable: true, description: 审计原因（AUD-01） }
+    GrantPermissionRequest:
+      type: object
+      required: [permission, grant]
+      properties:
+        permission: { type: string, description: PermissionCatalog 权限项（如 trace:read、system:manage）；未知权限 422 }
+        grant: { type: boolean, description: true 授予 / false 收回；重复授予幂等 }
+        reason: { type: string, nullable: true }
+    SessionResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [authenticated, csrfToken]
+          properties:
+            authenticated: { type: boolean }
+            username: { type: string, description: 仅已认证时返回 }
+            permissions: { type: array, items: { type: string }, description: 仅已认证时返回 }
+            csrfToken: { type: string }
+        requestId: { type: string }
+    LoginResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [username]
+          properties:
+            username: { type: string }
+        requestId: { type: string }
+    CreateUserResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [id]
+          properties:
+            id: { type: integer, format: int64, description: 本地 app_user bigint ID（内部 ID 以 JSON number 返回；API-01 字符串规则针对外部 ID/金额/数量/rowversion） }
+        requestId: { type: string }
+    EmptyDataResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data: { type: object }
+        requestId: { type: string }
+    DashboardResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [env, openIngestExceptions, pendingJobs, uploadTasksByState]
+          properties:
+            env: { type: string, enum: [LIVE, MOCK], description: 当前环境（配置大小写不敏感，启动规范化为 LIVE/MOCK；默认 MOCK，LIVE 须门禁后显式开启） }
+            openIngestExceptions: { type: integer, description: ingest_exception status=OPEN 计数 }
+            pendingJobs: { type: integer, description: 当前 env 下 outbox_job PENDING 计数 }
+            uploadTasksByState: { type: object, additionalProperties: { type: integer }, description: 当前 env 下 upload_task 按 state 分组计数 }
+            lastActivityUtc: { type: string, format: date-time, nullable: true, description: audit_log 最近 occurred_at（UTC） }
+        requestId: { type: string }
+    HealthResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [env, db, serverTimeUtc]
+          properties:
+            env: { type: string, enum: [LIVE, MOCK] }
+            db: { type: string, enum: [OK, UNAVAILABLE], description: 不回显连接细节（NFR-05） }
+            serverTimeUtc: { type: string, format: date-time }
+        requestId: { type: string }
+    # ---- M1+ 计划契约请求体 ----
+    ImportRequest:
+      type: object
+      required: [fileKind, fileHash, content]
+      properties:
+        fileKind: { type: string, description: 导入文件类型（如平台药品映射导出） }
+        fileName: { type: string }
+        fileHash: { type: string, description: 文件 SHA-256 摘要字符串；同导入意图幂等（MD-03） }
+        content: { type: string, description: 上传内容（Base64）；默认边界 20 MB/10000 行，超限 422 要求拆批 }
+    CommitImportRequest:
+      type: object
+      required: [expectedVersion]
+      properties:
+        expectedVersion: { type: string, description: rowversion 字符串 }
+        reason: { type: string }
+    SyncJobRequest:
+      type: object
+      required: [entity, start, end]
+      properties:
+        entity: { type: string, description: 同步实体（有界枚举，拒绝任意目标） }
+        start: { type: string, format: date-time, description: 窗口起点（有界参数，超限 422） }
+        end: { type: string, format: date-time }
+        filters: { type: object, description: 可选过滤条件 }
+    ConfirmAllocationRequest:
+      type: object
+      required: [allocationVersion, expectedVersion, reason]
+      properties:
+        allocationVersion: { type: string, description: 分配版本字符串 }
+        expectedVersion: { type: string, description: rowversion 字符串 }
+        reason: { type: string }
+    ReconciliationRequest:
+      type: object
+      required: [windowStart, windowEnd, businessType]
+      properties:
+        windowStart: { type: string, format: date-time }
+        windowEnd: { type: string, format: date-time }
+        businessType: { type: string, description: 业务类型（有界枚举） }
+    ConnectionTestRequest:
+      type: object
+      required: [configId]
+      properties:
+        configId: { type: integer, format: int64, description: 仅接受已保存配置 ID；拒绝任意连接目标（NFR-05，防 SSRF） }
+    SettingUpdateRequest:
+      type: object
+      required: [expectedVersion, reason]
+      properties:
+        valueJson: { type: string, nullable: true, description: 非敏感配置 JSON 文本 }
+        secretValue: { type: string, nullable: true, writeOnly: true, description: 敏感字段只写不回显（AUTH-01/NFR-05） }
+        expectedVersion: { type: string, description: rowversion 字符串 }
+        reason: { type: string }
+    JobAccepted:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [jobId]
+          properties:
+            jobId: { type: string, description: 'outbox_job 作业 ID 字符串；GET /jobs/{id} 查询进度' }
+        requestId: { type: string }
+  responses:
+    Unauthorized: { description: 未登录, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Forbidden: { description: 无权限, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Conflict: { description: 版本/占用/幂等冲突, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Unprocessable: { description: 业务不满足, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    BadRequest: { description: CSRF 令牌缺失/无效（CSRF_INVALID）或请求体畸形（BAD_REQUEST）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NotFound: { description: 对象不存在或不属于当前门店, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+security: [{ cookieAuth: [] }]
+paths:
+  # ================= M0 已实现端点（真实形状） =================
+  /auth/session:
+    get:
+      x-phase: M0
+      security: []
+      description: 会话状态与 CSRF 令牌（匿名可达）。已认证时附 username 与权限列表。
+      responses:
+        '200': { description: 会话与 CSRF 令牌, content: { application/json: { schema: { $ref: '#/components/schemas/SessionResponse' } } } }
+  /auth/login:
+    post:
+      x-phase: M0
+      security: []
+      description: 登录（匿名可达，但必须携带有效 X-CSRF-TOKEN，防登录 CSRF）。失败写审计（actor 超 64 字符截断保存），返回 401 AUTH_FAILED，不区分用户名/密码错误。
+      parameters: [{ $ref: '#/components/parameters/CsrfToken' }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/LoginRequest' } } }
+      responses:
+        '200': { description: 登录成功（Set-Cookie .tf.auth）, content: { application/json: { schema: { $ref: '#/components/schemas/LoginResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/logout:
+    post:
+      x-phase: M0
+      description: 退出登录并写审计。天然幂等（重复退出无副作用），不经幂等执行器；匿名调用亦安全退出。须携带 X-CSRF-TOKEN。
+      parameters: [{ $ref: '#/components/parameters/CsrfToken' }]
+      responses:
+        '200': { description: 已退出, content: { application/json: { schema: { $ref: '#/components/schemas/EmptyDataResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /admin/users:
+    post:
+      x-phase: M0
+      description: >
+        创建用户（权限 system:manage）。幂等执行器包裹（API-02）：Idempotency-Key 必填（缺失/超 128 字符 422），
+        同键同内容重放原结果，同键不同内容 409 IDEMPOTENCY_CONFLICT；幂等记录与业务同事务。
+        用户名重复 409 CONFLICT；用户名空或密码不足 10 位 422 VALIDATION。密码不可逆哈希（AUTH-02）。
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/CreateUserRequest' } } }
+      responses:
+        '200': { description: 创建成功（含新用户 ID）, content: { application/json: { schema: { $ref: '#/components/schemas/CreateUserResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: 用户名已存在（CONFLICT）或同幂等键不同请求体（IDEMPOTENCY_CONFLICT）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /admin/users/{id}/permissions:
+    post:
+      x-phase: M0
+      description: 授予/收回权限（权限 system:manage）。未知权限项 422；重复授予幂等（UQ_user_permission）；变更与审计同事务（AUTH-03）。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/GrantPermissionRequest' } } }
+      responses:
+        '200': { description: 权限已变更, content: { application/json: { schema: { $ref: '#/components/schemas/EmptyDataResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /dashboard:
+    get:
+      x-phase: M0
+      description: 待办计数/同步健康（权限 trace:read）。真实 DB 计数：接入异常 OPEN 数、当前 env PENDING 作业数、上传任务按态分组、最近审计时间。只读不触发平台请求（UI-01）。
+      responses:
+        '200': { description: 待办计数/同步健康/深链条件, content: { application/json: { schema: { $ref: '#/components/schemas/DashboardResponse' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /health:
+    get:
+      x-phase: M0
+      security: []
+      description: 健康检查（匿名）。DB 探测失败仅返回 UNAVAILABLE，不回显连接细节（NFR-05）。
+      responses:
+        '200': { description: 环境/DB 状态/服务器 UTC 时间, content: { application/json: { schema: { $ref: '#/components/schemas/HealthResponse' } } } }
+  # ================= M1+ 计划契约（未实现，x-phase 标注） =================
+  /products:
+    get:
+      x-phase: M1
+      description: 分页商品列表（权限 trace:read）。无密钥字段。
+      parameters: [{ $ref: '#/components/parameters/Page' }, { $ref: '#/components/parameters/PageSize' },
+        { name: keyword, in: query, schema: { type: string } },
+        { name: classification, in: query, schema: { type: string, enum: [UNKNOWN, REQUIRED, EXEMPT] } },
+        { name: mappingState, in: query, schema: { type: string } }]
+      responses:
+        '200': { description: 分页商品, content: { application/json: { schema: { $ref: '#/components/schemas/PageMeta' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /suppliers:
+    get:
+      x-phase: M1
+      description: 分页供应商列表（权限 trace:read）。dwbh/名称/信用代码/平台稳定 ID/审核/匹配态；无密钥。
+      parameters: [{ $ref: '#/components/parameters/Page' }, { $ref: '#/components/parameters/PageSize' },
+        { name: keyword, in: query, schema: { type: string } },
+        { name: mappingState, in: query, schema: { type: string } }]
+      responses:
+        '200': { description: 分页供应商, content: { application/json: { schema: { $ref: '#/components/schemas/PageMeta' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /imports:
+    post:
+      x-phase: M1
+      description: 导入先暂存预览（权限 master:match，MD-03）。202 返回 jobId；文件摘要幂等（UQ_import_intent）；超默认 20 MB/10000 行边界 422 要求拆批。
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ImportRequest' } } }
+      responses:
+        '202': { description: 已入队暂存校验作业, content: { application/json: { schema: { $ref: '#/components/schemas/JobAccepted' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /imports/{id}/commit:
+    post:
+      x-phase: M1
+      description: 预览确认后提交导入（权限 master:match）。expectedVersion 校验；冲突保留失败行，失败行可单独重提，成功行重复导入幂等；不自动覆盖锁定映射。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/CommitImportRequest' } } }
+      responses:
+        '200': { description: 提交结果（成功/失败行数与失败原因）, content: { application/json: { schema: { $ref: '#/components/schemas/EmptyDataResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /product-mappings/{id}/confirm:
+    post:
+      x-phase: M1
+      description: 人工确认商品映射（权限 master:match，MATCH-05）。显示双方身份/字段差异/证据/影响单据；强冲突（CONFLICT）禁止按"忽略"确认（409）；数据库双向有效唯一索引兜底；人工确认后锁定不被自动重跑替换。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ConfirmMappingRequest' } } }
+      responses:
+        '200': { description: 映射已确认（MANUAL_CONFIRMED，锁定）, content: { application/json: { schema: { $ref: '#/components/schemas/EmptyDataResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: 版本冲突/强冲突/双向有效唯一冲突, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /supplier-mappings/{id}/confirm:
+    post:
+      x-phase: M1
+      description: 人工确认供应商映射（权限 master:match，ENT-01/02）。核实平台审核状态与稳定企业身份 ref_ent_id；名称版本不复制成不同稳定企业；强冲突 409。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ConfirmMappingRequest' } } }
+      responses:
+        '200': { description: 映射已确认, content: { application/json: { schema: { $ref: '#/components/schemas/EmptyDataResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /products/{id}/trace-policy:
+    post:
+      x-phase: M1
+      description: 变更追溯分类（权限 master:classify，MD-01）。REQUIRED→EXEMPT 须原因并显示受影响未传任务；审计留痕；未传任务失效重算；禁止批量免除消除漏码错误。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/TracePolicyRequest' } } }
+      responses:
+        '200': { description: 分类已变更（含受影响任务提示）, content: { application/json: { schema: { $ref: '#/components/schemas/EmptyDataResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /upstream-bills:
+    get:
+      x-phase: M2
+      description: 上游出库单列表（权限 trace:read，UP-01/02）。下载完整性、行/码与占用；列表不提供"视为已入库"。
+      parameters: [{ $ref: '#/components/parameters/Page' }, { $ref: '#/components/parameters/PageSize' },
+        { name: upstreamRefEntId, in: query, schema: { type: string }, description: 上游主体平台稳定 ID },
+        { name: billNo, in: query, schema: { type: string } },
+        { name: completeness, in: query, schema: { type: string, enum: [LIST_ONLY, DETAIL_PARTIAL, COMPLETE, INCOMPLETE] } },
+        { name: dateStart, in: query, schema: { type: string, format: date } },
+        { name: dateEnd, in: query, schema: { type: string, format: date } }]
+      responses:
+        '200': { description: 分页上游单, content: { application/json: { schema: { $ref: '#/components/schemas/PageMeta' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /upstream-bills/{id}:
+    get:
+      x-phase: M2
+      description: 上游单详情（权限 trace:read）。行/码集合、包装层级、父子关系、来源版本与获取时间；缺字段标明缺失。
+      parameters: [{ $ref: '#/components/parameters/ResourceId' }]
+      responses:
+        '200': { description: 上游单详情（行/码/占用）, content: { application/json: { schema: { type: object, properties: { data: { type: object }, requestId: { type: string } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /sync-jobs:
+    post:
+      x-phase: M1
+      description: 触发有界同步作业（权限 job:rematch 或 system:manage 按实体）。有界参数（entity/窗口），202 入队；不同步等待全部 TOP；无条件补拉拒绝（UI-13）。
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/SyncJobRequest' } } }
+      responses:
+        '202': { description: 同步作业已入队, content: { application/json: { schema: { $ref: '#/components/schemas/JobAccepted' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { description: 参数越界/无界窗口/通道暂停, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /inbounds:
+    get:
+      x-phase: M2
+      description: 入库单列表（权限 trace:read）。匹配态/供应商/时间/单号筛选；本地/上游/差异/资格及上传态。
+      parameters: [{ $ref: '#/components/parameters/Page' }, { $ref: '#/components/parameters/PageSize' },
+        { name: matchState, in: query, schema: { type: string, enum: [NOT_REQUIRED, UNMATCHED, PARTIAL, AMBIGUOUS, CONFLICT, COMPLETE] } },
+        { name: supplierId, in: query, schema: { type: string }, description: 本地 dwbh 字符串 },
+        { name: billNo, in: query, schema: { type: string }, description: djbh },
+        { name: dateStart, in: query, schema: { type: string, format: date } },
+        { name: dateEnd, in: query, schema: { type: string, format: date } }]
+      responses:
+        '200': { description: 分页入库单, content: { application/json: { schema: { $ref: '#/components/schemas/PageMeta' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /inbounds/{id}:
+    get:
+      x-phase: M2
+      description: 入库单详情（权限 trace:read）。逐行本地/平台商品、批号、单位、数量、码及证据，差异高亮（UI-11）；冻结后不可编辑。
+      parameters: [{ $ref: '#/components/parameters/ResourceId' }]
+      responses:
+        '200': { description: 入库单详情（行/分配/资格/上传态）, content: { application/json: { schema: { type: object, properties: { data: { type: object }, requestId: { type: string } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /inbounds/{id}/rematch:
+    post:
+      x-phase: M2
+      description: 一键重新匹配（权限 job:rematch，IN-01）。只重新排队（202），运行匹配本身不得绕过完整性条件。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/TaskActionRequest' } } }
+      responses:
+        '202': { description: 重新匹配作业已入队, content: { application/json: { schema: { $ref: '#/components/schemas/JobAccepted' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /inbounds/{id}/allocations:
+    post:
+      x-phase: M2
+      description: 人工补配分配（权限 inbound:allocate，IN-03/04/08）。行与上游实际码列表；409 争用（两 session 争同一码只一个成功，另一个可读冲突且 UI 刷新）；只做允许的有效分配；禁止按金额比例配码/随意取前 N 个码。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/AllocationRequest' } } }
+      responses:
+        '200': { description: 分配已保存（TENTATIVE/RESERVED）, content: { application/json: { schema: { $ref: '#/components/schemas/EmptyDataResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: 码占用争用/版本冲突, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: 换算不明/超精度/数量非正/AMBIGUOUS 多解, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /inbounds/{id}/confirm-allocation:
+    post:
+      x-phase: M2
+      description: 确认补配（权限 inbound:allocate，IN-07）。确认前提示自动上报后果；确认后重新执行同样资格检查（禁止"人工已处理因此跳过校验"）；全匹配自动建 102 任务，响应提示自动上传。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ConfirmAllocationRequest' } } }
+      responses:
+        '200': { description: 资格复查结果；ELIGIBLE 时自动建任务并提示自动上传, content: { application/json: { schema: { $ref: '#/components/schemas/EmptyDataResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { description: 资格不满足（阻断原因逐项返回）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /sales:
+    get:
+      x-phase: M3
+      description: POS 销售列表（权限 trace:read，SALE-01）。时间/小票/商品/异常筛选；原始行与核验信息；禁止编辑原单码。
+      parameters: [{ $ref: '#/components/parameters/Page' }, { $ref: '#/components/parameters/PageSize' },
+        { name: lshh, in: query, schema: { type: string }, description: 小票号字符串（保留前导零） },
+        { name: productId, in: query, schema: { type: string }, description: spid 字符串 },
+        { name: exceptionOnly, in: query, schema: { type: boolean } },
+        { name: dateStart, in: query, schema: { type: string, format: date } },
+        { name: dateEnd, in: query, schema: { type: string, format: date } }]
+      responses:
+        '200': { description: 分页销售事件, content: { application/json: { schema: { $ref: '#/components/schemas/PageMeta' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /sales/{id}:
+    get:
+      x-phase: M3
+      description: 销售事件详情（权限 trace:read）。原始行（plh 分行不聚合）、码完整率、核验/依赖/上传态；不提供扫码或修改 TraceCode/原交易数量。
+      parameters: [{ $ref: '#/components/parameters/ResourceId' }]
+      responses:
+        '200': { description: 销售详情, content: { application/json: { schema: { type: object, properties: { data: { type: object }, requestId: { type: string } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /returns:
+    get:
+      x-phase: M3
+      description: 退货列表（权限 trace:read，RET-01/03）。消费者/供应商页签；负数来源行、原小票、码、匹配证据、确认/依赖/上传态；无来源采购退货显示未接入。
+      parameters: [{ $ref: '#/components/parameters/Page' }, { $ref: '#/components/parameters/PageSize' },
+        { name: returnKind, in: query, schema: { type: string, enum: [CONSUMER_RETURN, PURCHASE_RETURN] } },
+        { name: lshh, in: query, schema: { type: string } },
+        { name: dateStart, in: query, schema: { type: string, format: date } },
+        { name: dateEnd, in: query, schema: { type: string, format: date } }]
+      responses:
+        '200': { description: 分页退货事件, content: { application/json: { schema: { $ref: '#/components/schemas/PageMeta' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /returns/{id}:
+    get:
+      x-phase: M3
+      description: 退货事件详情（权限 trace:read）。原负数行/码/原销售候选与证据；保留原值不净额抵消。
+      parameters: [{ $ref: '#/components/parameters/ResourceId' }]
+      responses:
+        '200': { description: 退货详情, content: { application/json: { schema: { type: object, properties: { data: { type: object }, requestId: { type: string } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /verifications/{id}/recheck:
+    post:
+      x-phase: M3
+      description: 重新核验（权限 upload:query，SALE-02）。202 入队；不绕过同步完整性；核验绑定源头摘要/码集合摘要/规则版本。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/TaskActionRequest' } } }
+      responses:
+        '202': { description: 核验作业已入队, content: { application/json: { schema: { $ref: '#/components/schemas/JobAccepted' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /returns/{id}/confirm:
+    post:
+      x-phase: M3
+      description: 消费者退货首次人工确认（权限 return:confirm，DEF-02/RET-02）。须真实退回码、商品一致及可解释原销售关系；无候选或多候选阻断（422）；原销售存在则等待其终态；确认后校验建 116 任务；不默认自动首次上报。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ReturnConfirmRequest' } } }
+      responses:
+        '200': { description: 已确认并按条件建退货任务, content: { application/json: { schema: { $ref: '#/components/schemas/EmptyDataResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { description: 原销售关系不可解释/多候选/码不一致/G-RETURN 未取证, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /trace-codes/{code}/events:
+    get:
+      x-phase: M4
+      description: 码事件链（权限 trace:read，DB-05/UI-08）。精确码（normalized）；授权后完整事件链与关联快照；一个码多事件合法，不仅显示最后状态。
+      parameters:
+        - { name: code, in: path, required: true, schema: { type: string }, description: 规范化追溯码（精确匹配，字符串） }
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/PageSize' }
+      responses:
+        '200': { description: 分页事件链（方向/前序依赖/证据）, content: { application/json: { schema: { $ref: '#/components/schemas/PageMeta' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /upload-tasks:
+    get:
+      x-phase: M3
+      description: 上传任务列表（权限 trace:read）。类型/状态/日期/平台号/本地号筛选；子单、尝试数、失败码计数、request_id、下次运行。
+      parameters: [{ $ref: '#/components/parameters/Page' }, { $ref: '#/components/parameters/PageSize' },
+        { name: taskType, in: query, schema: { type: string, enum: [PURCHASE_IN_102, RETAIL_321, CONSUMER_RETURN_116, PURCHASE_RETURN_202] } },
+        { name: state, in: query, schema: { type: string, description: 12 态之一（Blocked/Ready/Dispatching/Accepted/AcceptanceUnknown/Processing/RetryWait/PartialSuccess/ResultUnresolved/Succeeded/Failed/ManualAction） } },
+        { name: billCode, in: query, schema: { type: string }, description: 平台单号字符串 },
+        { name: eventKey, in: query, schema: { type: string }, description: 本地业务事件键字符串 },
+        { name: dateStart, in: query, schema: { type: string, format: date } },
+        { name: dateEnd, in: query, schema: { type: string, format: date } }]
+      responses:
+        '200': { description: 分页上传任务, content: { application/json: { schema: { $ref: '#/components/schemas/PageMeta' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /upload-tasks/{id}:
+    get:
+      x-phase: M3
+      description: 上传任务详情（权限 trace:read）。子单/尝试/失败码/脱敏原文（原文响应受权限保护并脱敏，AUD-01）；成功/部分成功禁通用重发。
+      parameters: [{ $ref: '#/components/parameters/ResourceId' }]
+      responses:
+        '200': { description: 任务详情（子单/尝试/逐码结果）, content: { application/json: { schema: { type: object, properties: { data: { type: object }, requestId: { type: string } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /upload-tasks/{id}/query:
+    post:
+      x-phase: M3
+      description: 状态回查（权限 upload:query，IDEM-04/05）。只排回查作业（202），不上传；ACCEPTANCE_UNKNOWN 首先回查，禁止自动重发。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/TaskActionRequest' } } }
+      responses:
+        '202': { description: 回查作业已入队, content: { application/json: { schema: { $ref: '#/components/schemas/JobAccepted' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /upload-tasks/{id}/retry:
+    post:
+      x-phase: M3
+      description: 受控重试（权限 upload:retry，IDEM-05）。后端判定可证明未受理且合同允许重传才入队（202，复用任务与单号）；否则 409（状态不允许）/422（证据不足）；部分成功/成功任务禁全单重发；无通用"强制成功"。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/TaskActionRequest' } } }
+      responses:
+        '202': { description: 受控重试已入队（RETRY_WAIT→READY）, content: { application/json: { schema: { $ref: '#/components/schemas/JobAccepted' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: 当前状态不允许重试（已受理/处理中/成功/部分成功）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: 未受理证据不足/合同不允许重传, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /reconciliation-runs:
+    post:
+      x-phase: M4
+      description: 触发日对账（权限 system:manage 或 audit:read 按配置，REC-01/03）。日期窗+业务类型有界参数；202 入队；持久差异结果；统计口径未核对时 INCOMPLETE 不显示"无差异"。
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ReconciliationRequest' } } }
+      responses:
+        '202': { description: 对账作业已入队, content: { application/json: { schema: { $ref: '#/components/schemas/JobAccepted' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /jobs/{id}:
+    get:
+      x-phase: M1
+      description: 作业进度（权限 trace:read）。jobState/attemptCount/nextRunAt/lastError/leaseOwner/fencingToken。
+      parameters: [{ $ref: '#/components/parameters/ResourceId' }]
+      responses:
+        '200': { description: 作业详情, content: { application/json: { schema: { type: object, properties: { data: { type: object }, requestId: { type: string } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /audit-logs:
+    get:
+      x-phase: M1
+      description: 审计记录（权限 audit:read，AUD-01）。操作者/时间/对象/原因/前后值摘要/请求关联号；审计不可变，无普通业务删除入口。
+      parameters: [{ $ref: '#/components/parameters/Page' }, { $ref: '#/components/parameters/PageSize' },
+        { name: action, in: query, schema: { type: string } },
+        { name: objectType, in: query, schema: { type: string } },
+        { name: objectId, in: query, schema: { type: string } },
+        { name: dateStart, in: query, schema: { type: string, format: date } },
+        { name: dateEnd, in: query, schema: { type: string, format: date } }]
+      responses:
+        '200': { description: 分页审计记录, content: { application/json: { schema: { $ref: '#/components/schemas/PageMeta' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /settings/connections/test:
+    post:
+      x-phase: M1
+      description: 测试已保存连接（权限 system:manage，UI-10/NFR-05）。仅接受已保存配置 ID，拒绝任意连接目标（防 SSRF）；ERP 仅只读测试；不改变状态的只读探测，不需幂等键。
+      parameters: [{ $ref: '#/components/parameters/CsrfToken' }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ConnectionTestRequest' } } }
+      responses:
+        '200': { description: 连接健康结果（不回显凭据/连接串）, content: { application/json: { schema: { $ref: '#/components/schemas/EmptyDataResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { description: 配置不存在/拒绝任意目标, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /settings/{key}:
+    put:
+      x-phase: M1
+      description: 更新设置（权限 system:manage）。expectedVersion+reason；敏感字段只写不回显（secretValue writeOnly）；配置变更审计（AUD-01）；调度/通道暂停参数有界。
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string }, description: 设置键（app_setting.setting_key） }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/SettingUpdateRequest' } } }
+      responses:
+        '200': { description: 设置已更新（敏感值不回显）, content: { application/json: { schema: { $ref: '#/components/schemas/EmptyDataResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }

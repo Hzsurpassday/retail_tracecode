@@ -23,6 +23,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\TraceFlow.Domain\TraceFlow.Domain.csproj" />
     <ProjectReference Include="..\..\src\TraceFlow.Application\TraceFlow.Application.csproj" />
+    <ProjectReference Include="..\..\src\TraceFlow.Infrastructure\TraceFlow.Infrastructure.csproj" />
   </ItemGroup>
 
 </Project>

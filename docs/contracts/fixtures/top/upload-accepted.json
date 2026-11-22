@@ -1,0 +1,11 @@
+{
+  "_verified": false,
+  "_note": "G-TOP 验证后替换为真实脱敏响应；当前仅供假平台",
+  "alibaba_alihealth_drugtrace_top_lsyd_uploadinoutbill_response": {
+    "response_success": true,
+    "msg_code": "SUCCESS",
+    "sub_msg_code": null,
+    "model": { "bill_code": "TF1", "task_id": "MOCK-TASK-1" },
+    "request_id": "mock-req-1"
+  }
+}

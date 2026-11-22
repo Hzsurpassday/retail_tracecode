@@ -1,0 +1,10 @@
+{
+  "_verified": false,
+  "_note": "HTTP 200 + response_success=false 必须判失败（TOP-01/AT-047）",
+  "alibaba_alihealth_drugtrace_top_lsyd_uploadretail_response": {
+    "response_success": false,
+    "msg_code": "FAIL_BIZ_ERROR",
+    "sub_msg_code": "MOCK_INVALID_CODE",
+    "request_id": "mock-req-4"
+  }
+}

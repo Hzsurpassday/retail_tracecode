@@ -5,6 +5,7 @@
 # Node / React
 node_modules/
 traceflow/src/TraceFlow.Host/wwwroot/
+*.tsbuildinfo
 #  secrets & local config
 appsettings.Local.json
 *.pfx

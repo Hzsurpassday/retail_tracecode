@@ -1,0 +1,9 @@
+{
+  "_fixture": "混合正负小票：分 SALE/CONSUMER_RETURN 两事件，不净额抵消（DEF-06/RET-01）",
+  "salemast": [{ "lshh": "000125", "rq": "2026-11-21", "ontime": "09:10:00" }],
+  "salemxls": [
+    { "lshh": "000125", "plh": "1", "spid": "SP0001", "shl": 1, "TraceCode": "81234567890123456792" },
+    { "lshh": "000125", "plh": "2", "spid": "SP0001", "shl": -1, "TraceCode": "81234567890123456789" },
+    { "lshh": "000125", "plh": "3", "spid": "SP0003", "shl": 0, "TraceCode": null }
+  ]
+}
