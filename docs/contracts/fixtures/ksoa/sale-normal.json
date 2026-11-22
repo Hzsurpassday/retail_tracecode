@@ -1,0 +1,9 @@
+{
+  "_fixture": "KSOA 销售候选结构（未取证，G-ERP 前仅用于 Mock）",
+  "salemast": [{ "lshh": "000123", "rq": "2026-11-20", "ontime": "14:32:05" }],
+  "salemxls": [
+    { "lshh": "000123", "plh": "1", "spid": "SP0001", "shl": 1, "TraceCode": "81234567890123456789" },
+    { "lshh": "000123", "plh": "2", "spid": "SP0001", "shl": 1, "TraceCode": "81234567890123456790" },
+    { "lshh": "000123", "plh": "3", "spid": "SP0002", "shl": 2, "TraceCode": null }
+  ]
+}

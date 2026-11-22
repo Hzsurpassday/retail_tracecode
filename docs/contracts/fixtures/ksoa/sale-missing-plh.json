@@ -1,0 +1,5 @@
+{
+  "_fixture": "plh 空行：必须进接入异常，不得丢行或造行号（SRC-02）",
+  "salemast": [{ "lshh": "000124", "rq": "2026-11-20", "ontime": "15:01:00" }],
+  "salemxls": [{ "lshh": "000124", "plh": null, "spid": "SP0001", "shl": 1, "TraceCode": "81234567890123456791" }]
+}

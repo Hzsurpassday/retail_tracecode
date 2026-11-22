@@ -1,0 +1,9 @@
+{
+  "_verified": false,
+  "_note": "result_type=1 上传成功≠最终业务成功（TOP-02/AT-048）",
+  "alibaba_alihealth_drugtrace_top_lsyd_query_billstatus_response": {
+    "response_success": true,
+    "model": { "result_type": "1", "sub_process_flag": null },
+    "request_id": "mock-req-2"
+  }
+}
