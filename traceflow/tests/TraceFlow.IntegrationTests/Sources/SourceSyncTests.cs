@@ -279,6 +279,91 @@ public class SourceSyncTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Both_missing_doc_key_pseudo_docs_record_their_issues_single_version() // SRC-02 / T7 评审修复
+    {
+        var dir = TempDir();
+        try
+        {
+            // 同一 fetch 产生两个 docKey="(missing-doc-key)" 的伪单：
+            // 无 lshh 的行→孤儿聚合伪单（ORPHAN_LINE）；空 lshh 单头→缺键伪单（MISSING_DOC_KEY）。
+            // 两者 null 业务时间+零行→content_hash 相同；第二个不得被摘要去重吞掉异常。
+            await File.WriteAllTextAsync(Path.Combine(dir, "m.json"), """
+            { "salemast": [{ "lshh": "", "rq": "2026-11-20", "ontime": "08:00:00" }],
+              "salemxls": [{ "plh": "1", "spid": "SP0001", "shl": 1 }] }
+            """);
+            var (orgId, _) = await SeedAsync();
+            var r1 = await NewSvc(dir).RunAsync(orgId, "MOCK", "sale", Start, End, CancellationToken.None);
+            Assert.Equal(2, r1.Issues); // 两个伪单的键异常都必须落台账
+            await using var c = new SqlConnection(_fx.ConnectionString);
+            Assert.Equal(1, await c.ExecuteScalarAsync<int>(
+                "SELECT COUNT(*) FROM dbo.ingest_exception WHERE source_document_key=N'(missing-doc-key)' AND exception_type=N'ORPHAN_LINE'"));
+            Assert.Equal(1, await c.ExecuteScalarAsync<int>(
+                "SELECT COUNT(*) FROM dbo.ingest_exception WHERE source_document_key=N'(missing-doc-key)' AND exception_type=N'MISSING_DOC_KEY'"));
+            // 不可变版本：同 docKey+同摘要→仅一个版本，且为 INVALID
+            Assert.Equal(1, await c.ExecuteScalarAsync<int>(
+                "SELECT COUNT(*) FROM dbo.source_snapshot WHERE source_document_key=N'(missing-doc-key)'"));
+            Assert.Equal("INVALID", await c.ExecuteScalarAsync<string>(
+                "SELECT completeness_status FROM dbo.source_snapshot WHERE source_document_key=N'(missing-doc-key)'"));
+            // 完全相同重跑：问题感知去重仍零写入（不重复异常、不新增版本）
+            var r2 = await NewSvc(dir).RunAsync(orgId, "MOCK", "sale", Start, End, CancellationToken.None);
+            Assert.Equal(0, r2.NewVersions);
+            Assert.Equal(0, r2.Issues);
+            Assert.Equal(2, await c.ExecuteScalarAsync<int>(
+                "SELECT COUNT(*) FROM dbo.ingest_exception WHERE source_document_key=N'(missing-doc-key)'"));
+            Assert.Equal(1, await c.ExecuteScalarAsync<int>(
+                "SELECT COUNT(*) FROM dbo.source_snapshot WHERE source_document_key=N'(missing-doc-key)'"));
+        }
+        finally { Directory.Delete(dir, recursive: true); }
+    }
+
+    [Fact]
+    public async Task Cross_type_key_reuse_recorded_even_on_identical_content_hash() // SRC-02 / T7 评审修复
+    {
+        var dirS = TempDir(); var dirP = TempDir();
+        try
+        {
+            // 同 docKey+同业务时间+零行→跨单据类型 content_hash 完全相同（哈希不含 document_type）。
+            // KEY_REUSE 检测不得被摘要去重短路；同摘要不产生新版本，旧版本字节不动。
+            await File.WriteAllTextAsync(Path.Combine(dirS, "s.json"), """
+            { "salemast": [{ "lshh": "COLL2", "rq": "2026-11-20", "ontime": "08:00:00" }], "salemxls": [] }
+            """);
+            await File.WriteAllTextAsync(Path.Combine(dirP, "p.json"), """
+            { "jh_rkhz": [{ "djbh": "COLL2", "rq": "2026-11-20", "ontime": "08:00:00", "dwbh": "DW0001" }], "jh_rkmx": [] }
+            """);
+            var (orgId, _) = await SeedAsync();
+            await NewSvc(dirS).RunAsync(orgId, "MOCK", "sale", Start, End, CancellationToken.None);
+            await using var c = new SqlConnection(_fx.ConnectionString);
+            var rawV1 = await c.ExecuteScalarAsync<string>(
+                "SELECT raw_header FROM dbo.source_snapshot WHERE source_document_key=N'COLL2' AND version=1");
+            var hashV1 = await c.ExecuteScalarAsync<string>(
+                "SELECT content_hash FROM dbo.source_snapshot WHERE source_document_key=N'COLL2' AND version=1");
+            await NewSvc(dirP).RunAsync(orgId, "MOCK", "purchase-in", Start, End, CancellationToken.None);
+            Assert.Equal(1, await c.ExecuteScalarAsync<int>(
+                "SELECT COUNT(*) FROM dbo.ingest_exception WHERE source_document_key=N'COLL2' AND exception_type=N'KEY_REUSE'"));
+            // 同摘要→无新版本；v1 的类型/状态/raw/哈希全部原样
+            Assert.Equal(1, await c.ExecuteScalarAsync<int>(
+                "SELECT COUNT(*) FROM dbo.source_snapshot WHERE source_document_key=N'COLL2'"));
+            Assert.Equal("SALE", await c.ExecuteScalarAsync<string>(
+                "SELECT document_type FROM dbo.source_snapshot WHERE source_document_key=N'COLL2' AND version=1"));
+            Assert.Equal("DISCOVERED", await c.ExecuteScalarAsync<string>(
+                "SELECT completeness_status FROM dbo.source_snapshot WHERE source_document_key=N'COLL2' AND version=1"));
+            Assert.Equal(rawV1, await c.ExecuteScalarAsync<string>(
+                "SELECT raw_header FROM dbo.source_snapshot WHERE source_document_key=N'COLL2' AND version=1"));
+            Assert.Equal(hashV1, await c.ExecuteScalarAsync<string>(
+                "SELECT content_hash FROM dbo.source_snapshot WHERE source_document_key=N'COLL2' AND version=1"));
+            // purchase-in 重跑：KEY_REUSE 已在台账→不重复记录（EMPTY_DETAIL+KEY_REUSE 共 2 条）
+            var r3 = await NewSvc(dirP).RunAsync(orgId, "MOCK", "purchase-in", Start, End, CancellationToken.None);
+            Assert.Equal(0, r3.NewVersions);
+            Assert.Equal(0, r3.Issues);
+            Assert.Equal(1, await c.ExecuteScalarAsync<int>(
+                "SELECT COUNT(*) FROM dbo.ingest_exception WHERE source_document_key=N'COLL2' AND exception_type=N'KEY_REUSE'"));
+            Assert.Equal(2, await c.ExecuteScalarAsync<int>(
+                "SELECT COUNT(*) FROM dbo.ingest_exception WHERE source_document_key=N'COLL2'"));
+        }
+        finally { Directory.Delete(dirS, recursive: true); Directory.Delete(dirP, recursive: true); }
+    }
+
+    [Fact]
     public async Task Live_env_refuses_sync_in_m1()
     {
         var (orgId, _) = await SeedAsync();

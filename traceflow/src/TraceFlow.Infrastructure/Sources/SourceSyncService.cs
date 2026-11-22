@@ -14,7 +14,9 @@ public sealed record SyncResult(int DocumentsSeen, int NewVersions, int Complete
 /// <summary>
 /// 来源同步（SYNC-01/03、SRC-01/02/04/05、DB-02）：
 /// 抓取在事务外；落库整体一个事务——任何失败（含 docKey 超宽 SqlException）回滚全部，检查点不动（AT-006）。
-/// 不可变版本：同 docKey 摘要相同→无操作；摘要变化→新版本（旧版本字节不动）。
+/// 不可变版本：同 docKey 摘要相同→不产生新版本（旧版本字节不动）；摘要变化→新版本。
+/// 摘要去重是问题感知的（T7 评审修复）：content_hash 不含 KeyIssues/document_type，
+/// 命中时仍比对异常台账、只补记未记录的键质量异常（含跨类型 KEY_REUSE）；完全相同重跑→零写入。
 /// 异常单据 INVALID 但 raw 完整保存；零行 DISCOVERED+EMPTY_DETAIL；正常 STABILIZING（Task 8 续稳定期）。
 /// M1 仅 MOCK：LIVE 一律 AdapterNotCertifiedException（G-ERP 门禁）。
 /// </summary>
@@ -47,6 +49,17 @@ public sealed class SourceSyncService
         var sysId = await c.ExecuteScalarAsync<long>(new CommandDefinition(
             "SELECT id FROM dbo.source_system WHERE system_code=N'KSOA'", transaction: tx, cancellationToken: ct));
 
+        // 异常单点写入：新版本路径与去重补记共用同一 detail 序列化，保证重跑比对逐字节一致。
+        async Task InsertIssueAsync(string docKey, (string? LineKey, string Type, string Detail, string Raw) issue)
+        {
+            await c.ExecuteAsync(new CommandDefinition(@"
+INSERT INTO dbo.ingest_exception(org_id,source_system_id,source_document_key,source_line_key,exception_type,detail)
+VALUES(@org,@sys,@key,@lineKey,@type,@detail)",
+                new { org = orgId, sys = sysId, key = docKey, lineKey = issue.LineKey,
+                      type = issue.Type, detail = JsonSerializer.Serialize(new { detail = issue.Detail, raw = issue.Raw }) }, tx, cancellationToken: ct));
+            issuesTotal++;
+        }
+
         foreach (var doc in docs)
         {
             ct.ThrowIfCancellationRequested();
@@ -61,14 +74,13 @@ SELECT TOP 1 id, version, content_hash, completeness_status, business_datetime, 
 FROM dbo.source_snapshot WITH (UPDLOCK, HOLDLOCK)
 WHERE source_system_id=@sys AND source_document_key=@key ORDER BY version DESC",
                 new { sys = sysId, key = doc.SourceDocumentKey }, tx, cancellationToken: ct));
-            if (latest is not null && latest.content_hash == docHash)
-                continue; // 摘要去重：重复轮询不产生新版本
 
             var issues = new List<(string? LineKey, string Type, string Detail, string Raw)>();
             foreach (var ki in doc.KeyIssues)
                 issues.Add((ki.SourceLineKey, ki.IssueKind, ki.Detail, ki.RawLineJson));
 
-            // DB 级跨表键碰撞（KEY_REUSE）：同 docKey 出现过不同单据类型
+            // DB 级跨表键碰撞（KEY_REUSE）：同 docKey 出现过不同单据类型。
+            // 摘要命中时也必须执行：content_hash 不含 document_type，跨类型同内容否则被去重吞掉。
             var otherType = await c.ExecuteScalarAsync<string?>(new CommandDefinition(@"
 SELECT TOP 1 document_type FROM dbo.source_snapshot
 WHERE source_system_id=@sys AND source_document_key=@key AND document_type<>@t",
@@ -104,6 +116,29 @@ WHERE source_system_id=@sys AND source_document_key=@key AND document_type<>@t",
             var hasFatal = issues.Count > 0;
             if (!hasFatal && insertable.Count == 0)
                 issues.Add((null, "EMPTY_DETAIL", "单据无明细行（迟到明细由后续新版本补全，AT-005）", doc.RawHeaderJson));
+
+            // 摘要去重（问题感知，T7 评审修复）：content_hash 只覆盖 docKey+businessUtc+行哈希，
+            // 不含 KeyIssues 与 document_type——同摘要不代表键质量异常已记录（如两个 "(missing-doc-key)"
+            // 伪单、跨类型同内容 KEY_REUSE）。命中时比对台账 (lineKey,type,detail)，只补记缺失异常；
+            // 不产生新版本、不动既有版本字节；完全相同重跑→全部已记录→零写入。
+            if (latest is not null && latest.content_hash == docHash)
+            {
+                var recorded = await c.QueryAsync<ExceptionRow>(new CommandDefinition(@"
+SELECT source_line_key, exception_type, detail FROM dbo.ingest_exception
+WHERE source_system_id=@sys AND source_document_key=@key",
+                    new { sys = sysId, key = doc.SourceDocumentKey }, tx, cancellationToken: ct));
+                var recordedSet = new HashSet<(string? LineKey, string Type, string? Detail)>(
+                    recorded.Select(r => (r.source_line_key, r.exception_type, r.detail)));
+                foreach (var issue in issues)
+                {
+                    var payload = JsonSerializer.Serialize(new { detail = issue.Detail, raw = issue.Raw });
+                    if (!recordedSet.Add((issue.LineKey, issue.Type, payload)))
+                        continue; // 同 (lineKey,type,detail) 已在台账→可证已记录，不重复
+                    await InsertIssueAsync(doc.SourceDocumentKey, issue);
+                }
+                continue;
+            }
+
             var status = hasFatal ? "INVALID" : insertable.Count == 0 ? "DISCOVERED" : "STABILIZING";
             var version = (latest?.version ?? 0) + 1;
 
@@ -133,15 +168,8 @@ VALUES(@snap,@key,@pid,@qty,@unit,@batch,@expiry,@prec,@raw,@norm,@fmt,@hash,@ev
                           hash, evt = l.EventKind, rawLine = l.RawLineJson }, tx, cancellationToken: ct));
             }
 
-            foreach (var (lineKey, type, detail, raw) in issues)
-            {
-                await c.ExecuteAsync(new CommandDefinition(@"
-INSERT INTO dbo.ingest_exception(org_id,source_system_id,source_document_key,source_line_key,exception_type,detail)
-VALUES(@org,@sys,@key,@lineKey,@type,@detail)",
-                    new { org = orgId, sys = sysId, key = doc.SourceDocumentKey, lineKey,
-                          type, detail = JsonSerializer.Serialize(new { detail, raw }) }, tx, cancellationToken: ct));
-                issuesTotal++;
-            }
+            foreach (var issue in issues)
+                await InsertIssueAsync(doc.SourceDocumentKey, issue);
         }
 
         // 检查点 UPSERT（同事务；失败回滚则检查点不动，AT-007 窗口不丢）
@@ -170,5 +198,13 @@ ELSE
         public string completeness_status { get; set; } = "";
         public DateTime? business_datetime { get; set; }
         public string document_type { get; set; } = "";
+    }
+
+    // 去重补记的台账比对行：detail 为入库时的完整 JSON 载荷（与 InsertIssueAsync 序列化一致）。
+    private sealed class ExceptionRow
+    {
+        public string? source_line_key { get; set; }
+        public string exception_type { get; set; } = "";
+        public string? detail { get; set; }
     }
 }
