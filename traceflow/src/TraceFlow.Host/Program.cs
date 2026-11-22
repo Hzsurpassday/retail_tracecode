@@ -57,6 +57,7 @@ if (!webOnly)
     builder.Services.AddHostedService<WorkerHostedService>();
 
 var app = builder.Build();
+await TraceFlow.Infrastructure.Bootstrap.OrgBootstrap.EnsureAsync(connectionString);
 app.UseExceptionHandler(errApp => errApp.Run(ApiErrors.HandleAsync));
 
 if (!workerOnly)
