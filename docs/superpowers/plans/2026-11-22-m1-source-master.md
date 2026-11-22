@@ -838,7 +838,7 @@ public static class BusinessTimeParser
 {
     public static readonly TimeZoneInfo Shanghai = TimeZoneInfo.FindSystemTimeZoneById("China Standard Time");
     private static readonly string[] DateFormats = { "yyyy-MM-dd", "yyyy/M/d", "yyyy/MM/dd", "yyyy-M-d" };
-    private static readonly string[] TimeFormats = { "HH:mm:ss", "H:mm:ss", "HH:mm" };
+    private static readonly string[] TimeFormats = { @"hh\:mm\:ss", @"h\:mm\:ss", @"hh\:mm" }; // TimeSpan.TryParseExact 语法（执行期裁决：原 "HH:mm:ss" 为 DateTime 语法，TimeSpan 拒绝）
 
     public static DateTime? ParseUtc(string? dateRaw, string? timeRaw)
     {
