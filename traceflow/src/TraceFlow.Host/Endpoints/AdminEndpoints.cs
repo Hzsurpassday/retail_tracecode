@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Dapper;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.Data.SqlClient;
@@ -32,7 +33,7 @@ public static class AdminEndpoints
                 return Results.Json(new { code = "CONFLICT", message = "用户名已存在", retryable = false, requestId = ctx.TraceIdentifier }, statusCode: 409);
             }
             await audit.AppendAsync(conn, tx, new AuditEntry(ctx.User.Identity!.Name!, "User", "admin.user.create",
-                "app_user", id.ToString(), req.Reason, null, $"{{\"username\":\"{req.Username}\"}}", ctx.TraceIdentifier, null, "LIVE"));
+                "app_user", id.ToString(), req.Reason, null, JsonSerializer.Serialize(new { username = req.Username }), ctx.TraceIdentifier, null, "LIVE"));
             await tx.CommitAsync();
             return Results.Ok(new { data = new { id }, requestId = ctx.TraceIdentifier });
         }).WithMetadata(new RequirePermissionAttribute(PermissionCatalog.SystemManage));
@@ -48,7 +49,7 @@ public static class AdminEndpoints
             else await perms.RevokeAsync(conn, tx, id, req.Permission, ctx.User.Identity!.Name!);
             await audit.AppendAsync(conn, tx, new AuditEntry(ctx.User.Identity!.Name!, "User",
                 req.Grant ? "admin.permission.grant" : "admin.permission.revoke",
-                "app_user", id.ToString(), req.Reason, null, $"{{\"permission\":\"{req.Permission}\"}}", ctx.TraceIdentifier, null, "LIVE"));
+                "app_user", id.ToString(), req.Reason, null, JsonSerializer.Serialize(new { permission = req.Permission }), ctx.TraceIdentifier, null, "LIVE"));
             await tx.CommitAsync();
             return Results.Ok(new { data = new { }, requestId = ctx.TraceIdentifier });
         }).WithMetadata(new RequirePermissionAttribute(PermissionCatalog.SystemManage));

@@ -33,7 +33,10 @@ public static class AuthEndpoints
             if (user is null || !user.Value.Active ||
                 hasher.VerifyHashedPassword(req.Username, user.Value.Hash, req.Password) == PasswordVerificationResult.Failed)
             {
-                await audit.AppendAsync(conn, null, new AuditEntry(req.Username, "User", "auth.login.failed", "app_user", null, "登录失败", null, null, ctx.TraceIdentifier, null, "LIVE"));
+                // audit_log.actor is nvarchar(64): clamp over-length submitted usernames so the
+                // failure audit INSERT cannot throw (401 preserved, AUTH-02 failure evidence kept).
+                var actor = req.Username.Length > 64 ? req.Username[..64] : req.Username;
+                await audit.AppendAsync(conn, null, new AuditEntry(actor, "User", "auth.login.failed", "app_user", null, "登录失败", null, null, ctx.TraceIdentifier, null, "LIVE"));
                 return Results.Json(new { code = "AUTH_FAILED", message = "用户名或密码错误", retryable = false, requestId = ctx.TraceIdentifier }, statusCode: 401);
             }
             var claims = new[] { new Claim(ClaimTypes.NameIdentifier, user.Value.Id.ToString()), new Claim(ClaimTypes.Name, req.Username) };
