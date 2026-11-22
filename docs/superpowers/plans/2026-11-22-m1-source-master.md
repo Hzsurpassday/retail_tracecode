@@ -1753,6 +1753,8 @@ git ls-files -z -- 'traceflow/*.cs' 'traceflow/*.sql' 'traceflow/*.ts' 'traceflo
 done
 ```
 
+> **执行裁决（2026-11-22，Task 4）**：本循环给 0002–0005 迁移文件补了 EOF 换行，SHA-256 随之变化，与 Task 1"不修改 0001–0006 任何字节"注记冲突。裁决接受这次一次性规范化：已实测本机 SQL Server 无任何持久 TraceFlow* 库（系统未部署，M0 仅测试库且用后即删），checksum 门禁对任何外部已迁移库会显式报错停机（fail-loud），不会静默漂移。此后 0001–0007 以 Task 4 后的字节为新基线，继续不可变。若存在外部已迁移库，需人工重基线 schema_version.checksum 或还原旧字节。
+
 - [ ] **Step 9: 运行确认通过（含 BIN2 全量）**
 
 Run:
