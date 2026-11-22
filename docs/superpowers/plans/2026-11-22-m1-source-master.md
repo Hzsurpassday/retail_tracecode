@@ -4310,7 +4310,7 @@ public static class OpsEndpoints
                 var jobId = await queue.EnqueueAsync(conn, tx, orgId, env, "source-sync", intent, payload, now, ct);
                 await audit.AppendAsync(conn, tx, new AuditEntry(ctx.User.Identity!.Name!, "User", "sync.manual",
                     "outbox_job", jobId.ToString(), null, null,
-                    JsonSerializer.Serialize(new { entity = req.Entity, start, end }), ctx.TraceIdentifier, null, env));
+                    JsonSerializer.Serialize(new { entity = req.Entity, start, end }), ctx.TraceIdentifier, null, "LIVE")); // 执行裁决：控制面人工操作审计 env="LIVE"（全局约定优先于简报的通道 env；作业自身审计仍用作业 env）
                 return (202, JsonSerializer.Serialize(new { data = new { jobId = jobId.ToString() }, requestId = ctx.TraceIdentifier }));
             })).WithMetadata(new RequirePermissionAttribute(PermissionCatalog.JobRematch));
 
