@@ -84,7 +84,7 @@
 | JOB-02 | Infrastructure/Jobs/SendRecoveryService.cs（失租→受理未知→只回查；业务占用与租约分离） | SendRecoveryTests（5 用例）、JobQueueTests.Recover_expired_leases_skips_upload_dispatch；AT-059（计划） | SQL 2019 集成（授权降级；2008 R2 待补验） | M0 完成（上传动作恢复在 M3） |
 | JOB-03 | （M3 计划：AppKey/接口/主体共享调用预算、持久 nextAllowedAt） | AT-060（计划） | G-TOP 未取证 | 未实现（M3） |
 | JOB-04 | （M3 计划：回查退避参数、24h 转人工）；outbox_job next_run_at/attempt_count/max_attempts DDL 就绪 | AT-061（计划） | G-TOP 未取证 | 未实现（M3） |
-| JOB-05 | （M1/M3 计划：通道暂停/服务到期阻断）；app_setting DDL 就绪；Host env 默认 Mock（Live 须显式开启） | — | G-TOP/G-DEPLOY 未取证 | 未实现（M1/M3） |
+| JOB-05 | （M1/M3 计划：通道暂停/服务到期阻断）；app_setting DDL 就绪；Host env 配置大小写不敏感、启动规范化为 LIVE/MOCK（默认 MOCK；LIVE 须显式开启） | — | G-TOP/G-DEPLOY 未取证 | 未实现（M1/M3） |
 | UI-01 | Host/Endpoints/DashboardEndpoints.cs + Web/src/pages/DashboardPage.tsx（真实 DB 计数、只读不触发平台请求） | ApiGateTests.Dashboard_requires_trace_read_and_returns_real_counts；AT-073（计划） | SQL 2019 集成（授权降级；2008 R2 待补验） | M0 完成（基础工作台）；深链/全待办 M4 |
 | UI-02 | （M4 计划：商品资料与匹配页）；openapi /products 等契约已列 | — | — | 未实现（M4） |
 | UI-03 | （M4 计划：供应商资料与匹配页） | — | — | 未实现（M4） |
