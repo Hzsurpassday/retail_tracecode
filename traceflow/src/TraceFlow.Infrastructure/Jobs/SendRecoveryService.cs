@@ -43,7 +43,7 @@ WHERE p.state = N'Dispatching'
                 await conn.ExecuteAsync(@"
 UPDATE dbo.outbox_job SET job_state=N'FAILED', finished_at=SYSUTCDATETIME(), lease_owner=NULL, lease_until=NULL,
        last_error=N'lease expired; part moved to AcceptanceUnknown; query-first'
-WHERE job_kind=N'upload-dispatch' AND intent_key=@k AND job_state=N'RUNNING'",
+WHERE job_kind=N'upload-dispatch' AND intent_key=@k AND job_state IN (N'RUNNING', N'PENDING')",
                     new { k = $"part:{c.PartId}" }, tx);
                 await _queue.EnqueueAsync(conn, tx, c.OrgId, c.Env, "bill-query", $"query:part:{c.PartId}", null, null, ct);
                 await conn.ExecuteAsync(@"

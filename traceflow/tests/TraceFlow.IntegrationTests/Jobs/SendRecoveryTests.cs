@@ -18,7 +18,9 @@ public class SendRecoveryTests : IClassFixture<Sql2008Fixture>
                                               INSERT INTO dbo.organization(org_code,name) VALUES(N'O1',N'店');
                                             SELECT id FROM dbo.organization WHERE org_code = N'O1'");
 
-    private async Task<(long taskId, long partId)> SeedDispatchingPartAsync(string suffix, bool leaseExpired)
+    // claimJob=false：入队后不认领，作业保持 PENDING（模拟 RescheduleAsync 退回的预发送重试）；
+    // 默认 true 时行为与原种子完全一致，既有 4 个测试不受影响。
+    private async Task<(long taskId, long partId)> SeedDispatchingPartAsync(string suffix, bool leaseExpired, bool claimJob = true)
     {
         await using var c = await _fx.OpenAsync();
         var orgId = await SeedOrgAsync(c);
@@ -32,9 +34,12 @@ OUTPUT inserted.id VALUES(@taskId,@orgId,N'LIVE',0,N'TFREC'+@suffix,N'{}',REPLIC
         await using var tx = (Microsoft.Data.SqlClient.SqlTransaction)await c.BeginTransactionAsync();
         var jobId = await q.EnqueueAsync(c, tx, orgId, "LIVE", "upload-dispatch", $"part:{partId}", null, null, default);
         await tx.CommitAsync();
-        var claim = await q.ClaimAsync("dead-worker", "LIVE", new[] { "upload-dispatch" }, TimeSpan.FromMinutes(5), default);
-        if (leaseExpired)
-            await c.ExecuteAsync("UPDATE dbo.outbox_job SET lease_until=DATEADD(minute,-1,SYSUTCDATETIME()) WHERE id=@jobId", new { jobId });
+        if (claimJob)
+        {
+            var claim = await q.ClaimAsync("dead-worker", "LIVE", new[] { "upload-dispatch" }, TimeSpan.FromMinutes(5), default);
+            if (leaseExpired)
+                await c.ExecuteAsync("UPDATE dbo.outbox_job SET lease_until=DATEADD(minute,-1,SYSUTCDATETIME()) WHERE id=@jobId", new { jobId });
+        }
         return (taskId, partId);
     }
 
@@ -89,5 +94,25 @@ OUTPUT inserted.id VALUES(@taskId,@orgId,N'LIVE',0,N'TFREC'+@suffix,N'{}',REPLIC
         Assert.Equal("Dispatching", await c.ExecuteScalarAsync<string>("SELECT state FROM dbo.upload_part WHERE id=@partId", new { partId }));
         Assert.Equal(1, await c.ExecuteScalarAsync<int>(
             "SELECT COUNT(*) FROM dbo.upload_attempt WHERE task_id=@taskId AND is_stale_evidence=1", new { taskId }));
+    }
+
+    // 回归（JOB-02 复审）：RescheduleAsync 可把 dispatch 作业退回 PENDING，而分片仍是 Dispatching。
+    // 恢复扫掉该分片后，PENDING 的 dispatch 作业必须一并置 FAILED，否则留下可认领的重上传向量，击穿 query-first。
+    [Fact]
+    public async Task Pending_dispatch_job_failed_on_recovery_closing_reupload_vector()
+    {
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+        var (_, partId) = await SeedDispatchingPartAsync(suffix, leaseExpired: false, claimJob: false);
+        var svc = new SendRecoveryService(_fx.ConnectionString, new JobQueue(_fx.ConnectionString));
+        var n = await svc.RecoverAsync(default);
+        Assert.True(n >= 1);
+        await using var c = await _fx.OpenAsync();
+        Assert.Equal("AcceptanceUnknown", await c.ExecuteScalarAsync<string>("SELECT state FROM dbo.upload_part WHERE id=@partId", new { partId }));
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'upload-dispatch' AND intent_key=@k AND job_state<>N'FAILED'", new { k = $"part:{partId}" }));
+        Assert.Equal(1, await c.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'upload-dispatch' AND intent_key=@k AND job_state=N'FAILED'", new { k = $"part:{partId}" }));
+        Assert.Equal(1, await c.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'bill-query' AND intent_key=@k", new { k = $"query:part:{partId}" }));
     }
 }
