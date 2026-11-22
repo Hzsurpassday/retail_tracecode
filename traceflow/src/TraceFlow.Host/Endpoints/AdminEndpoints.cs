@@ -22,7 +22,7 @@ public static class AdminEndpoints
                     new JsonSerializerOptions(JsonSerializerDefaults.Web), ct);
                 if (req is null)
                     return (422, JsonSerializer.Serialize(new { code = "VALIDATION", message = "请求体无效", retryable = false, requestId = ctx.TraceIdentifier }));
-                if (string.IsNullOrWhiteSpace(req.Username) || req.Password.Length < 10)
+                if (string.IsNullOrWhiteSpace(req.Username) || string.IsNullOrEmpty(req.Password) || req.Password.Length < 10)
                     return (422, JsonSerializer.Serialize(new { code = "VALIDATION", message = "用户名必填且密码至少 10 位", retryable = false, requestId = ctx.TraceIdentifier }));
                 var hasher = new PasswordHasher<string>();
                 long id;

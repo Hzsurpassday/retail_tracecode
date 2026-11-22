@@ -27,8 +27,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="8.0.11" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\TraceFlow.Infrastructure\TraceFlow.Infrastructure.csproj" />
     <ProjectReference Include="..\..\src\TraceFlow.Application\TraceFlow.Application.csproj" />
+    <ProjectReference Include="..\..\src\TraceFlow.Host\TraceFlow.Host.csproj" />
     <ProjectReference Include="..\..\db\tools\TraceFlow.DbMigrator\TraceFlow.DbMigrator.csproj" />
   </ItemGroup>
 
