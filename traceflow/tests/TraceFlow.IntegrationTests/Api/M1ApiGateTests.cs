@@ -1,6 +1,8 @@
 using System.Runtime.Versioning; // brief 缺失此 using（SupportedOSPlatform 所需）；与 ApiGateTests/InputValidationTests 标注模式一致（T6 偏差 1 同型）
 using System.Net;
 using System.Net.Http.Json;
+using System.Security.Cryptography;
+using System.Text;
 using Dapper;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -158,6 +160,38 @@ IF NOT EXISTS (SELECT 1 FROM dbo.user_permission WHERE user_id=@id AND permissio
         Assert.Contains("total", body);
     }
 
+    [Fact]
+    public async Task Import_lookup_by_lowercase_hash_finds_staged_batch()
+    {
+        // T10 Fix Round 1 回归：StageAsync 以 OrdinalIgnoreCase 接受任意大小写 fileHash 并存储大写 hex，
+        // 而 import_batch.file_hash 为 BIN2 大小写敏感排序——GET 查询须先归一化为大写，否则小写 hash 写入被接受、读取 404。
+        var (client, _) = await LoginAsync("m1admin", "Admin-Password-123");
+        const string header = "spid,display_code,barcode,name,approval_no,manufacturer,dosage_form,strength,package_spec,unit,trace_classification,classification_reason,manufacturer_identity";
+        var csv = header + "\nP900,,,小写哈希药,,,,,,盒,EXEMPT,豁免理由,\n";
+        var bytes = Encoding.UTF8.GetBytes(csv);
+        var lowerHash = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant(); // 浏览器 SubtleCrypto/多数 hex 编码器的自然输出
+        client.DefaultRequestHeaders.Add("Idempotency-Key", Guid.NewGuid().ToString());
+        var stage = await client.PostAsJsonAsync("/api/v1/imports", new
+        {
+            fileKind = "PRODUCT",
+            fileHash = lowerHash,
+            content = Convert.ToBase64String(bytes),
+            fileName = "lowercase-hash.csv",
+        });
+        Assert.Equal(HttpStatusCode.Accepted, stage.StatusCode);
+        var staged = await stage.Content.ReadFromJsonAsync<ImportAccepted>();
+        Assert.False(string.IsNullOrEmpty(staged!.Data.BatchId));
+        // 用同一个（小写）hash 查批次 → 200 且 batchId 一致
+        var lookup = await client.GetAsync($"/api/v1/imports?fileKind=PRODUCT&fileHash={lowerHash}");
+        Assert.Equal(HttpStatusCode.OK, lookup.StatusCode);
+        var view = await lookup.Content.ReadFromJsonAsync<ImportLookup>();
+        Assert.Equal(staged.Data.BatchId, view!.Data.BatchId);
+    }
+
     private sealed record JobAccepted(JobData Data);
     private sealed record JobData(string JobId);
+    private sealed record ImportAccepted(ImportAcceptedData Data);
+    private sealed record ImportAcceptedData(string JobId, string BatchId);
+    private sealed record ImportLookup(ImportLookupData Data);
+    private sealed record ImportLookupData(string BatchId, string FileHash);
 }
