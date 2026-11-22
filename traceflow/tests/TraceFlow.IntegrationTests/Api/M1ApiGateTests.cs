@@ -140,6 +140,11 @@ IF NOT EXISTS (SELECT 1 FROM dbo.user_permission WHERE user_id=@id AND permissio
         var jobResp = await client.GetAsync($"/api/v1/jobs/{body.Data.JobId}");
         Assert.Equal(HttpStatusCode.OK, jobResp.StatusCode);
         Assert.Contains("jobState", await jobResp.Content.ReadAsStringAsync());
+        // 审计约定（T9 裁定）：控制面手动操作审计 env=LIVE（通道为 MOCK，作业自身审计仍随作业 env）
+        await using var auditConn = await _fx.OpenAsync();
+        Assert.Equal("LIVE", await auditConn.ExecuteScalarAsync<string>(
+            "SELECT env FROM dbo.audit_log WHERE action='sync.manual' AND object_id=@oid",
+            new { oid = body.Data.JobId }));
     }
 
     [Fact]
