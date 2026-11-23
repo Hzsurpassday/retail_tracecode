@@ -36,6 +36,8 @@ builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Master.ImportSe
     connectionString, sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(),
     sp.GetRequiredService<IJobQueue>(), sp.GetRequiredService<IAuditLog>()));
 builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Jobs.ImportStageJobHandler(connectionString));
+builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Jobs.MasterMatchJobHandler(
+    connectionString, sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(), sp.GetRequiredService<IAuditLog>()));
 var sourceMode = builder.Configuration["TraceFlow:SourceMode"] ?? "fixture";
 builder.Services.AddSingleton<ISourceAdapter>(TraceFlow.Infrastructure.Sources.SourceAdapterFactory.Create(
     sourceMode, Path.Combine(AppContext.BaseDirectory, "fixtures", "ksoa")));
