@@ -1,4 +1,5 @@
 using TraceFlow.Application.Abstractions;
+using TraceFlow.Infrastructure.Reconciliation;
 
 namespace TraceFlow.Host;
 
@@ -6,15 +7,19 @@ public sealed class WorkerHostedService : BackgroundService
 {
     private readonly IJobQueue _queue;
     private readonly ISendRecoveryService _recovery;
+    private readonly ReconciliationScheduler _reconciliationScheduler;
     private readonly IReadOnlyDictionary<string, IJobHandler> _handlers;
     private readonly ILogger<WorkerHostedService> _logger;
     private readonly string _env;
     private readonly string _workerId = $"{Environment.MachineName}-{Guid.NewGuid():N}";
     private DateTime _lastRecovery = DateTime.MinValue;
 
-    public WorkerHostedService(IJobQueue queue, ISendRecoveryService recovery, IEnumerable<IJobHandler> handlers, EnvOptions envOptions, ILogger<WorkerHostedService> logger)
+    public WorkerHostedService(IJobQueue queue, ISendRecoveryService recovery,
+        ReconciliationScheduler reconciliationScheduler, IEnumerable<IJobHandler> handlers,
+        EnvOptions envOptions, ILogger<WorkerHostedService> logger)
     {
-        _queue = queue; _recovery = recovery; _env = envOptions.Env; _logger = logger;
+        _queue = queue; _recovery = recovery; _reconciliationScheduler = reconciliationScheduler;
+        _env = envOptions.Env; _logger = logger;
         _handlers = handlers.ToDictionary(h => h.Kind);
     }
 
@@ -29,8 +34,10 @@ public sealed class WorkerHostedService : BackgroundService
                     await _queue.RecoverExpiredLeasesAsync(stoppingToken);
                     // 失租发送→受理未知→只回查（JOB-02）；只恢复本机环境的分片（MOCK worker 不动 LIVE）。
                     await _recovery.RecoverAsync(_env, stoppingToken);
+                    // 日对账（REC-01）：同桶内幂等入队；02:00（Asia/Shanghai）后补入昨日整日窗。
+                    await _reconciliationScheduler.TryEnqueueDailyAsync(_env, stoppingToken);
                     _lastRecovery = DateTime.UtcNow;
-                    _logger.LogDebug("Worker 恢复扫描完成（租约回收 + 发送恢复回查）");
+                    _logger.LogDebug("Worker 恢复扫描完成（租约回收 + 发送恢复回查 + 日对账调度）");
                 }
                 if (_handlers.Count > 0)
                 {

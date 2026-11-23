@@ -8,9 +8,11 @@ info:
     M0/M1 端点（/auth/*、/admin/*、/dashboard、/health、/products、/suppliers、/imports*、
     /product-mappings/*、/supplier-mappings/*、/products/{id}/trace-policy、/sync-jobs、
     /jobs/{id}、/audit-logs、/settings*）、M2 端点（/upstream-bills*、/inbounds*）与
-    M3 端点（/pos-sales*、/returns*、/upload-tasks*）均按真实代码形状描述
+    M3 端点（/pos-sales*、/returns*、/upload-tasks*）与 M4 日对账端点
+    （/reconciliation-runs*、POST /reconciliation-differences/{id}/resolve）均按真实代码形状描述
     （traceflow/src/TraceFlow.Host/Endpoints/*.cs，以代码为准）。
-    x-phase 标注契约归属阶段：M0/M1/M2/M3 为已实现；M4 为计划契约（未实现，不提供端点）。
+    x-phase 标注契约归属阶段：M0/M1/M2/M3 与上述 M4 对账端点为已实现；
+    其余 x-phase: M4 条目仍为计划契约（未实现，不提供端点）。
     已认证请求的所有 /api 变更方法（POST/PUT/DELETE/PATCH）必须携带 X-CSRF-TOKEN 头
     （全局 antiforgery 中间件，AUTH-02）；/auth/login 与 /auth/logout 匿名可达但自行校验 CSRF。
     失败统一 code/message/fieldErrors/retryable/requestId；401 未登录、403 无权、
@@ -215,7 +217,7 @@ components:
       properties:
         windowStart: { type: string, format: date-time }
         windowEnd: { type: string, format: date-time }
-        businessType: { type: string, description: 业务类型（有界枚举） }
+        businessType: { type: string, enum: [SALE, RETURN], description: 业务类型（有界枚举，大小写敏感） }
     ConnectionTestRequest:
       type: object
       required: [configId]
@@ -925,6 +927,84 @@ components:
             jobsReset: { type: integer, description: 复位/新建的 upload-dispatch 作业数 }
             partIds: { type: array, items: { type: string }, description: 被复核的 Failed 分片（成功分片绝不重发） }
         requestId: { type: string }
+    # ---- M4 日对账已实现端点真实响应形状（REC-01/02/03） ----
+    ReconciliationRunListResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [items, page, pageSize, total]
+          properties:
+            items: { type: array, items: { $ref: '#/components/schemas/ReconciliationRunRow' } }
+            page: { type: integer }
+            pageSize: { type: integer }
+            total: { type: integer }
+        requestId: { type: string }
+    ReconciliationRunRow:
+      type: object
+      required: [runId, windowStart, windowEnd, businessType, status, differenceCount]
+      properties:
+        runId: { type: string, description: 'reconciliation_run.id 字符串' }
+        windowStart: { type: string, format: date-time }
+        windowEnd: { type: string, format: date-time }
+        businessType: { type: string, enum: [SALE, RETURN] }
+        status: { type: string, enum: [RUNNING, COMPLETE, INCOMPLETE] }
+        startedAt: { type: string, format: date-time }
+        finishedAt: { type: string, format: date-time, nullable: true }
+        differenceCount: { type: integer, description: 差异总数（OPEN+RESOLVED） }
+    ReconciliationRunDetailResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [run, differences]
+          properties:
+            run:
+              allOf:
+                - { $ref: '#/components/schemas/ReconciliationRunRow' }
+                - type: object
+                  properties:
+                    env: { type: string, description: 'LIVE 或 MOCK（宿主环境）' }
+                    localSummary: { type: object, nullable: true, description: '本地侧汇总：documents/saleLines/codes/tasks/parts/succeeded/failed/partial/unknown' }
+                    platformSummary: { type: object, nullable: true, description: '平台侧汇总（仅由持久化上传证据计算）：partsByState/succeededParts/failedParts/partialParts/unresolvedParts/unavailable/unavailableReason' }
+            differences: { type: array, items: { $ref: '#/components/schemas/ReconciliationDifferenceRow' } }
+        requestId: { type: string }
+    ReconciliationDifferenceRow:
+      type: object
+      required: [differenceId, diffType, severity, objectRef, status]
+      properties:
+        differenceId: { type: string }
+        diffType: { type: string, description: '11 种差异类型之一' }
+        severity: { type: string, enum: [HIGH, MEDIUM] }
+        objectRef: { type: string, description: 对象引用（注明层级；≤200 字符） }
+        status: { type: string, enum: [OPEN, RESOLVED] }
+        ownerRole: { type: string }
+        nextAction: { type: string }
+        foundAt: { type: string, format: date-time }
+        evidence: { type: object, nullable: true, description: '证据（请求号/HTTP 状态/计数等；不含密钥与原始平台响应）' }
+        resolutionEvidence: { type: string, nullable: true }
+        resolvedBy: { type: string, nullable: true }
+        resolvedAt: { type: string, format: date-time, nullable: true }
+    ReconciliationResolveRequest:
+      type: object
+      required: [resolutionEvidence]
+      properties:
+        resolutionEvidence: { type: string, description: '处置留证，必填且 ≤4000 字符' }
+    ReconciliationResolveResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [differenceId, status, resolvedBy, resolvedAt]
+          properties:
+            differenceId: { type: string }
+            status: { type: string, enum: [RESOLVED] }
+            resolvedBy: { type: string }
+            resolvedAt: { type: string, format: date-time }
+        requestId: { type: string }
   responses:
     Unauthorized: { description: 未登录, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
     Forbidden: { description: 无权限, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
@@ -1585,7 +1665,7 @@ paths:
   /reconciliation-runs:
     post:
       x-phase: M4
-      description: 触发日对账（权限 system:manage 或 audit:read 按配置，REC-01/03）。日期窗+业务类型有界参数；202 入队；持久差异结果；统计口径未核对时 INCOMPLETE 不显示"无差异"。
+      description: 触发日对账（权限 system:manage，REC-01/03）。日期窗+业务类型有界参数；Idempotency-Key 控制重复提交；202 入队，作业按窗口粒度与业务类型去重（intent recon:run:{yyyyMMddHHmm}:{businessType}）。对账仅基于已持久化上传证据计算（不调用 TOP）；存在非终态分片时 run 状态 INCOMPLETE，不得显示"无差异"。触发审计 env=LIVE（控制面人工动作）。
       parameters:
         - { $ref: '#/components/parameters/IdempotencyKey' }
         - { $ref: '#/components/parameters/CsrfToken' }
@@ -1598,7 +1678,51 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
-        '422': { $ref: '#/components/responses/Unprocessable' }
+        '422': { description: 'VALIDATION（windowStart/windowEnd/businessType 非法或参数越界）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    get:
+      x-phase: M4
+      description: 对账运行列表（权限 audit:read，REC-02）。按宿主环境过滤（env 为宿主口径，不接受跨环境查询）；ROW_NUMBER 区间分页（pageSize 上限 100，默认 20，排序 started_at DESC, id DESC）；每行附差异总数（OPEN+RESOLVED）。
+      parameters:
+        - { $ref: '#/components/parameters/Page' }
+        - { name: pageSize, in: query, schema: { type: integer, minimum: 1, default: 20 }, description: '1..100；>100 收敛为 100' }
+        - { name: status, in: query, schema: { type: string, enum: [RUNNING, COMPLETE, INCOMPLETE] }, description: '非法值 422 VALIDATION（大小写敏感）' }
+        - { name: from, in: query, schema: { type: string }, description: 'ISO-8601；过滤 window_start >= from（非法值 400）' }
+        - { name: to, in: query, schema: { type: string }, description: 'ISO-8601；过滤 window_start < to（非法值 400）' }
+      responses:
+        '200': { description: 分页对账运行, content: { application/json: { schema: { $ref: '#/components/schemas/ReconciliationRunListResponse' } } } }
+        '400': { description: 'VALIDATION（page/pageSize/from/to 非法）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { description: VALIDATION（status 非法）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /reconciliation-runs/{id}:
+    get:
+      x-phase: M4
+      description: 对账运行详情（权限 audit:read，REC-02）。含本地/平台侧汇总 JSON 与差异明细（最多 2000 条，按 found_at, id 排序；differenceCount 为总数）。平台侧仅由已持久化上传证据计算；存在非终态分片时 platformSummary.unavailable=true 且给出原因，不得解读为"平台无记录"。跨环境/不存在均 404。
+      parameters: [{ $ref: '#/components/parameters/ResourceId' }]
+      responses:
+        '200': { description: 对账运行详情, content: { application/json: { schema: { $ref: '#/components/schemas/ReconciliationRunDetailResponse' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /reconciliation-differences/{id}/resolve:
+    post:
+      x-phase: M4
+      description: 处置对账差异（权限 system:manage，REC-03）。仅 OPEN→RESOLVED；resolutionEvidence 必填（≤4000 字符）；已处置重复提交返回 409 DIFFERENCE_ALREADY_RESOLVED；跨环境/不存在 404。审计动作 recon.difference.resolved，env=LIVE（控制面人工动作），actor=当前用户。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ReconciliationResolveRequest' } } }
+      responses:
+        '200': { description: 差异已处置, content: { application/json: { schema: { $ref: '#/components/schemas/ReconciliationResolveResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: DIFFERENCE_ALREADY_RESOLVED, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: 'VALIDATION（resolutionEvidence 为空或超长）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
   /jobs/{id}:
     get:
       x-phase: M1
