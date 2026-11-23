@@ -66,6 +66,8 @@ builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Inbound.Inbound
     connectionString, sp.GetRequiredService<TraceFlow.Infrastructure.Inbound.InboundTaskFactory>(), sp.GetRequiredService<IAuditLog>()));
 builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Jobs.InboundMatchJobHandler(
     sp.GetRequiredService<TraceFlow.Infrastructure.Inbound.InboundMatchService>()));
+builder.Services.AddSingleton<TraceFlow.Infrastructure.Inbound.AllocationService>(sp =>
+    new TraceFlow.Infrastructure.Inbound.AllocationService(sp.GetRequiredService<IAuditLog>()));
 builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Sources.SyncScheduler(
     connectionString, sp.GetRequiredService<IJobQueue>(),
     sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(), env));
@@ -127,6 +129,8 @@ if (!workerOnly)
     app.MapImportEndpoints(connectionString, env);
     app.MapMasterEndpoints(connectionString);
     app.MapOpsEndpoints(connectionString, env);
+    app.MapInboundEndpoints(connectionString, env);
+    app.MapUpstreamEndpoints(connectionString, env);
     app.MapDashboardEndpoints(connectionString, env);
     app.MapHealthEndpoints(connectionString, env);
     app.MapFallbackToFile("index.html");

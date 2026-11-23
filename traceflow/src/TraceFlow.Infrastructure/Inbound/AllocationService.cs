@@ -10,6 +10,7 @@ namespace TraceFlow.Infrastructure.Inbound;
 public sealed record AllocationLineInput(long SourceLineId, long UpstreamLineId, decimal Quantity, string UnitRatio, string? ConversionEvidence, IReadOnlyList<string> Codes);
 public sealed record AllocationRequest(string ExpectedMatchVersion, IReadOnlyList<AllocationLineInput> Lines);
 public sealed record AllocationSaveResult(int MatchVersion, int AllocationsSaved, bool AllRequiredCovered);
+public sealed record ConfirmResult(long TaskId, string BillCode, int MatchVersion, bool Reused);
 
 /// <summary>
 /// 人工分配保存/取消（IN-03/04/09，AT-027/028/029/032/067）：保存=全量替换（R9a），
@@ -28,6 +29,11 @@ public sealed class AllocationService
     private sealed record UpCodeRow(string code_normalized, string? package_level);
     private sealed record AllocRow(long id, string state, string source_document_key);
     private sealed record ParsedLine(AllocationLineInput Input, LineRow Line, Qty Qty, long Num, long Den, IReadOnlyList<long> CodeIds);
+    private sealed record AllocFullRow(long id, long source_line_id, long upstream_line_id, decimal quantity, long unit_ratio_numerator, long unit_ratio_denominator, string state, string source_line_key, string product_source_id, string? batch_raw, string? unit_original, decimal quantity_original, string? platform_drug_id, string? up_batch_no, string upstream_ref_ent_id, string completeness);
+    private sealed record SupFullRow(string dwbh, int map_version, string? ref_ent_id, string? ent_id);
+    private sealed record ProdMapRow(string spid, string platform_drug_id, int version);
+    private sealed record AllocCodeRow(long code_id, string code_normalized, string? package_level);
+    private sealed record SnapExtraRow(string content_hash, DateTime? business_datetime);
 
     public async Task<AllocationSaveResult> SaveAsync(SqlConnection conn, SqlTransaction tx, long orgId, string env,
         long snapshotId, AllocationRequest req, string actor, CancellationToken ct)
@@ -257,6 +263,151 @@ FROM dbo.source_snapshot WHERE id=@snapshotId AND org_id=@orgId", new { orgId, s
             await _audit.AppendAsync(conn, tx, new AuditEntry(actor, "User", "inbound.allocate.cancel", "source_snapshot", snapshotId.ToString(), reason, null, null, null, null, "LIVE"));
         }
         return n;
+    }
+
+    /// <summary>
+    /// 人工补配确认（AT-031/IN-06/07）：以当前匹配版本为乐观锁，对每条存活分配重跑与 Save 相同的资格闸，
+    /// 并校验 REQUIRED 覆盖与 Σ分配数量==来源行数量；任一失败 422 ALLOCATION_INVALID 且不落任何效果。
+    /// 任务态裁定 R10a：Cancelled→factory 同行复活；Blocked/Ready→409 VERSION_CONFLICT（并发自动匹配产物）；
+    /// 已发送或其他非发送前态→409 FROZEN。
+    /// </summary>
+    public async Task<ConfirmResult> ConfirmAsync(SqlConnection conn, SqlTransaction tx, long orgId, string env,
+        long snapshotId, string expectedMatchVersion, string actor, InboundTaskFactory factory, CancellationToken ct)
+    {
+        var snap = await conn.QuerySingleOrDefaultAsync<SnapRow>(new CommandDefinition(@"
+SELECT id, source_system_id, source_document_key, document_type, completeness_status, raw_header
+FROM dbo.source_snapshot WHERE id=@snapshotId AND org_id=@orgId", new { orgId, snapshotId }, tx, cancellationToken: ct));
+        if (snap is null || snap.document_type != "PURCHASE_IN" || snap.completeness_status != "COMPLETE")
+            throw new AllocationValidationException("VALIDATION", "快照不存在或非 COMPLETE 采购入库快照");
+        var match = await conn.QuerySingleOrDefaultAsync<MatchRow>(new CommandDefinition(@"
+SELECT id, version, match_state FROM dbo.inbound_match WITH (UPDLOCK, HOLDLOCK)
+WHERE org_id=@orgId AND env=@env AND source_snapshot_id=@snapshotId", new { orgId, env, snapshotId }, tx, cancellationToken: ct));
+        if (match is null)
+            throw new AllocationValidationException("VALIDATION", "尚未生成匹配记录，请先触发匹配");
+        if (!int.TryParse(expectedMatchVersion, out var expected) || expected != match.version)
+            throw new AllocationConflictException("VERSION_CONFLICT", "匹配版本已变化，请刷新后重试");
+        var eventKey = $"KSOA:{snap.source_document_key}:PURCHASE_IN";
+        var task = await conn.QuerySingleOrDefaultAsync<TaskRow>(new CommandDefinition(@"
+SELECT id, state, source_snapshot_id FROM dbo.upload_task WITH (UPDLOCK, HOLDLOCK)
+WHERE org_id=@orgId AND env=@env AND event_key=@eventKey AND source_snapshot_id IS NOT NULL",
+            new { orgId, env, eventKey }, tx, cancellationToken: ct));
+        if (task is not null && task.state != "Cancelled")
+        {
+            var sent = await SentAttemptsAsync(conn, tx, task.id, ct);
+            if (sent > 0 || task.state is not ("Blocked" or "Ready"))
+                throw new AllocationConflictException("FROZEN", "任务已发送或已进入发送流程，禁止确认");
+            throw new AllocationConflictException("VERSION_CONFLICT", "存在自动匹配生成的发送前任务，请刷新后重新保存补配");
+        }
+        var allocs = (await conn.QueryAsync<AllocFullRow>(new CommandDefinition(@"
+SELECT a.id, a.source_line_id, a.upstream_line_id, a.quantity, a.unit_ratio_numerator, a.unit_ratio_denominator, a.state,
+       l.source_line_key, l.product_source_id, l.batch_raw, l.unit_original, l.quantity_original,
+       u.platform_drug_id, u.batch_no AS up_batch_no, b.upstream_ref_ent_id, b.completeness
+FROM dbo.inbound_allocation a
+JOIN dbo.source_line l ON l.id=a.source_line_id
+JOIN dbo.upstream_bill_line u ON u.id=a.upstream_line_id
+JOIN dbo.upstream_bill b ON b.id=u.bill_id
+WHERE a.org_id=@orgId AND a.env=@env AND l.snapshot_id=@snapshotId AND a.state IN (N'RESERVED',N'COMMITTED')",
+            new { orgId, env, snapshotId }, tx, cancellationToken: ct))).ToList();
+        if (allocs.Count == 0)
+            throw new AllocationValidationException("EMPTY_LINES", "无有效补配分配，请先保存");
+        var dwbh = Str(snap.raw_header, "dwbh");
+        var sup = await conn.QuerySingleOrDefaultAsync<SupFullRow>(new CommandDefinition(@"
+SELECT s.dwbh, sm.version AS map_version, ev.ref_ent_id, ev.ent_id
+FROM dbo.supplier s
+JOIN dbo.supplier_mapping sm ON sm.supplier_id=s.id AND sm.state IN (N'AUTO_CONFIRMED',N'MANUAL_CONFIRMED')
+JOIN dbo.platform_enterprise_version ev ON ev.id=sm.enterprise_version_id
+WHERE s.org_id=@orgId AND s.source_system_id=@sys AND s.dwbh=@dwbh",
+            new { orgId, sys = snap.source_system_id, dwbh }, tx, cancellationToken: ct));
+        if (sup is null || sup.ref_ent_id is null)
+            throw new AllocationValidationException("SUPPLIER_UNRESOLVED", "供应商映射未确认，无法确认");
+        var maps = (await conn.QueryAsync<ProdMapRow>(new CommandDefinition(@"
+SELECT p.spid, pd.platform_drug_id, pm.version
+FROM dbo.product p
+JOIN dbo.product_mapping pm ON pm.product_id=p.id AND pm.state IN (N'AUTO_CONFIRMED',N'MANUAL_CONFIRMED')
+JOIN dbo.platform_drug pd ON pd.id=pm.platform_drug_id
+WHERE p.org_id=@orgId AND p.source_system_id=@sys AND p.spid IN @spids",
+            new { orgId, sys = snap.source_system_id, spids = allocs.Select(a => a.product_source_id).Distinct().ToList() }, tx, cancellationToken: ct)))
+            // 同一商品理论上只有一条有效映射；重复时取首条而非 ToDictionary 抛 500（映射异常应走 422 而非内部错误）
+            .GroupBy(r => r.spid, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
+        var fieldErrors = new List<object>();
+        var lines = new List<AllocatedLine>();
+        foreach (var a in allocs)
+        {
+            void Err(string code, string msg) => fieldErrors.Add(new { allocationId = a.id, sourceLineId = a.source_line_id, code, message = msg });
+            if (!string.Equals(a.upstream_ref_ent_id, sup.ref_ent_id, StringComparison.Ordinal)) { Err("SUPPLIER_MISMATCH", "上游单据不属于已确认供应商"); continue; }
+            if (a.completeness != "COMPLETE") { Err("UPSTREAM_NOT_FOUND", "上游单据未完成"); continue; }
+            if (!maps.TryGetValue(a.product_source_id, out var pm)) { Err("PRODUCT_UNRESOLVED", "商品映射未确认"); continue; }
+            if (!string.Equals(a.platform_drug_id, pm.platform_drug_id, StringComparison.Ordinal)) { Err("DRUG_CONFLICT", "药品身份强冲突"); continue; }
+            if (string.IsNullOrWhiteSpace(a.batch_raw) || string.IsNullOrWhiteSpace(a.up_batch_no)
+                || !string.Equals(a.batch_raw.Trim(), a.up_batch_no.Trim(), StringComparison.Ordinal))
+            { Err("BATCH_CONFLICT", "批号强冲突"); continue; }
+            var codes = (await conn.QueryAsync<AllocCodeRow>(new CommandDefinition(@"
+SELECT ac.code_id, tc.code_normalized, uc.package_level
+FROM dbo.allocation_code ac
+JOIN dbo.trace_code tc ON tc.id=ac.code_id
+LEFT JOIN dbo.upstream_bill_code uc ON uc.line_id=@upLineId AND uc.code_normalized=tc.code_normalized
+WHERE ac.allocation_id=@allocId",
+                new { allocId = a.id, upLineId = a.upstream_line_id }, tx, cancellationToken: ct))).ToList();
+            if (codes.Count == 0) { Err("CODES_EMPTY", "分配无码"); continue; }
+            if (codes.Any(k => k.package_level is null)) { Err("CODE_NOT_IN_LINE", "码不属于所选上游明细"); continue; }
+            if (codes.Any(k => k.package_level != "MIN")) { Err("BIG_CODE_BLOCKED", "非最小包装码禁止入库分配（AT-028）"); continue; }
+            if (codes.Any(k => TraceCodeNormalizer.Normalize(k.code_normalized).Format != CodeFormat.Supported8Prefix20)) { Err("CODE_FORMAT", "码格式不支持"); continue; }
+            Qty qty;
+            try { qty = new Qty(a.quantity); }
+            catch (ArgumentOutOfRangeException) { Err("QTY_DOMAIN", "数量超出域"); continue; }
+            Qty converted;
+            try { converted = new UnitRatio(a.unit_ratio_numerator, a.unit_ratio_denominator).Convert(qty); }
+            catch (UnitConversionException) { Err("CONVERSION_INEXACT", "换算不整除或超域（AT-029）"); continue; }
+            catch (ArgumentOutOfRangeException) { Err("CONVERSION_INEXACT", "换算比例非法（AT-029）"); continue; }
+            if (converted.Value != codes.Count) { Err("CONVERSION_INEXACT", "换算结果与码数不一致（AT-029）"); continue; }
+            var owned = await conn.ExecuteScalarAsync<int>(new CommandDefinition(@"
+SELECT COUNT(*) FROM dbo.code_claim cc JOIN dbo.allocation_code ac ON ac.code_id=cc.code_id AND ac.allocation_id=@allocId
+WHERE cc.org_id=@orgId AND cc.env=@env AND cc.event_scope=N'PURCHASE_IN' AND cc.claim_state=N'ACTIVE' AND cc.allocation_id=@allocId",
+                new { allocId = a.id, orgId, env }, tx, cancellationToken: ct));
+            if (owned != codes.Count) { Err("CLAIM_LOST", "码占用已失效或被争用"); continue; }
+            lines.Add(new AllocatedLine(a.id, a.source_line_id, a.source_line_key, a.product_source_id, pm.platform_drug_id,
+                a.batch_raw!.Trim(), a.quantity, a.unit_original ?? "",
+                codes.Select(k => new StoredCodeRef(k.code_id, k.code_normalized)).ToList()));
+        }
+        var allLines = (await conn.QueryAsync<LineRow>(new CommandDefinition(@"
+SELECT id, source_line_key, product_source_id, quantity_original, unit_original, batch_raw
+FROM dbo.source_line WHERE snapshot_id=@snapshotId AND event_kind=N'PURCHASE_IN'",
+            new { snapshotId }, tx, cancellationToken: ct))).ToList();
+        var required = await RequiredLineIdsAsync(conn, tx, orgId, snap.source_system_id, snapshotId, ct);
+        var bySource = allocs.GroupBy(a => a.source_line_id).ToDictionary(g => g.Key, g => g.ToList());
+        foreach (var rid in required)
+        {
+            if (!bySource.TryGetValue(rid, out var group))
+            { fieldErrors.Add(new { sourceLineId = rid, code = "LINE_UNCOVERED", message = "REQUIRED 行未被补配覆盖" }); continue; }
+            var src = allLines.First(l => l.id == rid);
+            if (group.Sum(g => g.quantity) != src.quantity_original)
+                fieldErrors.Add(new { sourceLineId = rid, code = "QTY_COVERAGE", message = "分配数量合计与来源行数量不一致" });
+        }
+        foreach (var a in allocs)
+            if (!required.Contains(a.source_line_id))
+                fieldErrors.Add(new { allocationId = a.id, sourceLineId = a.source_line_id, code = "NOT_REQUIRED_LINE", message = "非 REQUIRED 行不得分配" });
+        if (fieldErrors.Count > 0)
+            throw new AllocationValidationException("ALLOCATION_INVALID", "确认资格复核失败", fieldErrors);
+
+        await conn.ExecuteAsync(new CommandDefinition(
+            "UPDATE dbo.inbound_allocation SET state=N'COMMITTED', version=version+1 WHERE id IN @ids AND state=N'RESERVED'",
+            new { ids = allocs.Select(a => a.id).ToList() }, tx, cancellationToken: ct));
+        var extra = await conn.QuerySingleAsync<SnapExtraRow>(new CommandDefinition(
+            "SELECT content_hash, business_datetime FROM dbo.source_snapshot WHERE id=@snapshotId", new { snapshotId }, tx, cancellationToken: ct));
+        var mappingVersions = new List<string> { $"supplier:{sup.dwbh}:{sup.map_version}" };
+        mappingVersions.AddRange(maps.Values.Select(m => $"product:{m.spid}:{m.version}"));
+        var ctx = new InboundTaskContext(orgId, env, snapshotId, snap.source_document_key, extra.content_hash, extra.business_datetime,
+            sup.dwbh, sup.ref_ent_id, sup.ent_id ?? "", lines, mappingVersions.Distinct(StringComparer.Ordinal).ToList(), actor);
+        var created = await factory.CreateAsync(conn, tx, ctx, ct);
+        await conn.ExecuteAsync(new CommandDefinition(@"
+UPDATE dbo.inbound_match SET match_state=N'COMPLETE', reason=N'人工补配确认', version=version+1, matched_at=SYSUTCDATETIME()
+WHERE org_id=@orgId AND env=@env AND source_snapshot_id=@snapshotId", new { orgId, env, snapshotId }, tx, cancellationToken: ct));
+        var newVersion = await conn.ExecuteScalarAsync<int>(new CommandDefinition(
+            "SELECT version FROM dbo.inbound_match WHERE org_id=@orgId AND env=@env AND source_snapshot_id=@snapshotId",
+            new { orgId, env, snapshotId }, tx, cancellationToken: ct));
+        await _audit.AppendAsync(conn, tx, new AuditEntry(actor, "User", "inbound.allocate.confirm", "upload_task", created.TaskId.ToString(),
+            null, null, null, null, null, "LIVE"));
+        return new ConfirmResult(created.TaskId, created.BillCode, newVersion, created.Reused);
     }
 
     private static Task<TaskRow?> TaskForSnapshotAsync(SqlConnection conn, SqlTransaction tx, long orgId, string env, string docKey, CancellationToken ct)
