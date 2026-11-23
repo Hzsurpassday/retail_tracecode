@@ -5936,7 +5936,7 @@ git -c user.name=Hzsurpassday -c user.email=219255064+Hzsurpassday@users.noreply
     - **无任何候选**（本商品批准文号为空或平台无此文号）→ 不建映射行（列表 mappingState=NONE≙未解析）；已有非有效行降级 UNRESOLVED（保留原 pair）。
     - 写入冲突（2601/2627：UX_pmap_active_platform/UX_pmap_pair 竞态）→ 降级 CONFLICT（AT-015 并发兜底）。
   - **供应商**（ENT-01/02）：候选=统一社会信用代码非空且精确相等；名称相同**仅作候选**（CANDIDATE），绝不自动。信用代码候选 ≥2 → CONFLICT（AT-019）。恰 1 且 `audit_status ∈ supplier.auditPassValues`（默认空→不自动）且双向唯一 → AUTO_CONFIRMED；审核通过但不唯一 → CONFLICT；审核未通过 → CANDIDATE。角色（role）两侧独立存储，不参与匹配条件（AT-021）。有效映射复核：信用代码不再精确相等→REVIEW_REQUIRED；企业改名产生新版本行不影响既有映射（AT-020，映射钉在 enterprise_version_id）。
-  - **前缀索引**（MATCH-03/AT-018）：S8P20 来源码前 7 位 × 有效映射平台药，GROUP BY 去重；同前缀 >1 平台药 → 该前缀全部行 conflict_state=CONFLICT。前缀不是药品外键，绝不据此自动绑定。
+  - **前缀索引**（MATCH-03/AT-018）：S8P20 来源码前 7 位 × 有效映射平台药，GROUP BY 去重；同前缀 >1 平台药 → 该前缀全部行 conflict_state=CONFLICT。前缀不是药品外键，绝不据此自动绑定。**资格规则（T12 controller ruling，T7 携带项闭环）：仅 completeness_status=COMPLETE 快照的明细行入索引**——INVALID 版本保留明细行供审计，不得污染诊断索引。
   - 单门店数据量（千级商品）采用**一次事务内全量加载+内存匹配**；写入逐行 UPSERT。M1 每商品至多一条映射行（历史在 history 表）；UX_pmap_pair 防未来多行竞态。
 
 - [ ] **Step 1: 写失败测试（商品侧）**
@@ -6346,7 +6346,13 @@ public sealed class MatchingService
         var (prefixRows, prefixConflicts) = await PrefixIndexService.RebuildAsync(conn, tx, orgId, ct);
         await _audit.AppendAsync(conn, tx, new AuditEntry("SYSTEM", "Worker", "master.match.auto", "organization",
             orgId.ToString(), null, null,
-            JsonSerializer.Serialize(new { products = p, suppliers = s, prefixRows, prefixConflicts }),
+            // T12 评审前修复（controller ruling）：值元组被 STJ 序列化为 {}（字段非属性）→具名匿名对象投影保留计数
+            JsonSerializer.Serialize(new
+            {
+                products = new { auto = p.auto, candidate = p.candidate, conflict = p.conflict, unresolved = p.unresolved, review = p.review },
+                suppliers = new { auto = s.auto, candidate = s.candidate, conflict = s.conflict, unresolved = s.unresolved, review = s.review },
+                prefixRows, prefixConflicts
+            }),
             null, "match-1", env));
         await tx.CommitAsync(ct);
         return new MatchResult(p.auto, p.candidate, p.conflict, p.unresolved, p.review,
@@ -6683,6 +6689,7 @@ JOIN dbo.source_snapshot ss ON ss.id=sl.snapshot_id
 JOIN dbo.product p ON p.org_id=ss.org_id AND p.source_system_id=ss.source_system_id AND p.spid=sl.product_source_id
 JOIN dbo.product_mapping pm ON pm.product_id=p.id AND pm.state IN (N'AUTO_CONFIRMED',N'MANUAL_CONFIRMED')
 WHERE ss.org_id=@org AND sl.code_format=N'S8P20' AND sl.trace_code_normalized IS NOT NULL
+  AND ss.completeness_status=N'COMPLETE' -- T12 评审前修复（T7 携带项闭环）：INVALID 版本保留明细行，前缀索引仅取 COMPLETE 稳定快照
 GROUP BY LEFT(sl.trace_code_normalized,7), pm.platform_drug_id",
             new { org = orgId }, tx, cancellationToken: ct))).ToList();
         await conn.ExecuteAsync(new CommandDefinition("DELETE FROM dbo.drug_prefix_index", null, tx, cancellationToken: ct));
