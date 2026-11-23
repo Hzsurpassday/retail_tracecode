@@ -70,15 +70,21 @@ SELECT id,source_system_id,source_document_key,document_type,completeness_status
 FROM dbo.source_snapshot WHERE id=@id AND org_id=@orgId", new { id = snapshotId, orgId }, tx, cancellationToken: ct));
         if (snap is null || snap.document_type != "PURCHASE_IN" || snap.completeness_status != "COMPLETE")
             return ("SKIPPED", false);
+        // 锁序（终审修复 F2）：匹配/保存/取消统一 match→task。本方法随后会锁 upload_task（R8a 读取与任务工厂
+        // UPDLOCK），保存路径（AllocationService.SaveAsync）是 match→task，故这里也必须先锁匹配行，避免反向成环。
+        await InboundCancelService.LockMatchAsync(c, tx, orgId, env, snapshotId, ct);
         var lines = (await c.QueryAsync<LineRow>(new CommandDefinition(@"
 SELECT id,source_line_key,product_source_id,quantity_original,unit_original,batch_raw
 FROM dbo.source_line WHERE snapshot_id=@id AND event_kind=N'PURCHASE_IN' ORDER BY id", new { id = snapshotId }, tx, cancellationToken: ct))).ToList();
 
         async Task<(string, bool)> Save(string state, string? reason, string? dwbh, object evidence, bool created = false)
         {
-            await SaveMatchAsync(c, tx, orgId, env, snapshotId, dwbh, state, reason, JsonSerializer.Serialize(evidence), ct);
-            await _audit.AppendAsync(c, tx, new AuditEntry("SYSTEM", "System", "inbound.match", "source_snapshot",
-                snapshotId.ToString(), reason ?? state, null, null, null, null, env));
+            var changed = await SaveMatchAsync(c, tx, orgId, env, snapshotId, dwbh, state, reason, JsonSerializer.Serialize(evidence), ct);
+            // F1：判定与证据全等时不落库、不推进版本、不留审计——周期扫描（≤5 分钟）重扫未完成快照是常态，
+            // 空转写入会让打开编辑器的人凭白拿到 409 VERSION_CONFLICT，审计也会按拍增长。
+            if (changed)
+                await _audit.AppendAsync(c, tx, new AuditEntry("SYSTEM", "System", "inbound.match", "source_snapshot",
+                    snapshotId.ToString(), reason ?? state, null, null, null, null, env));
             return (state, created);
         }
 
@@ -278,18 +284,37 @@ OUTPUT INSERTED.id VALUES(@orgId,@env,@lineId,@upLineId,@qty,1,1,N'MIN',N'RESERV
         return await Save("COMPLETE", null, dwbh, evidence, created: true);
     }
 
-    private static async Task SaveMatchAsync(SqlConnection c, SqlTransaction tx, long orgId, string env, long snapshotId,
+    /// <summary>
+    /// 写匹配置；返回 true 表示确实落库（新增或内容变化），false 表示空转短路。
+    /// F1：同事务内先以 UPDLOCK/HOLDLOCK 读当前行（与 AllocationService 的版本闸同一把锁），
+    /// 判定、理由、证据（以及供应商编号）全等时直接返回——不 UPDATE、不 version+1、不动 matched_at；
+    /// 调用方据此跳过审计写入。任何字段变化（含状态迁移）仍照常写入。
+    /// </summary>
+    private static async Task<bool> SaveMatchAsync(SqlConnection c, SqlTransaction tx, long orgId, string env, long snapshotId,
         string? dwbh, string state, string? reason, string evidenceJson, CancellationToken ct)
     {
-        var n = await c.ExecuteAsync(new CommandDefinition(@"
-UPDATE dbo.inbound_match SET supplier_dwbh=@dwbh, match_state=@state, reason=@reason, evidence_json=@ev, version=version+1, matched_at=SYSUTCDATETIME()
+        var current = await c.QuerySingleOrDefaultAsync<MatchCurrentRow>(new CommandDefinition(@"
+SELECT supplier_dwbh, match_state, reason, evidence_json FROM dbo.inbound_match WITH (UPDLOCK, HOLDLOCK)
 WHERE org_id=@orgId AND env=@env AND source_snapshot_id=@snap",
-            new { orgId, env, snap = snapshotId, dwbh, state, reason, ev = evidenceJson }, tx, cancellationToken: ct));
-        if (n == 0)
+            new { orgId, env, snap = snapshotId }, tx, cancellationToken: ct));
+        if (current is null)
+        {
             await c.ExecuteAsync(new CommandDefinition(@"
 INSERT INTO dbo.inbound_match(org_id,env,source_snapshot_id,supplier_dwbh,match_state,reason,evidence_json,matched_at)
 VALUES(@orgId,@env,@snap,@dwbh,@state,@reason,@ev,SYSUTCDATETIME())",
                 new { orgId, env, snap = snapshotId, dwbh, state, reason, ev = evidenceJson }, tx, cancellationToken: ct));
+            return true;
+        }
+        if (string.Equals(current.match_state, state, StringComparison.Ordinal)
+            && string.Equals(current.reason, reason, StringComparison.Ordinal)
+            && string.Equals(current.evidence_json, evidenceJson, StringComparison.Ordinal)
+            && string.Equals(current.supplier_dwbh, dwbh, StringComparison.Ordinal))
+            return false;
+        await c.ExecuteAsync(new CommandDefinition(@"
+UPDATE dbo.inbound_match SET supplier_dwbh=@dwbh, match_state=@state, reason=@reason, evidence_json=@ev, version=version+1, matched_at=SYSUTCDATETIME()
+WHERE org_id=@orgId AND env=@env AND source_snapshot_id=@snap",
+            new { orgId, env, snap = snapshotId, dwbh, state, reason, ev = evidenceJson }, tx, cancellationToken: ct));
+        return true;
     }
 
     private static string? Str(JsonElement e, string name)
@@ -333,4 +358,11 @@ VALUES(@orgId,@env,@snap,@dwbh,@state,@reason,@ev,SYSUTCDATETIME())",
     private sealed class RelRow { public string parent_norm { get; set; } = ""; public string child_norm { get; set; } = ""; }
     private sealed class CodeRow { public long id { get; set; } public string code_normalized { get; set; } = ""; }
     private sealed class TaskRow { public long id { get; set; } public string state { get; set; } = ""; public string source_hash { get; set; } = ""; public long source_snapshot_id { get; set; } }
+    private sealed class MatchCurrentRow
+    {
+        public string? supplier_dwbh { get; set; }
+        public string match_state { get; set; } = "";
+        public string? reason { get; set; }
+        public string? evidence_json { get; set; }
+    }
 }

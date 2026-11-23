@@ -325,6 +325,54 @@ VALUES(@snapId,N'1',@spid,2,N'盒',N'B2026',@hash,N'PURCHASE_IN')", new { snapId
     }
 
     /// <summary>
+    /// 终审修复 F1：非 COMPLETE 快照的空转重扫必须零写入——周期扫描（≤5 分钟一拍）每拍都会重扫未完成快照，
+    /// 若无条件推进 inbound_match.version 并追加匹配审计，打开编辑器的用户会拿到无意义的 409 VERSION_CONFLICT，
+    /// 审计也会按拍增长。断言全部落在持久状态上：版本、matched_at、匹配审计行数在空转重扫后不变；
+    /// 真正变化（UNKNOWN→REQUIRED，UNMATCHED→COMPLETE）时仍须照常推进版本并留审计。
+    /// </summary>
+    [Fact]
+    public async Task Noop_rescan_keeps_version_and_audit_changed_rescan_bumps()
+    {
+        await using var c = await _fx.OpenAsync();
+        var s = await SeedBaseAsync(c, "M12", 96);
+        await c.ExecuteAsync("UPDATE dbo.product SET trace_classification=N'UNKNOWN' WHERE org_id=@orgId AND spid=@spid",
+            new { orgId = s.OrgId, spid = s.Spid });
+        const string auditSql = @"SELECT COUNT(*) FROM dbo.audit_log
+WHERE action=N'inbound.match' AND object_type=N'source_snapshot' AND object_id=@id";
+        var svc = NewService();
+
+        var first = await svc.RunAsync(s.OrgId, "MOCK", s.SnapId, default);
+        Assert.Equal(1, first.Unmatched);
+        var before = await LoadMatchAsync(c, s.SnapId);
+        Assert.Equal("UNMATCHED", before.match_state);
+        Assert.NotNull(before.matched_at);
+        Assert.Equal(1, await c.ExecuteScalarAsync<int>(auditSql, new { id = s.SnapId.ToString() }));
+
+        // 同样的来源、同样的判定 → 空转重扫：返回摘要不变，但不得推进版本/时间，也不得新增审计。
+        var again = await svc.RunAsync(s.OrgId, "MOCK", s.SnapId, default);
+        Assert.Equal(1, again.SnapshotsSeen);
+        Assert.Equal(1, again.Unmatched);
+        var after = await LoadMatchAsync(c, s.SnapId);
+        Assert.Equal(before.match_state, after.match_state);
+        Assert.Equal(before.reason, after.reason);
+        Assert.Equal(before.version, after.version);
+        Assert.Equal(before.matched_at, after.matched_at);
+        Assert.Equal(1, await c.ExecuteScalarAsync<int>(auditSql, new { id = s.SnapId.ToString() }));
+
+        // 分类改回 REQUIRED → 判定真的变了（UNMATCHED→COMPLETE）：照常推进版本、刷新时间、留一条审计。
+        await c.ExecuteAsync("UPDATE dbo.product SET trace_classification=N'REQUIRED' WHERE org_id=@orgId AND spid=@spid",
+            new { orgId = s.OrgId, spid = s.Spid });
+        var changed = await svc.RunAsync(s.OrgId, "MOCK", s.SnapId, default);
+        Assert.Equal(1, changed.Complete);
+        Assert.Equal(1, changed.TasksCreated);
+        var final = await LoadMatchAsync(c, s.SnapId);
+        Assert.Equal("COMPLETE", final.match_state);
+        Assert.True(final.version > before.version);
+        Assert.NotEqual(before.matched_at, final.matched_at);
+        Assert.Equal(2, await c.ExecuteScalarAsync<int>(auditSql, new { id = s.SnapId.ToString() }));
+    }
+
+    /// <summary>
     /// R11c 证据固化（Task 11 修复 2）：trace-policy 取消发送前任务后入队的 map: 重匹配不是空转——
     /// CancelPreSend 已把匹配置 UNMATCHED、分配置 CANCELLED、占用释放，任务行仍保留（Cancelled）；
     /// 重匹配必须绕开 R8a 的既有任务短路（该短路只对非 Cancelled 任务成立）并真正重算。

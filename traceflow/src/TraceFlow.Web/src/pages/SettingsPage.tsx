@@ -26,6 +26,7 @@ export default function SettingsPage() {
   const [settings, setSettings] = useState<SettingView[] | null>(null);
   const [account, setAccount] = useState<ServiceAccount | null>(null);
   const [budgets, setBudgets] = useState<TopBudgetView | null>(null);
+  const [budgetsError, setBudgetsError] = useState('');
   const [error, setError] = useState('');
   const [editTarget, setEditTarget] = useState<SettingView | null>(null);
   const [testMsg, setTestMsg] = useState('');
@@ -39,7 +40,11 @@ export default function SettingsPage() {
   useEffect(() => {
     let active = true;
     api<ServiceAccount>('/api/v1/settings/service-account').then((a) => { if (active) setAccount(a); }).catch(() => { /* 面板降级为不显示 */ });
-    api<TopBudgetView>('/api/v1/top-budgets').then((b) => { if (active) setBudgets(b); }).catch(() => { /* 同上 */ });
+    // 终审修复 F3（NFR-02）：预算面板失败必须显性告警，静默吞错会让面板永远停在「加载中…」，
+    // 403/503/断网都被伪装成“还在加载”。失败只影响本面板，其余设置项与账号面板照常可用。
+    api<TopBudgetView>('/api/v1/top-budgets')
+      .then((b) => { if (active) { setBudgets(b); setBudgetsError(''); } })
+      .catch((e) => { if (active) setBudgetsError(errMsg(e)); });
     return () => { active = false; };
   }, []);
 
@@ -83,7 +88,8 @@ export default function SettingsPage() {
         </p>
       )}
       <h3>限流预算用量（只读）</h3>
-      {budgets === null ? <p>加载中…</p> : (
+      {budgetsError && <p role="alert">限流预算用量加载失败：{budgetsError}</p>}
+      {budgets === null ? (budgetsError ? null : <p>加载中…</p>) : (
         <>
           <table border={1} cellPadding={4} style={{ borderCollapse: 'collapse' }}>
             <thead><tr><th>预算键</th><th>日用量/限值</th><th>分用量/限值</th><th>秒用量/限值</th><th>下次允许时间</th></tr></thead>

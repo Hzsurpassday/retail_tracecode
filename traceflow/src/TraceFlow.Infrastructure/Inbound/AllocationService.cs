@@ -211,6 +211,9 @@ WHERE org_id=@orgId AND env=@env AND source_snapshot_id=@snapshotId",
     public async Task<int> CancelAsync(SqlConnection conn, SqlTransaction tx, long orgId, string env, long snapshotId,
         long? allocationId, string actor, string reason, CancellationToken ct)
     {
+        // 锁序（终审修复 F2）：本方法两条分支都会先经 ResolveTaskAsync 锁 upload_task、再由 CancelPreSendAsync 锁
+        // inbound_match；SaveAsync/ConfirmAsync 是反序（match→task）。故先取匹配行锁，与保存路径同序，消除 ABBA。
+        await InboundCancelService.LockMatchAsync(conn, tx, orgId, env, snapshotId, ct);
         if (allocationId is not null)
         {
             var alloc = await conn.QuerySingleOrDefaultAsync<AllocRow>(new CommandDefinition(@"

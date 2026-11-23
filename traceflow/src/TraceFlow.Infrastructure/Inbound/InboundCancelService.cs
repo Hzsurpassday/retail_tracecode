@@ -14,9 +14,22 @@ public sealed record StaleRevokeResult(int OlderSnapshots, int AllocationsRevoke
 /// </summary>
 public static class InboundCancelService
 {
+    /// <summary>
+    /// 锁序统一（终审修复 F2）：保存/确认路径先取 inbound_match（UPDLOCK,HOLDLOCK）再取 upload_task，
+    /// 取消路径也必须先锁匹配行再锁任务行，否则并发保存（match→task）与取消（原为 task→match）构成 ABBA 死锁。
+    /// 只取锁不读值：无匹配行时 UPDLOCK+HOLDLOCK 在同键唯一索引上留键范围锁，仍保持「先匹配后任务」的顺序。
+    /// </summary>
+    public static Task<long?> LockMatchAsync(SqlConnection conn, SqlTransaction tx, long orgId, string env, long snapshotId, CancellationToken ct)
+        => conn.QuerySingleOrDefaultAsync<long?>(new CommandDefinition(@"
+SELECT id FROM dbo.inbound_match WITH (UPDLOCK, HOLDLOCK)
+WHERE org_id=@orgId AND env=@env AND source_snapshot_id=@snap",
+            new { orgId, env, snap = snapshotId }, tx, cancellationToken: ct));
+
     public static async Task<bool> CancelPreSendAsync(SqlConnection conn, SqlTransaction tx, long orgId, string env,
         long snapshotId, string actor, string reason, string auditEnv, CancellationToken ct)
     {
+        // 锁序：先匹配行、后任务行（与 AllocationService.SaveAsync/ConfirmAsync 一致）。
+        await LockMatchAsync(conn, tx, orgId, env, snapshotId, ct);
         var task = await conn.QuerySingleOrDefaultAsync<TaskRow>(new CommandDefinition(@"
 SELECT id,state FROM dbo.upload_task WITH (UPDLOCK, HOLDLOCK)
 WHERE org_id=@orgId AND env=@env AND source_snapshot_id=@snap AND task_type=N'PURCHASE_IN_102' AND state<>N'Cancelled'",
