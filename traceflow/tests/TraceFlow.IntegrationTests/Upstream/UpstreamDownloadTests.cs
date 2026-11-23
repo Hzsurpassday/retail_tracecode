@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using Dapper;
 using TraceFlow.Application.Abstractions;
@@ -23,13 +24,15 @@ public class UpstreamDownloadTests : IAsyncLifetime
     {
         public Dictionary<(string Method, string PageNo), TopRawResponse> Responses = new();
         public List<TopCall> Calls = new();
+        // Fix Round 1：可选兜底 lambda，表达"无限不同页"等字典无法枚举的脚本；null 时行为与原先逐字一致
+        public Func<TopCall, TopRawResponse>? Fallback;
         public TopRawResponse Handle(TopCall call)
         {
             Calls.Add(call);
             var pageNo = call.Parameters.TryGetValue("page_no", out var p) ? p : "1";
             return Responses.TryGetValue((call.Method, pageNo), out var r)
                 ? r
-                : Ok("""{"total_pages":1,"page_no":1,"bills":[]}""");
+                : Fallback?.Invoke(call) ?? Ok("""{"total_pages":1,"page_no":1,"bills":[]}""");
         }
     }
 
@@ -163,6 +166,59 @@ public class UpstreamDownloadTests : IAsyncLifetime
         var (svc, _, orgId) = await BuildAsync();
         var (start, end) = Window;
         await Assert.ThrowsAsync<TopNotCertifiedException>(() => svc.RunAsync(orgId, "LIVE", start, end, null, default));
+    }
+
+    // Fix Round 1：页帽（MaxPages=1000）耗尽绝不伪造 COMPLETE——列表无 total_pages/total_count 且页页不同
+    [Fact]
+    public async Task List_page_cap_exhaustion_never_fakes_complete()
+    {
+        var (svc, script, orgId) = await BuildAsync();
+        var n = 0;
+        script.Fallback = call =>
+        {
+            if (call.Method == "listupout.detail")
+                return Ok("""{"total_pages":1,"page_no":1,"lines":[]}""");
+            n++;
+            // 每次调用返回全新不同单据页（1 单/页），且不带 total_pages/total_count → 只能靠页帽终止
+            var bill = $$"""{"platform_bill_id":"UB-CAP-{{n}}","bill_no":"XS-CAP","upstream_ref_ent_id":"REF-SUP1","bill_date":"2026-11-18T02:00:00Z","from_ent_id":"ENT-SUP1","to_ent_id":"ENT-STORE","owner_ent_id":"ENT-SUP1","deliver_ent_id":null,"source_version":"v1"}""";
+            return Ok($$"""{"page_no":{{n}},"bills":[{{bill}}]}""");
+        };
+        var (start, end) = Window;
+        await Assert.ThrowsAsync<InvalidOperationException>(() => svc.RunAsync(orgId, "MOCK", start, end, null, default));
+        Assert.Equal(1000, script.Calls.Count); // 恰好拉满页帽后失败，未进入详情阶段
+        await using var c = await _fx.OpenAsync();
+        Assert.Equal("FAILED", await c.ExecuteScalarAsync<string>("SELECT status FROM dbo.download_progress WHERE org_id=@org AND job_kind=N'upstream-list' AND bill_id=0", new { org = orgId }));
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.upstream_bill WHERE org_id=@org AND completeness=N'COMPLETE'", new { org = orgId }));
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.outbox_job WHERE org_id=@org AND job_kind=N'inbound-match'", new { org = orgId }));
+    }
+
+    // Fix Round 1：详情 total_pages=1001 超过页帽→INCOMPLETE + FAILED + 审计，零入队，已拉页码保留
+    [Fact]
+    public async Task Detail_page_cap_exhaustion_marks_incomplete()
+    {
+        await using var c0 = await _fx.OpenAsync();
+        var (orgId, _) = await TestSeed.EnsureAsync(c0);
+        await c0.ExecuteAsync("UPDATE dbo.organization SET ref_ent_id=N'REF-STORE', ent_id=N'ENT-STORE' WHERE id=@org", new { org = orgId });
+        var top = new TopClientService(_fx.ConnectionString, new FakeTopGateway(call =>
+        {
+            if (call.Method == "listupout")
+                return Ok(ListResult($"[{BillA}]", 1, 1));
+            var pageNo = int.Parse(call.Parameters["page_no"], CultureInfo.InvariantCulture);
+            var code = "8123456789012345" + pageNo.ToString("D4", CultureInfo.InvariantCulture); // 每页 1 个有效 20 位码（互不相同）
+            return Ok($$"""{"total_pages":1001,"page_no":{{pageNo}},"lines":[{"platform_line_id":"L1","platform_drug_id":"PD1","batch_no":"P1","quantity":1,"unit":"盒","package_level":"MIN","codes":[{"code":"{{code}}","package_level":"MIN","parent_code":null}]}]}""");
+        }), new RateBudgetService(), new ChannelPauseService(), new AuditLog());
+        var svc = new UpstreamDownloadService(_fx.ConnectionString, top, new JobQueue(_fx.ConnectionString, new AuditLog()), new AuditLog());
+        var (start, end) = Window;
+        var sum = await svc.RunAsync(orgId, "MOCK", start, end, null, default);
+        Assert.Equal(1, sum.BillsIncomplete); // 页帽耗尽=详情页未全部成功→INCOMPLETE，绝不 COMPLETE
+        Assert.Equal(0, sum.BillsComplete);
+        await using var c = await _fx.OpenAsync();
+        Assert.Equal("INCOMPLETE", await c.ExecuteScalarAsync<string>("SELECT completeness FROM dbo.upstream_bill WHERE org_id=@org AND platform_bill_id=N'UB-A'", new { org = orgId }));
+        Assert.Equal("FAILED", await c.ExecuteScalarAsync<string>("SELECT status FROM dbo.download_progress WHERE org_id=@org AND job_kind=N'upstream-detail' AND bill_id<>0", new { org = orgId }));
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.outbox_job WHERE org_id=@org AND job_kind=N'inbound-match'", new { org = orgId }));
+        // 已拉的 1000 页码逐页同事务落库保留，但单据不完整
+        Assert.Equal(1000, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.upstream_bill_code bc JOIN dbo.upstream_bill b ON b.id=bc.bill_id WHERE b.org_id=@org", new { org = orgId }));
+        Assert.Equal(1, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.audit_log WHERE action='upstream.detail.incomplete' AND env=N'MOCK'"));
     }
 
     [Fact]

@@ -13,7 +13,7 @@ public sealed record DownloadSummary(int BillsSeen, int BillsComplete, int Bills
 
 /// <summary>
 /// SYNC-03/UP-01/UP-02：上游出库单分页下载。页数据与进度同事务；列表/详情进度分离；
-/// 详情未全部成功→INCOMPLETE；重复页/总数不一致→FAILED，不伪造完成。
+/// 详情未全部成功→INCOMPLETE；重复页/总数不一致/页帽耗尽→FAILED，不伪造完成。
 /// 每次运行从第 1 页重拉（upsert 幂等）；检查点逐页持久化供观测与下轮重拉。
 /// </summary>
 public sealed class UpstreamDownloadService
@@ -132,6 +132,13 @@ WHERE org_id=@org AND env=@env AND ((@only IS NULL AND completeness<>N'COMPLETE'
             if (bills.Count == 0 || (totalPages is int t && pageNo >= t)) break;
             pageNo++;
         }
+        // Fix Round 1：页帽耗尽（无 total_pages/空页合法终止）绝不伪造 COMPLETE——与重复页/总数不一致失败路径同形
+        if (pageNo > MaxPages)
+        {
+            await SetProgressAsync(orgId, env, "upstream-list", 0, start, end, MaxPages, totalPages, totalCount, "FAILED", ct);
+            await AuditAsync(env, "upstream.list.failed", orgId, $"上游列表页帽 {MaxPages} 耗尽且无合法终止，禁止伪造完成", ct);
+            throw new InvalidOperationException($"上游列表页帽 {MaxPages} 耗尽且无合法终止，禁止伪造完成");
+        }
         if (totalCount is int expected && seen.Count != expected)
         {
             await SetProgressAsync(orgId, env, "upstream-list", 0, start, end, pageNo, totalPages, totalCount, "FAILED", ct);
@@ -172,6 +179,9 @@ WHERE org_id=@org AND env=@env AND ((@only IS NULL AND completeness<>N'COMPLETE'
             if (totalPages is not int t || pageNo >= t) break;
             pageNo++;
         }
+        // Fix Round 1：total_pages 超帽或页帽耗尽→与详情页失败同路径（外层 catch：INCOMPLETE + FAILED + 审计，零入队），绝不伪造 COMPLETE
+        if (pageNo > MaxPages || (totalPages is int cap && cap > MaxPages))
+            throw new InvalidOperationException($"上游详情页帽 {MaxPages} 耗尽（total_pages={totalPages}），未拉全全部页，禁止伪造完成");
         // 全部详情页成功→COMPLETE + 匹配事件入队（同事务，SYNC-03）
         await using (var c = new SqlConnection(_cs))
         {
