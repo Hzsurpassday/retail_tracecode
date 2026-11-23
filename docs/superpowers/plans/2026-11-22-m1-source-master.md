@@ -6763,6 +6763,8 @@ git -c user.name=Hzsurpassday -c user.email=219255064+Hzsurpassday@users.noreply
 ---
 ### Task 13: 人工确认/解除映射端点（双向唯一/强冲突/在途任务守卫）
 
+> **T13 评审前修复（controller ruling，AT-015/MD-01 并发闭环）**：T12 的 MatchingService 全部 8 处 UPDATE 站点（upsert ×2、2601/2627 fallback ×2、重验 ×2、无候选降级 ×2）已加守卫 `is_locked=0 AND state/version=加载值`，0 行→跳过写入+历史+计数（下轮重读）；fallback 先 UPDLOCK+HOLDLOCK 重选当前行，locked/active 则跳过 CONFLICT 降级。T12 代码块以仓库 b9bac3e 为准（本计划 T12 块未含守卫）。确定性测试用影子 org 座位锁定行使 INSERT 真实触发 2601（fallback 重选无 org 过滤——M2 前建议补 org_id 谓词）；UPDATE 守卫真并发无测试缝，逻辑轨迹经评审独立确认。详见 task-13-report.md Fix Round 1。
+
 **Files:**
 - Modify: `traceflow/src/TraceFlow.Host/Endpoints/MasterEndpoints.cs`（追加 4 个端点）
 - Test: `traceflow/tests/TraceFlow.IntegrationTests/Master/MappingConfirmTests.cs`
