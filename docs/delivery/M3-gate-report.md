@@ -157,7 +157,7 @@ SELECT version, name, checksum, success FROM dbo.schema_version ORDER BY version
 
 2. 对 `traceflow/db/migrations/*.sql` 当前文件字节做 SHA-256（PowerShell `Get-FileHash -Algorithm SHA256`），9 个文件与上表逐项一致。
 
-**0001–0008 未变**：上表 1–8 与 `docs/delivery/M2-gate-report.md` ③ 登记的 checksum 逐字节相同；`Migration0009Tests.Migrations_0001_to_0008_checksums_match_m2_gate_report` 在 429 用例中通过。0009 为 M3 新增增量（R-M3-6：合并前修订并更新校验和断言），checksum 首次登记。
+**0001–0008 未变**：上表 1–8 与 `docs/delivery/M2-gate-report.md` ③ 登记的 checksum 逐字节相同；`Migration0009Tests.Migrations_0001_to_0008_checksums_match_m2_gate_report` 在 433 用例中通过。0009 为 M3 新增增量（R-M3-6：合并前修订并更新校验和断言），checksum 首次登记。
 
 ## ④ 浏览器证据（M3 Task 8，控制器执行；本任务未重跑）
 
@@ -180,7 +180,7 @@ SELECT version, name, checksum, success FROM dbo.schema_version ORDER BY version
 
 | 项 | 状态 | 后果/边界 |
 | --- | --- | --- |
-| SQL Server 2008 R2（AT-070） | **未验证**（本报告全部 DB 证据为 2019 授权降级） | 交付前必须真实 10.50.x 重跑全部 429 集成用例并替换 ①③ 证据；静态语法门禁不替代运行时 |
+| SQL Server 2008 R2（AT-070） | **未验证**（本报告全部 DB 证据为 2019 授权降级） | 交付前必须真实 10.50.x 重跑全部 433 集成用例并替换 ①③ 证据；静态语法门禁不替代运行时 |
 | G-TOP 合同 | **未取证** | 321/116 发送、billstatus、codedetail 全部候选 `_verified:false`；LIVE 一律 422 TOP_NOT_CERTIFIED |
 | 真实平台发送 | **未发生** | 全部 MOCK/fixture；不声称平台受理/处理成功/恰好一次 |
 | 受控重试 | `top.retryPathCertified=false`（默认） | 取证前端点 422 且零写入；UI 按后端事实禁用 |
@@ -221,3 +221,16 @@ SELECT version, name, checksum, success FROM dbo.schema_version ORDER BY version
 | Low（携带 M4）：平台回传未知码入台账；`/returns` 固定宿主 env | 裁决保留现状，列入 `M3-rulings-and-carryforwards.md` |
 
 终审修复后重跑（真实输出）：build 0 警告 0 错误；单元 **272/272**；集成默认 **433/433**（2 m 40 s）；BIN2 **433/433**（2 m 30 s）；前端 `npm run build` 0 错误（vite 1.23 s）。迁移 0001–0009 逐字节未变（checksum 同 ③）。
+
+## ⑨ 终审修复范围复核（2026-11-24，修复提交后）
+
+对修复提交做限定范围复核，结论 APPROVED WITH FIXES；处置如下：
+
+| 发现 | 处置 |
+| --- | --- |
+| High：详情时间线仍按 `audit_log.env=task.env` 过滤，人工操作审计改为 LIVE 后，MOCK 任务的人工核对/受控重试记录从抽屉时间线消失 | 时间线改为 `env IN (@env, N'LIVE')`（对象 id 唯一，仍保留 env 防御）；`UploadApiTests` 增加 MOCK 任务时间线含 `task.upload.manual_verified` 的断言 |
+| Medium：报告前瞻段仍写"429 集成用例" | 改为 433（历史首跑记录保留原数） |
+| Low：重复键证据在 JsonNode 物化时抛 `ArgumentException` → 500 | 合并过程整体兜住 `JsonException/ArgumentException/InvalidOperationException` → 422 `VALIDATION`；证据序列化用宽松编码器（中文不转义）；`ReturnConfirmTests` 增加重复键子用例（仍零写入） |
+| Low：不可解析 `priorState` 落入"保留"分支；声明校验先于幂等查询；`SendRecoveryTests` 精确计数 | 评估后不修：`priorState` 来自锁定行必可解析（内部不变量）；幂等重放携带同一请求体（缺字段即不同请求，先校验更安全）；计数为强断言且用例自成库 |
+
+复核后重跑（真实输出）：build 0 警告 0 错误；单元 **272/272**；集成默认 **433/433**（2 m 27 s）；BIN2 **433/433**（2 m 33 s）；定向 `UploadApiTests|ReturnConfirmTests` 32/32。无 UI 改动，前端构建沿用 ⑧ 结果。迁移文件未变。

@@ -405,6 +405,16 @@ ELSE UPDATE dbo.app_setting SET value_json=N'true', updated_by=N'test' WHERE set
             Assert.Equal("MOCK", await c.ExecuteScalarAsync<string>(
                 "SELECT env FROM dbo.upload_task WHERE id=@id", new { id = seed.TaskId }));
         }
+
+        // 详情时间线按对象聚合：人工审计 env=LIVE、任务 env=MOCK，仍须出现在该任务时间线上。
+        var detail = await client.GetAsync($"/api/v1/upload-tasks/{seed.TaskId}");
+        Assert.Equal(HttpStatusCode.OK, detail.StatusCode);
+        using (var detailDoc = JsonDocument.Parse(await detail.Content.ReadAsStringAsync()))
+        {
+            var kinds = detailDoc.RootElement.GetProperty("data").GetProperty("timeline").EnumerateArray()
+                .Select(t => t.GetProperty("kind").GetString()).ToList();
+            Assert.Contains("task.upload.manual_verified", kinds);
+        }
     }
 
     [Fact]

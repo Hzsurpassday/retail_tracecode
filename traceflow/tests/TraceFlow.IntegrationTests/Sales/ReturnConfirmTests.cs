@@ -355,6 +355,13 @@ SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'upload-dispatch' AND intent
         Assert.Equal(ReturnConfirmService.ErrorFirstReportNotDeclared, validation.ErrorCode);
         Assert.Contains("首次上报声明必须勾选", validation.Message);
 
+        // 重复键证据：JsonDocument 接受但 JsonNode 拒绝——必须 422 校验失败而非 500（仍零写入）。
+        var (dupResult, dupFailure) = await AttemptAsync(() => NewConfirmService().ConfirmAsync(scenario.ReturnTaskId,
+            new ReturnConfirmCommand(1, "CONFIRMED", new[] { scenario.SaleEventId }, "{\"a\":1,\"a\":2}",
+                "idem-t6-d1-dup", "tester", FirstReportDeclared: true), default));
+        Assert.Null(dupResult);
+        Assert.Equal("VALIDATION", Assert.IsType<AllocationValidationException>(dupFailure).ErrorCode);
+
         Assert.Equal("Blocked", await ScalarAsync<string>(c, "SELECT state FROM dbo.upload_task WHERE id=@id",
             new { id = scenario.ReturnTaskId }));
         Assert.Equal("RETURN_CONFIRM_REQUIRED", await ScalarAsync<string>(c,

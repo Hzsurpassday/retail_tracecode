@@ -174,7 +174,7 @@ WHERE c.task_id=@id ORDER BY c.id",
                 new { id }, cancellationToken: ctx.RequestAborted))).ToList();
             var audits = (await conn.QueryAsync<AuditTimelineRow>(new CommandDefinition(@"
 SELECT occurred_at, actor, action, reason FROM dbo.audit_log
-WHERE object_type=N'upload_task' AND object_id=@objectId AND env=@env ORDER BY occurred_at, id",
+WHERE object_type=N'upload_task' AND object_id=@objectId AND env IN (@env, N'LIVE') ORDER BY occurred_at, id",
                 new { objectId = id.ToString(CultureInfo.InvariantCulture), env = task.env },
                 cancellationToken: ctx.RequestAborted))).ToList();
 

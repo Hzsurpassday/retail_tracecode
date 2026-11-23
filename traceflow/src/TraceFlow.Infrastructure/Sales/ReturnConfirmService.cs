@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Dapper;
@@ -272,18 +273,30 @@ WHERE id=@id AND state=N'Blocked'",
 
     /// <summary>
     /// 首次上报声明并入证据（落 return_confirmation.evidence_json）：对象形状补 <c>firstReportDeclared=true</c>；
-    /// 数组/标量形状包一层对象保留原证据（绝不丢弃操作员提交的内容）。RequireEvidence 已保证是合法 JSON。
+    /// 数组/标量形状包一层对象保留原证据（绝不丢弃操作员提交的内容）。RequireEvidence 已保证是合法 JSON；
+    /// 但 JsonNode 拒绝重复键（JsonDocument 接受），此时按校验失败处理而非 500。中文证据不做转义（保留可读性）。
     /// </summary>
     private static string WithFirstReportDeclaration(string evidenceJson)
     {
-        var node = JsonNode.Parse(evidenceJson);
-        if (node is JsonObject obj)
+        // JsonNode 延迟物化对象：重复键在解析时放行、在读取/改写时才抛 ArgumentException，故整个合并过程都要兜住。
+        try
         {
-            obj["firstReportDeclared"] = true;
-            return obj.ToJsonString();
+            var node = JsonNode.Parse(evidenceJson);
+            if (node is JsonObject obj)
+            {
+                obj["firstReportDeclared"] = true;
+                return obj.ToJsonString(RelaxedJson);
+            }
+            return new JsonObject { ["firstReportDeclared"] = true, ["evidence"] = node }.ToJsonString(RelaxedJson);
         }
-        return new JsonObject { ["firstReportDeclared"] = true, ["evidence"] = node }.ToJsonString();
+        catch (Exception ex) when (ex is JsonException or ArgumentException or InvalidOperationException)
+        {
+            throw new AllocationValidationException("VALIDATION", "EvidenceJson 须为合法 JSON（不允许重复键）");
+        }
     }
+
+    private static readonly JsonSerializerOptions RelaxedJson =
+        new() { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
 
     /// <summary>
     /// 任务必须存在且属于退货类型：不存在（含跨环境 id）→ 404 <see cref="ResourceNotFoundException"/>；
