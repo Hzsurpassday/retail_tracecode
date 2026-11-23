@@ -461,4 +461,4 @@ function ManualVerifyForm({ detail, onDone }: { detail: UploadDetail; onDone: (m
 }
 
 const overlay: CSSProperties = { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', display: 'flex', justifyContent: 'flex-end', zIndex: 100 };
-const drawer: CSSProperties = { background: '#fff', padding: 20, width: 720, maxWidth: '96%', height: '100%', overflow: 'auto', boxShadow: '-4px 0 12px rgba(0,0,0,0.2)' };
+const drawer: CSSProperties = { background: '#fff', padding: 20, width: 720, maxWidth: '96%', height: '100%', overflow: 'auto', boxSizing: 'border-box', boxShadow: '-4px 0 12px rgba(0,0,0,0.2)' };
