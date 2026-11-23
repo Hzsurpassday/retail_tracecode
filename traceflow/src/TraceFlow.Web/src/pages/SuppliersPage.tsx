@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type CSSProperties } from 'react';
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
 import { api, ApiError } from '../api';
 import type { Page, Supplier } from '../m1types';
 
@@ -15,13 +15,22 @@ export default function SuppliersPage() {
   const [error, setError] = useState('');
   const [confirmTarget, setConfirmTarget] = useState<Supplier | null>(null);
   const [disableTarget, setDisableTarget] = useState<Supplier | null>(null);
+  // 请求序号守卫：每次 load 递增；await 后若已有更新的请求则丢弃本次结果，防止旧响应覆盖新数据
+  const seqRef = useRef(0);
 
   const load = useCallback(async () => {
+    const seq = ++seqRef.current;
     const qs = new URLSearchParams({ page: String(page), pageSize: String(PAGE_SIZE) });
     if (keyword.trim()) qs.set('keyword', keyword.trim());
     if (mappingState !== 'ALL') qs.set('mappingState', mappingState);
-    try { setData(await api<Page<Supplier>>(`/api/v1/suppliers?${qs.toString()}`)); setError(''); }
-    catch (e) { setError(errMsg(e)); }
+    try {
+      const res = await api<Page<Supplier>>(`/api/v1/suppliers?${qs.toString()}`);
+      if (seq !== seqRef.current) return;
+      setData(res); setError('');
+    } catch (e) {
+      if (seq !== seqRef.current) return;
+      setError(errMsg(e));
+    }
   }, [keyword, mappingState, page]);
 
   useEffect(() => { let active = true; (async () => { if (active) await load(); })(); return () => { active = false; }; }, [load]);
