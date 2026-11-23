@@ -131,18 +131,18 @@ FROM dbo.source_snapshot WHERE id=@id", new { id = snapshotId }, cancellationTok
 
         var ids = codeIds.Distinct().ToList();
         var codes = new List<string>();
-        for (var offset = 0; offset < ids.Count; offset += CodeChunk)
+        for (var start = 0; start < ids.Count; start += CodeChunk)
         {
-            var chunk = ids.Skip(offset).Take(CodeChunk).ToList();
+            var chunk = ids.Skip(start).Take(CodeChunk).ToList();
             codes.AddRange(await conn.QueryAsync<string>(new CommandDefinition(
                 "SELECT code_normalized FROM dbo.trace_code WHERE id IN @ids", new { ids = chunk }, tx, cancellationToken: ct)));
         }
         if (codes.Count == 0) return 0;
 
         var snapshotIds = new List<long>();
-        for (var offset = 0; offset < codes.Count; offset += CodeChunk)
+        for (var start = 0; start < codes.Count; start += CodeChunk)
         {
-            var chunk = codes.Skip(offset).Take(CodeChunk).ToList();
+            var chunk = codes.Skip(start).Take(CodeChunk).ToList();
             snapshotIds.AddRange(await conn.QueryAsync<long>(new CommandDefinition(@"
 SELECT DISTINCT t.source_snapshot_id
 FROM dbo.upload_task t
@@ -449,9 +449,9 @@ WHERE vc.verification_id=@id AND vc.result=N'PASS'", new { id = priorId.Value },
         var result = new HashSet<string>(StringComparer.Ordinal);
         if (batch.Count == 0) return result;
         var codes = batch.Select(b => b.Code).ToList();
-        for (var offset = 0; offset < codes.Count; offset += CodeChunk)
+        for (var start = 0; start < codes.Count; start += CodeChunk)
         {
-            var chunk = codes.Skip(offset).Take(CodeChunk).ToList();
+            var chunk = codes.Skip(start).Take(CodeChunk).ToList();
             var rows = await conn.QueryAsync<string>(new CommandDefinition(@"
 SELECT DISTINCT tc.code_normalized
 FROM dbo.code_event e

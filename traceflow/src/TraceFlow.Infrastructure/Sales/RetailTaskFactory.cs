@@ -295,9 +295,9 @@ VALUES(@orgId,@env,@codeId,@scope,@taskId,NULL,N'ACTIVE')",
         string scope, long? taskId, CancellationToken ct)
     {
         var codeIds = ctx.Lines.SelectMany(l => l.Codes.Select(c => c.CodeId)).Distinct().ToList();
-        for (var offset = 0; offset < codeIds.Count; offset += ClaimGateBatch)
+        for (var start = 0; start < codeIds.Count; start += ClaimGateBatch)
         {
-            var batch = codeIds.Skip(offset).Take(ClaimGateBatch).ToList();
+            var batch = codeIds.Skip(start).Take(ClaimGateBatch).ToList();
             var contended = await conn.ExecuteScalarAsync<int>(new CommandDefinition(@"
 SELECT COUNT(*) FROM dbo.code_claim WITH (UPDLOCK, HOLDLOCK)
 WHERE claim_state=N'ACTIVE' AND event_scope=@scope AND org_id=@orgId AND env=@env AND code_id IN @codes
@@ -325,9 +325,9 @@ WHERE claim_state=N'ACTIVE' AND event_scope=@scope AND org_id=@orgId AND env=@en
 
         var eventIds = map.Values.Distinct().ToList();
         var codeByEventId = new Dictionary<long, long>();
-        for (var offset = 0; offset < eventIds.Count; offset += ClaimGateBatch)
+        for (var start = 0; start < eventIds.Count; start += ClaimGateBatch)
         {
-            var batch = eventIds.Skip(offset).Take(ClaimGateBatch).ToList();
+            var batch = eventIds.Skip(start).Take(ClaimGateBatch).ToList();
             var rows = await conn.QueryAsync<EventCodeRow>(new CommandDefinition(@"
 SELECT id, code_id FROM dbo.code_event WHERE org_id=@orgId AND env=@env AND id IN @ids",
                 new { orgId = ctx.OrgId, env = ctx.Env, ids = batch }, tx, cancellationToken: ct));
