@@ -76,6 +76,8 @@ function reasonZh(reason: string | null): string {
   return REASON_ZH[reason] ?? reason;
 }
 const RETRY_BLOCK_REASON = '受控重试通道未取证（top.retryPathCertified=false），禁止重发；请等待回查或联系平台';
+// 在途发送（RETRY_IN_FLIGHT）：发送结果未知时只能走发送恢复→受理未知→回查，UI 只提示等待。
+const RETRY_IN_FLIGHT_REASON = '存在在途发送作业，待其结束后再重试';
 function errMsg(e: unknown): string { return e instanceof ApiError ? `${e.code}: ${e.message}` : '网络错误'; }
 const SHANGHAI = new Intl.DateTimeFormat('en-US', {
   timeZone: 'Asia/Shanghai', hourCycle: 'h23',
@@ -276,6 +278,8 @@ function UploadDrawer({ taskId, envFilter, onClose, onChanged }: {
       onChanged();
     } catch (e) {
       if (e instanceof ApiError && e.code === 'RETRY_PATH_NOT_CERTIFIED') setRetryBlocked(RETRY_BLOCK_REASON);
+      // 在途发送期间服务端零写入拒绝（409）：不重排、不抢占，等作业结束后再重试。
+      else if (e instanceof ApiError && e.code === 'RETRY_IN_FLIGHT') setError(RETRY_IN_FLIGHT_REASON);
       else setError(errMsg(e));
     } finally {
       setBusy(false);

@@ -605,9 +605,12 @@ ELSE UPDATE dbo.app_setting SET value_json=N'true', updated_by=N'test' WHERE set
         }
     }
 
-    /// <summary>受控重试绝不抢占在途发送：RUNNING（租约未过期）作业保持原样，jobsReset 只统计实际复位行数。</summary>
+    /// <summary>
+    /// 受控重试绝不在在途发送时抢占/重排：目标分片的 upload-dispatch 作业 RUNNING（租约未过期）→ 409 RETRY_IN_FLIGHT，
+    /// 且拒绝即零写入（任务/分片/作业/租约/审计/幂等记录全部不变）。
+    /// </summary>
     [Fact]
-    public async Task Controlled_retry_does_not_reset_running_dispatch_job()
+    public async Task Controlled_retry_blocked_while_dispatch_in_flight_writes_nothing()
     {
         await EnableRetryPathCertifiedAsync();
         var seed = await SeedUploadAsync("R3", 1300, taskState: "Failed", partState: "Failed", failedCodes: 1,
@@ -622,18 +625,74 @@ WHERE id=@id", new { id = seed.JobId });
         NewIdemKey(client);
         var resp = await client.PostAsJsonAsync($"/api/v1/upload-tasks/{seed.TaskId}/controlled-retry",
             new { expectedVersion = 1 });
-        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
-        using (var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync()))
-            Assert.Equal(0, doc.RootElement.GetProperty("data").GetProperty("jobsReset").GetInt32());
+        Assert.Equal(HttpStatusCode.Conflict, resp.StatusCode);
+        Assert.Contains("RETRY_IN_FLIGHT", await resp.Content.ReadAsStringAsync());
 
         await using (var c = await _fx.OpenAsync())
         {
+            Assert.Equal("Failed", await c.ExecuteScalarAsync<string>(
+                "SELECT state FROM dbo.upload_task WHERE id=@id", new { id = seed.TaskId }));
+            Assert.Equal(1, await c.ExecuteScalarAsync<int>(
+                "SELECT version FROM dbo.upload_task WHERE id=@id", new { id = seed.TaskId }));
+            Assert.Equal("Failed", await c.ExecuteScalarAsync<string>(
+                "SELECT state FROM dbo.upload_part WHERE id=@id", new { id = seed.PartId }));
             Assert.Equal("RUNNING", await c.ExecuteScalarAsync<string>(
                 "SELECT job_state FROM dbo.outbox_job WHERE id=@id", new { id = seed.JobId }));
             Assert.Equal(1, await c.ExecuteScalarAsync<int>(
                 "SELECT attempt_count FROM dbo.outbox_job WHERE id=@id", new { id = seed.JobId }));
             Assert.Equal("worker-1", await c.ExecuteScalarAsync<string>(
                 "SELECT lease_owner FROM dbo.outbox_job WHERE id=@id", new { id = seed.JobId }));
+            Assert.Equal(1, await c.ExecuteScalarAsync<int>(
+                "SELECT COUNT(*) FROM dbo.upload_attempt WHERE task_id=@id", new { id = seed.TaskId }));
+            Assert.Equal(0, await c.ExecuteScalarAsync<int>(
+                "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'task.upload.controlled_retry'"));
+            Assert.Equal(0, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.idempotency_record"));
+        }
+    }
+
+    /// <summary>
+    /// 租约已过期的 RUNNING 同样不可动（M1）：upload-dispatch 的失租由发送恢复→受理未知→回查收尾，
+    /// 受控重试不得把它复位成 PENDING（否则等于重排未知结果的发送）。
+    /// </summary>
+    [Fact]
+    public async Task Controlled_retry_blocked_when_running_job_lease_expired()
+    {
+        await EnableRetryPathCertifiedAsync();
+        var seed = await SeedUploadAsync("R5", 1350, taskState: "Failed", partState: "Failed", failedCodes: 1,
+            withJob: true, jobState: "RUNNING", jobAttempts: 2);
+        DateTime? leaseBefore;
+        await using (var c = await _fx.OpenAsync())
+        {
+            await c.ExecuteAsync(@"
+UPDATE dbo.outbox_job
+SET lease_owner=N'worker-2', lease_until=DATEADD(minute,-5,SYSUTCDATETIME()), finished_at=NULL
+WHERE id=@id", new { id = seed.JobId });
+            leaseBefore = await c.ExecuteScalarAsync<DateTime?>(
+                "SELECT lease_until FROM dbo.outbox_job WHERE id=@id", new { id = seed.JobId });
+        }
+
+        var client = await LoginAsync("upload-admin", AdminPassword);
+        NewIdemKey(client);
+        var resp = await client.PostAsJsonAsync($"/api/v1/upload-tasks/{seed.TaskId}/controlled-retry",
+            new { expectedVersion = 1 });
+        Assert.Equal(HttpStatusCode.Conflict, resp.StatusCode);
+        Assert.Contains("RETRY_IN_FLIGHT", await resp.Content.ReadAsStringAsync());
+
+        await using (var c = await _fx.OpenAsync())
+        {
+            Assert.Equal("RUNNING", await c.ExecuteScalarAsync<string>(
+                "SELECT job_state FROM dbo.outbox_job WHERE id=@id", new { id = seed.JobId }));
+            Assert.Equal(2, await c.ExecuteScalarAsync<int>(
+                "SELECT attempt_count FROM dbo.outbox_job WHERE id=@id", new { id = seed.JobId }));
+            Assert.Equal("worker-2", await c.ExecuteScalarAsync<string>(
+                "SELECT lease_owner FROM dbo.outbox_job WHERE id=@id", new { id = seed.JobId }));
+            Assert.Equal(leaseBefore, await c.ExecuteScalarAsync<DateTime?>(
+                "SELECT lease_until FROM dbo.outbox_job WHERE id=@id", new { id = seed.JobId }));
+            Assert.Equal("Failed", await c.ExecuteScalarAsync<string>(
+                "SELECT state FROM dbo.upload_part WHERE id=@id", new { id = seed.PartId }));
+            Assert.Equal(0, await c.ExecuteScalarAsync<int>(
+                "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'task.upload.controlled_retry'"));
+            Assert.Equal(0, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.idempotency_record"));
         }
     }
 
@@ -659,6 +718,38 @@ WHERE id=@id", new { id = seed.JobId });
             "SELECT attempt_count FROM dbo.outbox_job WHERE id=@id", new { id = seed.JobId }));
         Assert.Null(await c.ExecuteScalarAsync<DateTime?>(
             "SELECT finished_at FROM dbo.outbox_job WHERE id=@id", new { id = seed.JobId }));
+    }
+
+    /// <summary>
+    /// 原本没有发送作业（无人认领的分片）：受控重试必须新建 PENDING 作业并在响应里 retryAllowed=true、
+    /// jobsReset&gt;0——不允许「分片进入 RetryWait 却无可认领作业」的静默空转。
+    /// </summary>
+    [Fact]
+    public async Task Controlled_retry_creates_dispatch_job_when_missing()
+    {
+        await EnableRetryPathCertifiedAsync();
+        var seed = await SeedUploadAsync("R6", 1450, taskState: "Failed", partState: "Failed", failedCodes: 1,
+            withJob: false);
+        var client = await LoginAsync("upload-admin", AdminPassword);
+        NewIdemKey(client);
+        var resp = await client.PostAsJsonAsync($"/api/v1/upload-tasks/{seed.TaskId}/controlled-retry",
+            new { expectedVersion = 1 });
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        using (var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync()))
+        {
+            var data = doc.RootElement.GetProperty("data");
+            Assert.True(data.GetProperty("retryAllowed").GetBoolean());
+            Assert.True(data.GetProperty("jobsReset").GetInt32() > 0);
+        }
+
+        await using var c = await _fx.OpenAsync();
+        Assert.Equal(1, await c.ExecuteScalarAsync<int>(@"
+SELECT COUNT(*) FROM dbo.outbox_job
+WHERE org_id=@orgId AND env=N'MOCK' AND job_kind=N'upload-dispatch' AND job_state=N'PENDING'
+  AND attempt_count=0 AND intent_key=@intent",
+            new { seed.OrgId, intent = "part:" + seed.PartId }));
+        Assert.Equal("RetryWait", await c.ExecuteScalarAsync<string>(
+            "SELECT state FROM dbo.upload_part WHERE id=@id", new { id = seed.PartId }));
     }
 
     // ---------------------------------------------------------------- 429 限流契约

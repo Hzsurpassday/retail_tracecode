@@ -314,6 +314,10 @@ WHERE id=@id AND state=N'Blocked'",
 
     // ---------- 读取 ----------
 
+    /// <summary>
+    /// 任务加载按 id + 环境 + 活动机构定界（纵深防御）：单机构部署下 org 谓词恒成立，行为不变；
+    /// 范围外（含跨环境/跨机构 id）返回 null → NOT_FOUND，绝不读写别处任务。
+    /// </summary>
     private async Task<TaskRow?> LoadTaskAsync(SqlConnection conn, SqlTransaction tx, long taskId, bool forUpdate,
         CancellationToken ct)
     {
@@ -323,7 +327,8 @@ SELECT t.id, t.org_id, t.task_type, t.event_key, t.source_snapshot_id, t.source_
        t.state, t.state_reason, t.predecessor_task_id, t.version, s.business_datetime
 FROM dbo.upload_task t{hint}
 LEFT JOIN dbo.source_snapshot s ON s.id=t.source_snapshot_id
-WHERE t.id=@id AND t.env=@env",
+WHERE t.id=@id AND t.env=@env
+  AND t.org_id=(SELECT id FROM dbo.organization WHERE is_active=1)",
             new { id = taskId, env = _env }, tx, cancellationToken: ct));
     }
 

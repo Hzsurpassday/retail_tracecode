@@ -74,7 +74,7 @@ WHERE s.rn=1";
             args.Add("hi", p * size);
             var rows = await conn.QueryAsync<SaleListRow>(new CommandDefinition($@"
 SELECT snapshotId,docKey,version,businessDatetimeUtc,completeness,lineCount,codeCount,
-       verificationState,verificationEnv,taskId,taskState,createdAt FROM (
+       verificationState,taskId,taskState,createdAt FROM (
     SELECT ROW_NUMBER() OVER (ORDER BY s.id DESC) AS rn2,
            s.id AS snapshotId, s.source_document_key AS docKey, s.version,
            s.business_datetime AS businessDatetimeUtc, s.completeness_status AS completeness,
@@ -82,18 +82,19 @@ SELECT snapshotId,docKey,version,businessDatetimeUtc,completeness,lineCount,code
             WHERE l.snapshot_id=s.id AND l.event_kind=N'SALE') AS lineCount,
            (SELECT COUNT(*) FROM dbo.source_line l
             WHERE l.snapshot_id=s.id AND l.event_kind=N'SALE' AND l.trace_code_normalized IS NOT NULL) AS codeCount,
-           v.state AS verificationState, v.env AS verificationEnv, t.id AS taskId, t.state AS taskState,
+           v.state AS verificationState, t.id AS taskId, t.state AS taskState,
            s.observed_at AS createdAt
     {baseSql}
 ) x WHERE rn2 BETWEEN @lo AND @hi ORDER BY rn2", args, cancellationToken: ctx.RequestAborted));
             // API-01：外部 ID 一律 JSON 字符串；响应只含白名单字段（raw_header/raw_line/payload 永不外泄）。
-            // env 回显行自身的核验归属（R-M3-17：未核验快照无 env 属性、两个环境视图都可见，此时才回退查询环境）。
+            // source_snapshot 无 env 列：join 已把 v.env 钉死为查询环境（@env），所以行 env 即查询环境本身；
+            // 未核验快照没有 env 属性，按 R-M3-17 在两个环境视图中都可见，同样回显查询环境。
             var items = rows.Select(r => new
             {
                 snapshotId = r.snapshotId.ToString(CultureInfo.InvariantCulture),
                 r.docKey, r.version, businessDatetimeUtc = r.businessDatetimeUtc,
                 completeness = r.completeness, lineCount = r.lineCount, codeCount = r.codeCount,
-                env = r.verificationEnv ?? targetEnv, r.verificationState,
+                env = targetEnv, r.verificationState,
                 taskId = r.taskId?.ToString(CultureInfo.InvariantCulture), r.taskState,
             }).ToList();
             return Results.Ok(new { data = new { items, page = p, pageSize = size, total }, requestId = ctx.TraceIdentifier });
@@ -196,16 +197,17 @@ SELECT id, part_index, bill_code, state FROM dbo.upload_part WHERE task_id=@task
 
         // ---------------------------------------------------------------- 退货任务列表
         app.MapGet("/api/v1/returns", async (HttpContext ctx, int? page, int? pageSize, string? state,
-            string? stateReason) =>
+            string? confirmStatus) =>
         {
             if (!TryPaging(page, pageSize, out var p, out var size, out var pagingError))
                 return PagingError(ctx, pagingError!);
             if (!string.IsNullOrEmpty(state)
                 && !Enum.TryParse<UploadState>(state, ignoreCase: false, out _))
                 return Err(ctx, 422, "VALIDATION", "state 不是合法的上传状态");
-            // stateReason 与 state 同风格：可选、逗号分隔多值（动态 IN）；任一值非已知原因 → 422，且在读写前拒绝。
-            if (!TryParseStateReasons(stateReason, out var stateReasons))
-                return Err(ctx, 422, "VALIDATION", "stateReason 不是合法的状态原因");
+            // 页签分组（稳定，不依赖 state_reason 是否为 RETURN_CONFIRMED 留存）：大小写敏感，非法值 422，
+            // 且在读写前拒绝（绝不静默返回空列表）。
+            if (!TryParseConfirmStatus(confirmStatus, out var confirmGroup))
+                return Err(ctx, 422, "VALIDATION", "confirmStatus 只能为 PENDING、CONFIRMED 或 REJECTED");
 
             await using var conn = new SqlConnection(connectionString);
             await conn.OpenAsync(ctx.RequestAborted);
@@ -216,12 +218,7 @@ SELECT id, part_index, bill_code, state FROM dbo.upload_part WHERE task_id=@task
             args.Add("env", env);
             var filters = "";
             if (!string.IsNullOrEmpty(state)) { filters += " AND t.state=@state"; args.Add("state", state); }
-            if (stateReasons.Count > 0)
-            {
-                // 动态 IN（Dapper 展开为参数列表）：2008 R2 无表值参数，动态参数列表是唯一可行写法。
-                filters += " AND t.state_reason IN @stateReasons";
-                args.Add("stateReasons", stateReasons);
-            }
+            if (confirmGroup is not null) filters += " AND " + ConfirmGroupPredicate(confirmGroup);
             var where = $@"FROM dbo.upload_task t
 WHERE t.org_id=@orgId AND t.env=@env
   AND t.task_type IN (N'CONSUMER_RETURN_116',N'PURCHASE_RETURN_202'){filters}";
@@ -308,32 +305,41 @@ FROM (
         return value is "LIVE" or "MOCK" ? value : null;
     }
 
+    /// <summary>退货首次确认分组取值（大小写敏感）：PENDING / CONFIRMED / REJECTED。</summary>
+    private const string ConfirmStatusPending = "PENDING";
+    private const string ConfirmStatusConfirmed = "CONFIRMED";
+    private const string ConfirmStatusRejected = "REJECTED";
+
+    /// <summary>待确认：仍是 Blocked 且原因为 RETURN_CONFIRM_REQUIRED 的占位任务。</summary>
+    private const string ConfirmPendingPredicate =
+        "(t.state=N'Blocked' AND t.state_reason=N'RETURN_CONFIRM_REQUIRED')";
+
+    /// <summary>已驳回：Blocked + 两种驳回原因（含被撤销的驳回）。</summary>
+    private const string ConfirmRejectedPredicate =
+        "(t.state=N'Blocked' AND t.state_reason IN (N'RETURN_CONFIRM_REJECTED',N'RETURN_CONFIRM_REJECTED_SUPERSEDED'))";
+
     /// <summary>
-    /// 退货任务已知的状态原因（<c>upload_task.state_reason</c>）：与 state 的白名单校验同风格，
-    /// 未知值一律 422（避免前端把拼写错误当成「无数据」静默展示）。
+    /// 已确认＝不属于前两组：确认后任务会随上传推进改写 state/state_reason（如 PLATFORM_ACCEPTED），
+    /// 因此只能按「排除法」分组，绝不能要求 state_reason 仍为 RETURN_CONFIRMED。
     /// </summary>
-    private static readonly HashSet<string> ReturnStateReasons = new(StringComparer.Ordinal)
+    private const string ConfirmConfirmedPredicate =
+        "NOT " + ConfirmPendingPredicate + " AND NOT " + ConfirmRejectedPredicate;
+
+    private static string ConfirmGroupPredicate(string group) => group switch
     {
-        ReturnConfirmService.ReasonConfirmRequired,
-        ReturnConfirmService.ReasonRejected,
-        ReturnConfirmService.ReasonConfirmed,
-        SaleVerificationService.ReasonReturnConfirmRejectedSuperseded,
-        SaleVerificationService.ReasonReturnLinesRemoved,
-        SaleVerificationService.ReasonRuleVersionChanged,
+        ConfirmStatusPending => ConfirmPendingPredicate,
+        ConfirmStatusRejected => ConfirmRejectedPredicate,
+        _ => ConfirmConfirmedPredicate,
     };
 
-    /// <summary>解析 stateReason：逗号分隔多值，去空白/去重；空串表示不过滤；任一未知值 → false（422）。</summary>
-    private static bool TryParseStateReasons(string? raw, out List<string> reasons)
+    /// <summary>解析 confirmStatus：空/缺省表示不过滤；大小写敏感（不做 Trim/大小写归一），未知值 → false（422）。</summary>
+    private static bool TryParseConfirmStatus(string? raw, out string? group)
     {
-        reasons = new List<string>();
-        if (string.IsNullOrWhiteSpace(raw)) return true;
-        foreach (var part in raw.Split(','))
-        {
-            var value = part.Trim();
-            if (value.Length == 0 || !ReturnStateReasons.Contains(value)) return false;
-            if (!reasons.Contains(value)) reasons.Add(value);
-        }
-        return reasons.Count > 0;
+        group = null;
+        if (raw is null || raw.Length == 0) return true;
+        if (raw is not (ConfirmStatusPending or ConfirmStatusConfirmed or ConfirmStatusRejected)) return false;
+        group = raw;
+        return true;
     }
 
     private static bool TryParseDateFrom(string? raw, out DateTime? value)
@@ -402,7 +408,7 @@ WHERE org_id=@orgId AND env=@env AND is_current=1 AND source_snapshot_id IN @ids
 
         var all = candidatesBySnapshot.Values.SelectMany(list => list).ToList();
         var codeTexts = await LoadCodeTextsAsync(conn, all.Select(c => c.CodeId), ct);
-        var predecessorFacts = await LoadPredecessorFactsAsync(conn, all.Select(c => c.PredecessorEventId), ct);
+        var predecessorFacts = await LoadPredecessorFactsAsync(conn, orgId, all.Select(c => c.PredecessorEventId), ct);
 
         var enriched = new Dictionary<long, List<object>>(candidatesBySnapshot.Count);
         foreach (var (snapshotId, parsed) in candidatesBySnapshot)
@@ -446,7 +452,11 @@ WHERE org_id=@orgId AND env=@env AND is_current=1 AND source_snapshot_id IN @ids
     /// <summary>候选展示字段的联查批量大小（避免单条语句参数超限）。</summary>
     private const int CandidateBatchSize = 500;
 
-    /// <summary>码文本（按 codeId）；缺行不返回，只让对应候选的 code 置 null。</summary>
+    /// <summary>
+    /// 码文本（按 codeId）；缺行不返回，只让对应候选的 code 置 null。
+    /// 不做机构作用域：trace_code 是全局码台账（无 org_id 列），码本身全局唯一；
+    /// 调用侧的 codeId 来自活动机构快照的当前核验结论，故不存在跨机构越权读取面。
+    /// </summary>
     private static async Task<Dictionary<long, string>> LoadCodeTextsAsync(SqlConnection conn,
         IEnumerable<string?> codeIdTexts, CancellationToken ct)
     {
@@ -468,9 +478,10 @@ WHERE org_id=@orgId AND env=@env AND is_current=1 AND source_snapshot_id IN @ids
     /// 前序事件事实：occurredAt 取 code_event.occurred_at；docKey 取事件来源单据键——
     /// 事件自带 source_snapshot_id 时直连 source_snapshot，否则（外部证据事件/来源行事件）经
     /// source_line 的 snapshot 链回查；两处都缺行 → null（候选保留，仅字段为空）。
+    /// 纵深防御：事件与两处快照联查都按活动机构 org_id 收窄（source_line 无 org 列，经快照归属）。
     /// </summary>
     private static async Task<Dictionary<long, CandidatePredecessorFact>> LoadPredecessorFactsAsync(
-        SqlConnection conn, IEnumerable<string?> eventIdTexts, CancellationToken ct)
+        SqlConnection conn, long orgId, IEnumerable<string?> eventIdTexts, CancellationToken ct)
     {
         var ids = eventIdTexts.Select(ParseId).Where(id => id is not null).Select(id => id!.Value)
             .Distinct().ToList();
@@ -482,10 +493,10 @@ WHERE org_id=@orgId AND env=@env AND is_current=1 AND source_snapshot_id IN @ids
 SELECT e.id, e.occurred_at AS occurredAt,
        COALESCE(snap.source_document_key, line_snap.source_document_key) AS docKey
 FROM dbo.code_event e
-LEFT JOIN dbo.source_snapshot snap ON snap.id=e.source_snapshot_id
+LEFT JOIN dbo.source_snapshot snap ON snap.id=e.source_snapshot_id AND snap.org_id=@orgId
 LEFT JOIN dbo.source_line l ON l.id=e.source_line_id
-LEFT JOIN dbo.source_snapshot line_snap ON line_snap.id=l.snapshot_id
-WHERE e.id IN @ids", new { ids = chunk }, cancellationToken: ct));
+LEFT JOIN dbo.source_snapshot line_snap ON line_snap.id=l.snapshot_id AND line_snap.org_id=@orgId
+WHERE e.org_id=@orgId AND e.id IN @ids", new { orgId, ids = chunk }, cancellationToken: ct));
             foreach (var row in rows) map[row.id] = new CandidatePredecessorFact(row.occurredAt, row.docKey);
         }
         return map;
@@ -551,7 +562,6 @@ WHERE e.id IN @ids", new { ids = chunk }, cancellationToken: ct));
         public int lineCount { get; set; }
         public int codeCount { get; set; }
         public string? verificationState { get; set; }
-        public string? verificationEnv { get; set; }
         public long? taskId { get; set; }
         public string? taskState { get; set; }
         public DateTime? createdAt { get; set; }

@@ -506,16 +506,15 @@ VALUES(@orgId,N'MOCK',@key,N'CONSUMER_RETURN_116',@hash,@payload,@hash,N'Blocked
     }
 
     /// <summary>
-    /// 退货页签改为服务端过滤（UI-06/07）：stateReason 支持逗号分隔多值（动态 IN），
-    /// 每个页签查询只返回对应原因的任务；非法原因 → 422 VALIDATION（不是静默空列表）。
+    /// 退货页签按稳定的确认分组过滤（UI-06/07）：confirmStatus ∈ PENDING|CONFIRMED|REJECTED（大小写敏感），
+    /// 三组互斥；已确认走排除法，任务随后续上传推进改写 state_reason（PLATFORM_ACCEPTED）也不从页签消失；
+    /// 非法值 → 422 VALIDATION（不是静默空列表）。
     /// </summary>
     [Fact]
-    public async Task Returns_list_filters_by_state_reason_server_side()
+    public async Task Returns_list_filters_by_stable_confirm_status_server_side()
     {
-        // 三种页签状态各一条，外加一条被撤销的驳回（Cancelled + *_SUPERSEDED）验证多值 IN 与 state 组合。
         var pending = await SeedReturnTaskAsync("SR1", "Blocked", "RETURN_CONFIRM_REQUIRED");
         var rejected = await SeedReturnTaskAsync("SR2", "Blocked", "RETURN_CONFIRM_REJECTED");
-        var rejectedSuperseded = await SeedReturnTaskAsync("SR3", "Cancelled", "RETURN_CONFIRM_REJECTED_SUPERSEDED");
         var confirmed = await SeedReturnTaskAsync("SR4", "Ready", "RETURN_CONFIRMED");
         var client = await LoginAsync("sales-admin", AdminPassword);
 
@@ -531,30 +530,40 @@ VALUES(@orgId,N'MOCK',@key,N'CONSUMER_RETURN_116',@hash,@payload,@hash,N'Blocked
             return items.Select(i => i.GetProperty("id").GetString()!).ToList();
         }
 
-        // 待确认页签：state=Blocked + 单一原因。
-        Assert.Equal(new[] { pending.ToString() },
-            await IdsAsync("state=Blocked&stateReason=RETURN_CONFIRM_REQUIRED"));
-        // 已驳回页签：state=Blocked + 两个原因的多值 IN（已撤销的驳回是 Cancelled，故不在本页签）。
-        Assert.Equal(new[] { rejected.ToString() },
-            await IdsAsync("state=Blocked&stateReason=RETURN_CONFIRM_REJECTED,RETURN_CONFIRM_REJECTED_SUPERSEDED"));
-        // 不带 state 时两个驳回原因都应命中：证明动态 IN 真的展开为多值而不是只取第一个。
-        var bothRejected = await IdsAsync("stateReason=RETURN_CONFIRM_REJECTED,RETURN_CONFIRM_REJECTED_SUPERSEDED");
-        Assert.Equal(
-            new[] { rejected.ToString(), rejectedSuperseded.ToString() }.OrderBy(x => x, StringComparer.Ordinal),
-            bothRejected.OrderBy(x => x, StringComparer.Ordinal));
-        // 已确认页签：只按原因过滤，不带 state。
-        Assert.Equal(new[] { confirmed.ToString() }, await IdsAsync("stateReason=RETURN_CONFIRMED"));
+        Assert.Equal(new[] { pending.ToString() }, await IdsAsync("confirmStatus=PENDING"));
+        Assert.Equal(new[] { rejected.ToString() }, await IdsAsync("confirmStatus=REJECTED"));
+        Assert.Equal(new[] { confirmed.ToString() }, await IdsAsync("confirmStatus=CONFIRMED"));
 
-        // 非法值（未知原因 / 大小写不符 / 多值中混入未知）一律 422，绝不静默返回空列表。
-        foreach (var bad in new[] { "BOGUS", "return_confirm_required", "RETURN_CONFIRM_REQUIRED,BOGUS", "," })
+        // 上传推进改写 state/state_reason 后，已确认页签必须仍返回该任务（不依赖 RETURN_CONFIRMED 留存）。
+        await using (var c = await _fx.OpenAsync())
+            await c.ExecuteAsync(
+                "UPDATE dbo.upload_task SET state=N'Processing', state_reason=N'PLATFORM_ACCEPTED' WHERE id=@id",
+                new { id = confirmed });
+        Assert.Equal(new[] { confirmed.ToString() }, await IdsAsync("confirmStatus=CONFIRMED"));
+        Assert.Equal(new[] { pending.ToString() }, await IdsAsync("confirmStatus=PENDING"));
+        Assert.Equal(new[] { rejected.ToString() }, await IdsAsync("confirmStatus=REJECTED"));
+
+        // 三组互斥：同一任务不得同时出现在两个页签。
+        var pendingIds = await IdsAsync("confirmStatus=PENDING");
+        var confirmedIds = await IdsAsync("confirmStatus=CONFIRMED");
+        var rejectedIds = await IdsAsync("confirmStatus=REJECTED");
+        Assert.Empty(pendingIds.Intersect(confirmedIds));
+        Assert.Empty(pendingIds.Intersect(rejectedIds));
+        Assert.Empty(confirmedIds.Intersect(rejectedIds));
+
+        // 不带 confirmStatus 时不过滤（保持旧行为：全部退货任务）。
+        Assert.Equal(3, (await IdsAsync("page=1&pageSize=20")).Count);
+
+        // 非法值（大小写不符 / 未知分组 / 多值 / 前后空白）一律 422，绝不静默返回空列表。
+        foreach (var bad in new[] { "pending", "Pending", "BOGUS", "PENDING,CONFIRMED", " PENDING" })
         {
-            var resp = await client.GetAsync($"/api/v1/returns?stateReason={Uri.EscapeDataString(bad)}");
+            var resp = await client.GetAsync($"/api/v1/returns?confirmStatus={Uri.EscapeDataString(bad)}");
             Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
             Assert.Contains("VALIDATION", await resp.Content.ReadAsStringAsync());
         }
     }
 
-    /// <summary>直写退货占位任务（不走核验服务）：用于 stateReason 过滤断言。</summary>
+    /// <summary>直写退货占位任务（不走核验服务）：用于确认分组过滤断言。</summary>
     private async Task<long> SeedReturnTaskAsync(string tag, string state, string stateReason)
     {
         await using var c = await _fx.OpenAsync();

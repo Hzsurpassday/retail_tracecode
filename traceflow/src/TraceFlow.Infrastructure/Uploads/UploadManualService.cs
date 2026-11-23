@@ -20,7 +20,7 @@ public sealed record ManualVerifyCommand(string Decision, string? PlatformBillCo
 public sealed record ManualVerifyResult(long TaskId, string State, int Version, string Decision,
     IReadOnlyList<long> PartIds);
 
-/// <summary>受控重试结果：JobsReset 为被复位的 upload-dispatch 作业数（0 表示原本没有作业、已新建待执行作业）。</summary>
+/// <summary>受控重试结果：JobsReset 为被复位的 upload-dispatch 作业数（新建的作业同样计一次）。</summary>
 public sealed record ControlledRetryResult(long TaskId, string State, int Version, IReadOnlyList<long> PartIds,
     int JobsReset);
 
@@ -31,8 +31,9 @@ public sealed record ControlledRetryResult(long TaskId, string State, int Versio
 /// 经 <see cref="UploadStateMachine"/> 推进 EvidenceVerifiedAccepted/Processing；NOT_ACCEPTED 需一致性窗口已过
 /// 且提供合同证据，经 QueryConfirmedNotAccepted → RetryWait 并复位发送作业（否则 RetryWait 永远不会被再发送）。</item>
 /// <item><b>controlled-retry</b>：先读 <see cref="SettingsService.GetRetryPathCertifiedAsync"/>，false 在零写入前抛
-/// <see cref="RetryPathNotCertifiedException"/>；true 时仅 Failed 分片 ControlledRetryApproved → RetryWait，
-/// 复位 <c>upload-dispatch</c> 作业（PENDING/attempt_count=0/next_run_at=now/清租约；在执行中的 RUNNING 作业不动），
+/// <see cref="RetryPathNotCertifiedException"/>；目标 Failed 分片存在在途（RUNNING）发送作业时，在零写入前抛
+/// <see cref="AllocationConflictException"/>（RETRY_IN_FLIGHT）；通过后仅 Failed 分片 ControlledRetryApproved → RetryWait，
+/// 复位 <c>upload-dispatch</c> 作业（PENDING/attempt_count=0/next_run_at=now/清租约；PENDING/FAILED/DONE 才可复位），
 /// 绝不改写 upload_attempt 历史。</item>
 /// </list>
 /// 两个入口都按「活动机构 + 宿主环境」定界任务（跨环境 id → <see cref="ResourceNotFoundException"/> 404，零写入）。
@@ -52,6 +53,8 @@ public sealed class UploadManualService
     public const string ErrorNotFailed = "NOT_FAILED";
     public const string ErrorTransition = "TRANSITION_NOT_ALLOWED";
     public const string ErrorVersionConflict = "VERSION_CONFLICT";
+    /// <summary>目标分片存在在途发送作业：受控重试必须在任何写入前拒绝（409），待其结束后再重试。</summary>
+    public const string ErrorRetryInFlight = "RETRY_IN_FLIGHT";
 
     private const string DispatchJobKind = "upload-dispatch";
     private const string DispatchIntentPrefix = "part:";
@@ -184,6 +187,12 @@ public sealed class UploadManualService
         if (failedParts.Count == 0)
             throw new AllocationValidationException(ErrorNotFailed, "任务没有 Failed 分片");
 
+        // 在途发送时拒绝重试（仍在校验段、首个写入之前）：RUNNING 作业不可抢占、也不可重排，
+        // 未知结果的发送只能走「发送恢复 → 受理未知 → 回查」，盲目重排等于重复提交。
+        // 拒绝路径由 IdempotencyExecutor 回滚事务：任务/分片/作业/审计/幂等记录零写入。
+        if (await HasInFlightDispatchAsync(conn, tx, task, failedParts, ct))
+            throw new AllocationConflictException(ErrorRetryInFlight, "存在在途发送作业，待其结束后再重试");
+
         var before = Digest(task.state, task.version, parts);
         var moved = new List<long>(failedParts.Count);
         foreach (var part in failedParts)
@@ -225,9 +234,10 @@ UPDATE dbo.upload_part SET state=@next, next_query_at=@nextQueryAt WHERE id=@id 
 
     /// <summary>
     /// 复位分片发送作业：存在则 PENDING/attempt_count=0/next_run_at=now/清租约与收尾字段；
-    /// 不存在则新建（同事务，同意图幂等）。只复位 PENDING/FAILED/DONE 或租约已过期的 RUNNING
-    /// （后者等价于「租约已过期的 LEASED」，与 JobQueue 回收规则一致）；正在执行的 RUNNING（租约未过期）
-    /// 绝不改写——重试不得抢占在途发送。取消态作业同样不复位（行政取消优先）。
+    /// 不存在则新建（同事务，同意图幂等）。只复位 PENDING/FAILED/DONE——RUNNING 一律不动，
+    /// 无论租约是否过期：后台队列刻意把 upload-dispatch 排除在通用租约回收之外，
+    /// 未知结果的发送必须走「发送恢复 → 受理未知 → 回查」，此处重排等于抢占在途发送并可能重复提交。
+    /// 取消态作业同样不复位（行政取消优先）。
     /// </summary>
     private async Task<int> ResetDispatchJobsAsync(SqlConnection conn, SqlTransaction tx, TaskRow task,
         IReadOnlyList<long> partIds, string trigger, CancellationToken ct)
@@ -246,12 +256,31 @@ UPDATE dbo.upload_part SET state=@next, next_query_at=@nextQueryAt WHERE id=@id 
 UPDATE dbo.outbox_job
 SET job_state=N'PENDING', attempt_count=0, next_run_at=SYSUTCDATETIME(),
     lease_owner=NULL, lease_until=NULL, finished_at=NULL, last_error=NULL
-WHERE id=@id
-  AND (job_state IN (N'PENDING',N'FAILED',N'DONE')
-       OR (job_state=N'RUNNING' AND lease_until < SYSUTCDATETIME()))", new { id = jobId }, tx,
+WHERE id=@id AND job_state IN (N'PENDING',N'FAILED',N'DONE')", new { id = jobId }, tx,
                 cancellationToken: ct));
         }
         return reset;
+    }
+
+    /// <summary>
+    /// 目标（Failed）分片是否已有在途发送作业：按 outbox 去重键 <c>intent_key=part:{partId}</c> 命中
+    /// RUNNING 行即视为在途（不看租约是否过期——upload-dispatch 的 RUNNING 由发送恢复负责收尾）。
+    /// 2008 R2 安全：意图键参数化（动态 IN 展开），不用 2012+ 的拼接/聚合函数。
+    /// </summary>
+    private static async Task<bool> HasInFlightDispatchAsync(SqlConnection conn, SqlTransaction tx, TaskRow task,
+        IReadOnlyList<PartRow> targetParts, CancellationToken ct)
+    {
+        if (targetParts.Count == 0) return false;
+        var intents = targetParts.Select(p => DispatchIntentPrefix + p.id.ToString(CultureInfo.InvariantCulture))
+            .ToList();
+        return await conn.ExecuteScalarAsync<bool>(new CommandDefinition(@"
+SELECT CASE WHEN EXISTS (
+    SELECT 1 FROM dbo.outbox_job j
+    WHERE j.org_id=@orgId AND j.env=@env AND j.job_kind=@jobKind AND j.job_state=N'RUNNING'
+      AND j.intent_key IN @intents
+) THEN CAST(1 AS bit) ELSE CAST(0 AS bit) END",
+            new { orgId = task.orgId, env = task.env, jobKind = DispatchJobKind, intents }, tx,
+            cancellationToken: ct));
     }
 
     /// <summary>活动机构（单机构部署）：与列表端点同一解析口径。</summary>

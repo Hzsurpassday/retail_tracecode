@@ -284,6 +284,8 @@ WHERE object_type=N'upload_task' AND object_id=@objectId AND env=@env ORDER BY o
                 }
                 var result = await svc.ControlledRetryAsync(conn, tx, id, env, req?.ExpectedVersion,
                     ctx.User.Identity!.Name!, ctx.TraceIdentifier, ct);
+                // 走到这里意味着没有在途发送作业（否则服务层已 409 RETRY_IN_FLIGHT 且零写入），
+                // 每个目标分片的发送作业都已复位或新建 → retryAllowed 恒为 true。
                 return (200, JsonSerializer.Serialize(new { data = new
                 {
                     taskId = result.TaskId.ToString(CultureInfo.InvariantCulture), state = result.State,

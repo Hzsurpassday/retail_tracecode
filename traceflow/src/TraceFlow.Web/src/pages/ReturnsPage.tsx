@@ -28,11 +28,12 @@ const TABS: { key: Tab; label: string }[] = [
   { key: 'rejected', label: '已驳回' },
 ];
 // 页签即服务端过滤条件（不再对「当前 20 行」做客户端筛选，待确认行不会藏在别的页里）。
-// 已确认页签只按原因收窄，不带 state=Blocked（确认后任务已离开 Blocked）。
-const TAB_FILTER: Record<Tab, { state?: string; stateReason: string }> = {
-  pending: { state: 'Blocked', stateReason: 'RETURN_CONFIRM_REQUIRED' },
-  rejected: { state: 'Blocked', stateReason: 'RETURN_CONFIRM_REJECTED,RETURN_CONFIRM_REJECTED_SUPERSEDED' },
-  confirmed: { stateReason: 'RETURN_CONFIRMED' },
+// 服务端按稳定的确认分组过滤（confirmStatus）：已确认＝不属于待确认/已驳回的任务，
+// 因此确认后随上传推进改写 state_reason（如 PLATFORM_ACCEPTED）也不会从页签消失。
+const TAB_FILTER: Record<Tab, string> = {
+  pending: 'PENDING',
+  confirmed: 'CONFIRMED',
+  rejected: 'REJECTED',
 };
 const TASK_TYPE_ZH: Record<string, string> = {
   CONSUMER_RETURN_116: '消费者退货 116（原码退回）',
@@ -92,10 +93,8 @@ export default function ReturnsPage() {
   const load = useCallback(async () => {
     const seq = ++seqRef.current;
     const qs = new URLSearchParams({ page: String(page), pageSize: String(PAGE_SIZE) });
-    // 页签在服务端过滤：待确认/已驳回只见 Blocked，已确认只按 RETURN_CONFIRMED 收窄。
-    const filter = TAB_FILTER[tab];
-    if (filter.state) qs.set('state', filter.state);
-    qs.set('stateReason', filter.stateReason);
+    // 页签在服务端按确认分组过滤（待确认/已确认/已驳回，三组互斥且无需 state 叠加）。
+    qs.set('confirmStatus', TAB_FILTER[tab]);
     try {
       const res = await api<ListPage<ReturnItem>>(`/api/v1/returns?${qs.toString()}`);
       if (seq !== seqRef.current) return;
