@@ -48,6 +48,7 @@ public sealed class EnterpriseSyncService
             using var doc = JsonDocument.Parse(outcome.ResultJson ?? "{}");
             var r = doc.RootElement;
             totalPages = r.TryGetProperty("total_pages", out var tp) ? tp.GetInt32() : totalPages;
+            var pageParts = 0;
             await using (var c = new SqlConnection(_cs))
             {
                 await c.OpenAsync(ct);
@@ -56,6 +57,7 @@ public sealed class EnterpriseSyncService
                     foreach (var p in parts.EnumerateArray())
                     {
                         seen++;
+                        pageParts++;
                         var refEntId = GetString(p, "ref_ent_id") ?? throw new InvalidOperationException("往来单位缺 ref_ent_id（候选合同不符）");
                         var entId = GetString(p, "ent_id") ?? throw new InvalidOperationException("往来单位缺 ent_id（候选合同不符）");
                         // brief 原为 "IF NOT EXISTS(...) INSERT"，跳过分支 ExecuteNonQuery 返回 -1（非 DML 批次）；
@@ -71,9 +73,18 @@ WHERE NOT EXISTS (SELECT 1 FROM dbo.platform_enterprise_version WHERE ref_ent_id
                     }
                 await tx.CommitAsync(ct);
             }
-            if (totalPages is not int t || pageNo >= t) break;
+            // 有 total_pages：翻到末页合法终止；缺 total_pages：翻到空页才合法终止（T5 规则，不臆断仅有 1 页）
+            if (totalPages is int t)
+            {
+                if (pageNo >= t) break;
+            }
+            else if (pageParts == 0) break;
             pageNo++;
         }
+        // Fix Round 1：页帽耗尽绝不伪造完成（T5 规则）。循环仅因 pageNo > MaxPages 退出时仍存在不可达页，
+        // 必须先抛，成功审计不得执行（否则 DONE + 摘要会掩盖永久缺口）。
+        if (pageNo > MaxPages)
+            throw new InvalidOperationException($"往来单位页帽 {MaxPages} 耗尽（total_pages={totalPages}），禁止伪造完成");
         await using (var c = new SqlConnection(_cs))
         {
             await c.OpenAsync(ct);

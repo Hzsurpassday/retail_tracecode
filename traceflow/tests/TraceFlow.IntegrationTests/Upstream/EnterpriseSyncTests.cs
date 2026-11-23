@@ -10,14 +10,22 @@ using Xunit;
 
 namespace TraceFlow.IntegrationTests.Upstream;
 
-public class EnterpriseSyncTests : IClassFixture<Sql2008Fixture>
+// Fix Round 1：brief 原为 IClassFixture 共享库；但页帽/审计断言须精确计数（行数 == 1000、enterprise.sync 审计 == 0），
+// 共享库会被同类其它测试的历史行污染。改用 UpstreamDownloadTests 既有"每测试独立测试库"模式保证隔离，
+// 既有 5 个测试体与断言逐字保留。
+public class EnterpriseSyncTests : IAsyncLifetime
 {
-    private readonly Sql2008Fixture _fx;
-    public EnterpriseSyncTests(Sql2008Fixture fx) => _fx = fx;
+    private Sql2008Fixture _fx = null!;
+    public async Task InitializeAsync() { _fx = new Sql2008Fixture(); await _fx.InitializeAsync(); }
+    public Task DisposeAsync() => _fx.DisposeAsync();
 
     private static TopRawResponse Parts(string partsJson, int totalPages = 1)
         // brief 原为 $$ 原始字符串，尾部 "}}" 连续右大括号触发 CS9007；改 $$$（输出 JSON 逐字一致）
         => new(true, 200, null, $$$"""{"response_success":true,"result":{"total_pages":{{{totalPages}}},"parts":{{{partsJson}}}}}""", null);
+
+    /// <summary>平台未返回 total_pages 的页（T5 规则：翻到空页才合法终止）。</summary>
+    private static TopRawResponse PartsNoTotal(string partsJson)
+        => new(true, 200, null, $$$"""{"response_success":true,"result":{"parts":{{{partsJson}}}}}""", null);
 
     private async Task<(EnterpriseSyncService svc, long orgId)> BuildAsync(Func<TopCall, TopRawResponse> handler)
     {
@@ -112,5 +120,37 @@ public class EnterpriseSyncTests : IClassFixture<Sql2008Fixture>
         await using var c = await _fx.OpenAsync();
         // 第 1 页已同事务落库（查询幂等，下轮重拉不重复）
         Assert.Equal(1, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.platform_enterprise_version WHERE ref_ent_id=N'REF-PF'"));
+    }
+
+    [Fact]
+    public async Task Page_cap_exhaustion_throws()
+    {
+        // total_pages=1001 > MaxPages=1000：前 1000 页已提交，但页 ≥1001 永不可达 ⇒ 必须抛，不得伪造完成
+        var (svc, orgId) = await BuildAsync(call =>
+        {
+            var pageNo = call.Parameters["page_no"];
+            return Parts($$"""[{"ref_ent_id":"REF-CAP-{{pageNo}}","ent_id":"E-CAP","name":"n","credit_code":null,"audit_status":null,"role":null}]""", 1001);
+        });
+        await Assert.ThrowsAsync<InvalidOperationException>(() => svc.RunAsync(orgId, "MOCK", default));
+        await using var c = await _fx.OpenAsync();
+        Assert.Equal(1000, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.platform_enterprise_version")); // 前 1000 页已提交
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'enterprise.sync'")); // 成功审计被跳过
+    }
+
+    [Fact]
+    public async Task Missing_total_pages_continues_until_empty_page()
+    {
+        // total_pages 缺省：翻页直到空页才合法终止（T5 规则），第 1 页不得直接 break
+        var (svc, orgId) = await BuildAsync(call => call.Parameters["page_no"] switch
+        {
+            "1" => PartsNoTotal("""[{"ref_ent_id":"REF-NT-1","ent_id":"E-1","name":"a","credit_code":null,"audit_status":null,"role":null},{"ref_ent_id":"REF-NT-2","ent_id":"E-2","name":"b","credit_code":null,"audit_status":null,"role":null}]"""),
+            "2" => PartsNoTotal("""[{"ref_ent_id":"REF-NT-3","ent_id":"E-3","name":"c","credit_code":null,"audit_status":null,"role":null}]"""),
+            _ => PartsNoTotal("[]"),
+        });
+        var s = await svc.RunAsync(orgId, "MOCK", default);
+        Assert.Equal(3, s.PartnersSeen);
+        Assert.Equal(3, s.VersionsAdded);
+        await using var c = await _fx.OpenAsync();
+        Assert.Equal(3, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.platform_enterprise_version"));
     }
 }
