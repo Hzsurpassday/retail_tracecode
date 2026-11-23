@@ -98,6 +98,7 @@ if (!workerOnly)
     app.MapAdminEndpoints(connectionString);
     app.MapSettingsEndpoints(connectionString);
     app.MapImportEndpoints(connectionString, env);
+    app.MapMasterEndpoints(connectionString);
     app.MapOpsEndpoints(connectionString, env);
     app.MapDashboardEndpoints(connectionString, env);
     app.MapHealthEndpoints(connectionString, env);
