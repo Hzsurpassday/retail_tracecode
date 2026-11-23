@@ -347,6 +347,45 @@ SELECT ISNULL(MAX(attempt_no),0)+1 FROM dbo.upload_attempt WHERE task_id=@taskId
 
     // ---------------------------------------------------------------- 任务级聚合
 
+    /// <summary>可结算分片态：这些态已表达"该分片本轮发送的最终结论"，可直接参与严重度聚合。</summary>
+    private static bool IsSettleable(UploadState state)
+        => state is UploadState.Succeeded or UploadState.Failed or UploadState.PartialSuccess
+            or UploadState.ResultUnresolved or UploadState.AcceptanceUnknown or UploadState.ManualAction;
+
+    /// <summary>
+    /// 分片状态 → 任务状态的唯一规则（严重度表本身仍由 <see cref="TaskStateAggregator"/> 持有，顺序不变）。
+    /// <list type="number">
+    /// <item>Cancelled 分片不参与聚合；全 Cancelled → 任务 Cancelled。</item>
+    /// <item>任一非 Cancelled 分片不可结算时先归一：<c>Succeeded</c> → <c>Accepted</c>（回执受理≠逐码成功），
+    /// <c>Ready/RetryWait/Blocked</c> → <c>Dispatching</c>（仍在推进，任务不得提前落定），再聚合。</item>
+    /// <item>全部可结算时按原状态聚合。</item>
+    /// </list>
+    /// </summary>
+    public static UploadState AggregateTaskState(IReadOnlyCollection<UploadState> partStates)
+    {
+        ArgumentNullException.ThrowIfNull(partStates);
+        if (partStates.Count == 0)
+            throw new ArgumentException("分片状态集合不能为空", nameof(partStates));
+
+        var active = partStates.Where(s => s != UploadState.Cancelled).ToList();
+        if (active.Count == 0) return UploadState.Cancelled;
+
+        if (active.Any(s => !IsSettleable(s)))
+            active = active.Select(s => s switch
+            {
+                UploadState.Succeeded => UploadState.Accepted,
+                UploadState.Ready or UploadState.RetryWait or UploadState.Blocked => UploadState.Dispatching,
+                _ => s,
+            }).ToList();
+
+        return TaskStateAggregator.Aggregate(active);
+    }
+
+    /// <summary>
+    /// 任务状态重算：绝不跳过写入（否则更坏的分片结论已知后任务会滞留在 Dispatching）。
+    /// 守卫：一般聚合只在任务仍处于可发送阶段（Ready/RetryWait/Dispatching）时写入——
+    /// 已取消或已由回查收敛的任务不被迟到的聚合结果覆盖；全 Cancelled 的取消结论始终可写（终态幂等）。
+    /// </summary>
     private static async Task<int> RecomputeTaskStateAsync(SqlConnection conn, SqlTransaction tx, long taskId, CancellationToken ct)
     {
         var states = (await conn.QueryAsync<string>(new CommandDefinition(
@@ -354,19 +393,11 @@ SELECT ISNULL(MAX(attempt_no),0)+1 FROM dbo.upload_attempt WHERE task_id=@taskId
             .Select(s => Enum.Parse<UploadState>(s, ignoreCase: false)).ToList();
         if (states.Count == 0) return 0;
 
-        var aggregate = TaskStateAggregator.Aggregate(states);
-        var pending = states.Any(s => s is UploadState.Ready or UploadState.RetryWait);
-        // 仍有待发送/待重试分片时任务不得落定为终态，否则后续分片的发送前置条件被自身聚合结果阻断。
-        if (pending && aggregate is not (UploadState.Ready or UploadState.RetryWait or UploadState.Dispatching))
-            return 0;
-
-        if (aggregate == UploadState.Cancelled)
-            return await conn.ExecuteAsync(new CommandDefinition(@"
-UPDATE dbo.upload_task SET state=N'Cancelled', version=version+1 WHERE id=@taskId AND state<>N'Cancelled'",
-                new { taskId }, tx, cancellationToken: ct));
-
+        var aggregate = AggregateTaskState(states);
         return await conn.ExecuteAsync(new CommandDefinition(@"
-UPDATE dbo.upload_task SET state=@state, version=version+1 WHERE id=@taskId AND state<>N'Cancelled'",
+UPDATE dbo.upload_task SET state=@state, version=version+1
+WHERE id=@taskId
+  AND (state IN (N'Ready',N'RetryWait',N'Dispatching') OR @state=N'Cancelled')",
             new { taskId, state = aggregate.ToString() }, tx, cancellationToken: ct));
     }
 

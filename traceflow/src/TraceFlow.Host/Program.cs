@@ -52,6 +52,10 @@ builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Top.TopClientSe
     sp.GetRequiredService<TraceFlow.Infrastructure.Top.RateBudgetService>(),
     sp.GetRequiredService<TraceFlow.Infrastructure.Top.ChannelPauseService>(),
     sp.GetRequiredService<IAuditLog>()));
+// 发送协议 upload-dispatch（IDEM-04 / §3.2）：未注册则 Worker 不会认领该类作业，outbox 行会永久 PENDING。
+builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Uploads.UploadDispatchService(
+    connectionString, sp.GetRequiredService<TraceFlow.Infrastructure.Top.TopClientService>(),
+    sp.GetRequiredService<IJobQueue>(), sp.GetRequiredService<ISendRecoveryService>()));
 builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Sales.RetailTaskFactory(
     sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(), sp.GetRequiredService<IJobQueue>()));
 builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Sales.SaleVerificationService(
@@ -61,6 +65,9 @@ builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Sales.SaleVerif
     sp.GetRequiredService<IJobQueue>(), sp.GetRequiredService<IAuditLog>()));
 builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Jobs.SaleVerifyJobHandler(
     sp.GetRequiredService<TraceFlow.Infrastructure.Sales.SaleVerificationService>(),
+    sp.GetRequiredService<IJobQueue>(), connectionString));
+builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Jobs.UploadDispatchJobHandler(
+    sp.GetRequiredService<TraceFlow.Infrastructure.Uploads.UploadDispatchService>(),
     sp.GetRequiredService<IJobQueue>(), connectionString));
 builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Upstream.UpstreamDownloadService(
     connectionString, sp.GetRequiredService<TraceFlow.Infrastructure.Top.TopClientService>(),

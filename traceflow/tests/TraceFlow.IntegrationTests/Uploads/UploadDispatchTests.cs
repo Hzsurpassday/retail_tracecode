@@ -345,6 +345,113 @@ OUTPUT inserted.id VALUES(@taskId,@partId,1,N'UPLOAD',N'MOCK',@w,@token)",
         Assert.Equal("Succeeded", await PartStateAsync(seed.PartId));
     }
 
+    /// <summary>追加一个非目标分片（任务级聚合场景），返回分片 id。</summary>
+    private static Task<long> AddPartAsync(SqlConnection c, Seed seed, int partIndex, string state)
+        => c.ExecuteScalarAsync<long>(@"
+INSERT INTO dbo.upload_part(task_id,org_id,env,part_index,bill_code,payload_json,payload_hash,code_set_hash,state)
+OUTPUT inserted.id
+VALUES(@taskId,@orgId,N'MOCK',@partIndex,@bill,@payload,REPLICATE('b',64),REPLICATE('c',64),@state)",
+            new
+            {
+                seed.TaskId, seed.OrgId, partIndex,
+                bill = "TFX" + Guid.NewGuid().ToString("N")[..16],
+                payload = PartPayloadJson("extra" + partIndex), state,
+            });
+
+    private async Task<string?> PartStateAtAsync(long taskId, int partIndex)
+    {
+        await using var c = await _fx.OpenAsync();
+        return await c.ExecuteScalarAsync<string>(
+            "SELECT state FROM dbo.upload_part WHERE task_id=@id AND part_index=@i", new { id = taskId, i = partIndex });
+    }
+
+    [Fact]
+    public async Task Blocked_part_keeps_task_dispatching_and_is_not_rewritten()
+    {
+        // [Succeeded, Blocked]：Blocked 既不是"待发送"也不是已完成——任务必须留在 Dispatching，绝不能结算成 Succeeded。
+        var tag = Tag();
+        var seed = await SeedAsync(tag);
+        await using (var c = await _fx.OpenAsync())
+        {
+            await AddPartAsync(c, seed, partIndex: 1, state: "Succeeded");
+            await AddPartAsync(c, seed, partIndex: 2, state: "Blocked");
+        }
+        var service = NewService(_ => Accepted());
+
+        var outcome = await service.DispatchAsync(seed.PartId, Worker, seed.FencingToken, default);
+
+        Assert.Equal(DispatchOutcome.Accepted, outcome);
+        Assert.Equal("Dispatching", await TaskStateAsync(seed.TaskId));
+        Assert.Equal("Blocked", await PartStateAtAsync(seed.TaskId, 2)); // 聚合只写任务，不改写分片
+        Assert.Equal("Succeeded", await PartStateAtAsync(seed.TaskId, 1));
+    }
+
+    [Fact]
+    public async Task Acceptance_unknown_with_blocked_part_is_not_skipped()
+    {
+        // [AcceptanceUnknown, Blocked]：已知更坏的结论必须写入，任务不得滞留在 Dispatching。
+        var seed = await SeedAsync(Tag());
+        await using (var c = await _fx.OpenAsync())
+        {
+            await AddPartAsync(c, seed, partIndex: 1, state: "AcceptanceUnknown");
+            await AddPartAsync(c, seed, partIndex: 2, state: "Blocked");
+        }
+        var service = NewService(_ => Accepted());
+
+        await service.DispatchAsync(seed.PartId, Worker, seed.FencingToken, default);
+
+        Assert.Equal("AcceptanceUnknown", await TaskStateAsync(seed.TaskId));
+    }
+
+    [Fact]
+    public async Task Succeeded_part_with_accepted_part_settles_task_as_accepted()
+    {
+        // [Succeeded, Accepted]：仍有分片只到"回执受理"，任务不得结算为 Succeeded。
+        var seed = await SeedAsync(Tag());
+        await using (var c = await _fx.OpenAsync())
+            await AddPartAsync(c, seed, partIndex: 1, state: "Succeeded");
+        var service = NewService(_ => Accepted());
+
+        var outcome = await service.DispatchAsync(seed.PartId, Worker, seed.FencingToken, default);
+
+        Assert.Equal(DispatchOutcome.Accepted, outcome);
+        Assert.Equal("Accepted", await PartStateAsync(seed.PartId)); // 本分片只推进到回执受理
+        Assert.Equal("Accepted", await TaskStateAsync(seed.TaskId));
+    }
+
+    [Fact]
+    public async Task Cancelled_before_dispatch_is_stale_without_attempt_or_http()
+    {
+        var seed = await SeedAsync(Tag());
+        await using (var c = await _fx.OpenAsync())
+        {
+            // 与 SaleVerificationService.CancelPartsAndReleaseClaimsAsync 相同的取消写法（IN-09 行政终态）：
+            // 任务 Cancelled → 分片 Cancelled → 发送作业 CANCELLED（清租约）。
+            await using var tx = (SqlTransaction)await c.BeginTransactionAsync();
+            await c.ExecuteAsync(@"
+UPDATE dbo.upload_task SET state=N'Cancelled', state_reason=N'核验重算（未发送），由核验事务重建', version=version+1
+WHERE id=@id", new { id = seed.TaskId }, tx);
+            await c.ExecuteAsync(
+                "UPDATE dbo.upload_part SET state=N'Cancelled' WHERE task_id=@id AND state<>N'Cancelled'",
+                new { id = seed.TaskId }, tx);
+            await c.ExecuteAsync(@"
+UPDATE dbo.outbox_job SET job_state=N'CANCELLED', lease_owner=NULL, lease_until=NULL,
+       finished_at=SYSUTCDATETIME(), last_error=N'VERIFY_BLOCKED'
+WHERE id=@id", new { id = seed.JobId }, tx);
+            await tx.CommitAsync();
+        }
+        var calls = 0;
+        var service = NewService(_ => { calls++; return Accepted(); });
+
+        var outcome = await service.DispatchAsync(seed.PartId, Worker, seed.FencingToken, default);
+
+        Assert.Equal(DispatchOutcome.StaleRejected, outcome);
+        Assert.Equal(0, calls); // 零 HTTP
+        Assert.Equal(0, await UploadAttemptCountAsync(seed.TaskId)); // 零尝试（含迟到证据行）
+        Assert.Equal("Cancelled", await PartStateAsync(seed.PartId));
+        Assert.Equal("Cancelled", await TaskStateAsync(seed.TaskId));
+    }
+
     [Fact]
     public async Task Live_dispatch_fails_closed_before_any_state_change()
     {
