@@ -492,30 +492,69 @@ SELECT diff_type FROM dbo.reconciliation_difference WHERE object_ref=@objectRef"
     }
 
     /// <summary>
-    /// H1(iii)：Dispatching 分片（无任何结论边）观察窗过期升级人工后，作业收尾为 DONE，
-    /// 不得残留 PENDING/RUNNING 的 bill-query 作业继续重排。
+    /// F1：Dispatching 不是回查状态（状态机没有从 Dispatching 出发的 Query* 边，回查它只会把平台的
+    /// AllSuccess/Partial/Failed 丢进非法转换）。per-part 回查路径必须直接跳过：零 HTTP、零尝试行、
+    /// 零逐码结论、状态与查询次数不变、不落差异行、不重排作业。在途/崩溃的发送由 SendRecoveryService
+    /// 收敛（Dispatching + 无活作业 → LeaseLost → AcceptanceUnknown → query:part），见
+    /// <c>Jobs/SendRecoveryTests</c> 与 <c>UploadDispatchTests.Crash_before_http_leaves_dispatching_then_recovery_queries_first</c>。
     /// </summary>
     [Fact]
-    public async Task Dispatching_part_escalation_leaves_no_reschedule_job()
+    public async Task Dispatching_part_is_not_queried_by_part_path()
     {
-        var seed = await SeedAsync(new[] { Code(15) }, partState: "Dispatching", taskState: "Dispatching",
-            queryCount: 19, firstSentAt: DateTime.UtcNow.AddHours(-2));
-        var service = NewService(_ => BillStatus("1", null));
-        var handler = new BillQueryJobHandler(service, _fx.ConnectionString);
+        var seed = await SeedAsync(new[] { Code(19) }, partState: "Dispatching", taskState: "Dispatching",
+            firstSentAt: DateTime.UtcNow.AddHours(-2), nextQueryAt: DateTime.UtcNow.AddMinutes(-1));
+        var calls = 0;
+        var service = NewService(_ => { calls++; return BillStatus("2", null); });
 
-        await handler.HandleAsync(new ClaimedJob(seed.JobId, "bill-query", $"query:part:{seed.PartId}", null,
-            seed.FencingToken, DateTime.UtcNow.AddMinutes(5), 2), default);
-        // Worker 收尾（处理成功即 Complete）：升级人工后作业不得被重排成 PENDING。
+        var outcome = await service.QueryPartAsync(seed.PartId, Worker, seed.FencingToken, default);
+
+        Assert.Equal(QueryOutcome.Skipped, outcome);
+        Assert.Equal(0, calls);
+        Assert.Equal("Dispatching", await PartStateAsync(seed.PartId));
+        Assert.Equal(0, await QueryAttemptCountAsync(seed.TaskId));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.code_result WHERE part_id=@id", new { id = seed.PartId }));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT query_count FROM dbo.upload_part WHERE id=@id", new { id = seed.PartId }));
+        Assert.Equal(0, await DifferenceCountAsync(seed.PartId));
+        // 处理器不改期：Worker 照常收尾本作业，不得残留 PENDING 的回查重排。
+        var queue = new JobQueue(_fx.ConnectionString, new AuditLog());
+        Assert.True(await queue.CompleteAsync(seed.JobId, Worker, seed.FencingToken, default));
+        Assert.Equal("DONE", await ScalarAsync<string>(
+            "SELECT job_state FROM dbo.outbox_job WHERE id=@id", new { id = seed.JobId }));
+        Assert.Equal(0, await OpenPartJobsAsync(seed.PartId));
+    }
+
+    /// <summary>
+    /// F1：已结算结论被状态机拒绝（PartialSuccess 再收 Partial，无 QueryPartial 边）时不得静默丢弃——
+    /// 写 transition_rejected 审计、状态不变，并按"无出口"收敛（停回查、撤掉待执行作业、落差异行）。
+    /// </summary>
+    [Fact]
+    public async Task Rejected_settled_transition_is_audited_and_stops_rescheduling()
+    {
+        var codes = new[] { Code(20), Code(21) };
+        var seed = await SeedAsync(codes, partState: "PartialSuccess", taskState: "PartialSuccess",
+            queryCount: 3, nextQueryAt: DateTime.UtcNow.AddMinutes(-1));
+        var service = NewService(_ => BillStatus("3", "52",
+            (codes[0], "1", null), (codes[1], "2", "码已被其他企业绑定")));
+
+        var outcome = await service.QueryPartAsync(seed.PartId, Worker, seed.FencingToken, default);
+        // Worker 照常收尾本作业（服务只撤 PENDING 作业，不碰自己持有的 RUNNING 租约）。
         var queue = new JobQueue(_fx.ConnectionString, new AuditLog());
         Assert.True(await queue.CompleteAsync(seed.JobId, Worker, seed.FencingToken, default));
 
-        Assert.Equal("ManualAction", await PartStateAsync(seed.PartId));
-        Assert.Equal("DONE", await ScalarAsync<string>(
-            "SELECT job_state FROM dbo.outbox_job WHERE id=@id", new { id = seed.JobId }));
-        Assert.Equal(0, await OpenPartJobsAsync(seed.PartId)); // 升级后无作业重排
+        Assert.Equal(QueryOutcome.Unresolved, outcome);
+        Assert.Equal("PartialSuccess", await PartStateAsync(seed.PartId)); // 状态机拒绝：不改状态
+        Assert.Equal(4, await ScalarAsync<int>(
+            "SELECT query_count FROM dbo.upload_part WHERE id=@id", new { id = seed.PartId }));
         Assert.Null(await ScalarAsync<DateTime?>(
             "SELECT next_query_at FROM dbo.upload_part WHERE id=@id", new { id = seed.PartId }));
-        Assert.Equal(1, await DifferenceCountAsync(seed.PartId));
+        Assert.Equal("DONE", await ScalarAsync<string>(
+            "SELECT job_state FROM dbo.outbox_job WHERE id=@id", new { id = seed.JobId }));
+        Assert.Equal(0, await OpenPartJobsAsync(seed.PartId)); // 停回查，不再无限重排
+        Assert.Equal(1, await DifferenceCountAsync(seed.PartId)); // 平台结论浮到人工面前
+        Assert.Equal(1, await ScalarAsync<int>(@"
+SELECT COUNT(*) FROM dbo.audit_log
+WHERE action=N'bill.query.transition_rejected' AND object_type=N'upload_part' AND object_id=@obj AND reason=@reason",
+            new { obj = seed.PartId.ToString(), reason = "PartialSuccess->QueryPartial" }));
     }
 
     // ---------------------------------------------------------------- M1/M2：扫描批量与盲区
@@ -550,6 +589,7 @@ SELECT diff_type FROM dbo.reconciliation_difference WHERE object_ref=@objectRef"
     /// <summary>
     /// M2：受理后回查作业丢失（next_query_at 为 NULL）的分片在首次发送 5 分钟后由扫描兜底选中；
     /// 未过 5 分钟、已有待执行 per-part 作业、或不是受理侧状态的分片一律不选。
+    /// F1：<c>Dispatching</c> 不在可回查状态集内——无论是到期还是盲区，扫描都不挑（由 SendRecoveryService 接管）。
     /// </summary>
     [Fact]
     public async Task Scan_selects_never_scheduled_parts_only_after_grace_and_without_open_job()
@@ -563,6 +603,10 @@ SELECT diff_type FROM dbo.reconciliation_difference WHERE object_ref=@objectRef"
             firstSentAt: DateTime.UtcNow.AddMinutes(-10), nextQueryAt: null, withQueryJob: true);
         var processing = await SeedAsync(codes, partState: "Processing", taskState: "Processing",
             firstSentAt: DateTime.UtcNow.AddMinutes(-10), nextQueryAt: null, withQueryJob: false);
+        var dispatchingDue = await SeedAsync(codes, partState: "Dispatching", taskState: "Dispatching",
+            firstSentAt: DateTime.UtcNow.AddMinutes(-10), nextQueryAt: DateTime.UtcNow.AddMinutes(-5), withQueryJob: false);
+        var dispatchingBlind = await SeedAsync(codes, partState: "Dispatching", taskState: "Dispatching",
+            firstSentAt: DateTime.UtcNow.AddMinutes(-10), nextQueryAt: null, withQueryJob: false);
 
         try
         {
@@ -573,10 +617,12 @@ SELECT diff_type FROM dbo.reconciliation_difference WHERE object_ref=@objectRef"
             Assert.DoesNotContain(recent.PartId, ids);     // 5 分钟宽限内不抢
             Assert.DoesNotContain(busy.PartId, ids);       // 已有待执行 per-part 作业由该作业负责
             Assert.DoesNotContain(processing.PartId, ids); // 盲区只接管受理侧状态
+            Assert.DoesNotContain(dispatchingDue.PartId, ids);   // Dispatching 不是回查状态（F1）
+            Assert.DoesNotContain(dispatchingBlind.PartId, ids);
         }
         finally
         {
-            await DeleteSeedsAsync(new[] { blind, recent, busy, processing });
+            await DeleteSeedsAsync(new[] { blind, recent, busy, processing, dispatchingDue, dispatchingBlind });
         }
     }
 

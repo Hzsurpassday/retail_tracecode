@@ -63,7 +63,8 @@ public sealed class SyncScheduler
             await _queue.EnqueueAsync(c, tx, orgId.Value, _env, "enterprise-sync",
                 $"daily:{nowUtc:yyyyMMdd}", entPayload, nowUtc, ct);
             n++;
-            // 回查兜底（JOB-04）：按 5 分钟桶挑出 next_query_at 到期的分片逐片回查（单批上限 50）。
+            // 回查兜底（JOB-04）：按 5 分钟桶挑出 next_query_at 到期的分片逐片回查
+            // （单批上限见 BillQueryService.ScanLimit，当前 10：扫描租约 5 分钟不续期，一批要串行做完 TOP HTTP）。
             // 常规路径是查询作业自身退避重排 query:part:{id}；本扫描只补漏入队/进程重启丢失的作业。
             // 命中平台渠道，暂停通道时跳过（恢复后下一桶自动接手，不用重放）。
             var scanPayload = JsonSerializer.Serialize(new { orgId = orgId.Value, env = _env, trigger = "scan" });

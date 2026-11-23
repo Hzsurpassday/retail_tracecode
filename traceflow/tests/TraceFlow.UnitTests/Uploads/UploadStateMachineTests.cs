@@ -127,4 +127,24 @@ public class UploadStateMachineTests
             .Where(t => t.From == from)
             .Select(t => (UploadState?)t.To)
             .FirstOrDefault(to => to == UploadState.ManualAction));
+
+    /// <summary>
+    /// Dispatching 不是回查状态（F1）：状态机不得有从 Dispatching 出发的 Query* 边，
+    /// 否则回查服务会把平台的 AllSuccess/Partial/Failed 落进非法转换而静默丢弃。
+    /// 在途/崩溃的发送只经 LeaseLost/TransportUncertain 收敛为 AcceptanceUnknown 后再回查。
+    /// </summary>
+    [Fact]
+    public void Dispatching_has_no_query_edges()
+    {
+        var queryEvents = new[]
+        {
+            UploadEvent.QueryAllSuccess, UploadEvent.QueryPartial, UploadEvent.QueryFailed,
+            UploadEvent.QueryProcessing, UploadEvent.QueryUnresolved,
+            UploadEvent.QueryConfirmedAccepted, UploadEvent.QueryConfirmedNotAccepted,
+        };
+        Assert.All(queryEvents,
+            e => Assert.False(UploadStateMachine.TryGetNext(UploadState.Dispatching, e, out _), $"Dispatching 不应有 {e} 边"));
+        Assert.DoesNotContain(UploadStateMachine.AllTransitions,
+            t => t.From == UploadState.Dispatching && t.Event.ToString().StartsWith("Query", StringComparison.Ordinal));
+    }
 }
