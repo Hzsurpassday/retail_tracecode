@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Dapper;
@@ -14,6 +15,13 @@ public sealed record SettingView(long Id, string Key, string? ValueJson, bool Is
     string Version, string? UpdatedBy, DateTime? UpdatedAtUtc, string? Reason, string? ProtectionScope);
 
 public sealed record ConnectionTestResult(bool Ok, string Message);
+
+/// <summary>M3 销售核验：规则版本（写入 verification.rule_version 与任务快照）与单次核验平台调用码数上限。</summary>
+public sealed record SaleVerifySettings(string RuleVersion, int MaxCodesPerRun);
+
+/// <summary>M3 回查/发送策略：退避基数（指数）、最大次数、转人工小时数、未受理证据延迟窗口、发送作业租约。</summary>
+public sealed record QueryPolicy(int BackoffSeconds, int MaxAttempts, int ManualAfterHours,
+    int ConsistencyWindowSeconds, int DispatchLeaseSeconds);
 
 /// <summary>
 /// 配置中心（SET-01/02）：键目录+边界校验；密钥 DPAPI 只写不回显；rowversion 乐观并发；
@@ -47,6 +55,24 @@ public sealed class SettingsService
     /// 预留 7 位后 prefix.Length + 7 ≤ top.billMaxLength，部署量级内生成的单号恒可容纳（超出仍由生成器抛错，不截断）。
     /// </summary>
     public const int ReservedBillSuffixLength = 7;
+
+    /// <summary>
+    /// M3 销售核验/分片/回查/发送运维键的只读默认值。不注册进 <see cref="Catalog"/>：该目录是对外可写目录，
+    /// 其条目数被设置页契约锁定（SettingsApiTests）；本组键按「app_setting 行值 → 本表默认」回落，
+    /// 不播种行（brief：read-only fallback, not a new seeded row），需要覆盖时直写 app_setting 行即可。
+    /// </summary>
+    private static readonly IReadOnlyDictionary<string, string> M3Defaults = new Dictionary<string, string>
+    {
+        ["sale.verify.ruleVersion"] = "\"M3-1\"",
+        ["sale.verify.maxCodesPerRun"] = "200",
+        ["upload.part.maxCodes"] = "200",
+        ["top.query.backoffSeconds"] = "30",
+        ["top.query.maxAttempts"] = "20",
+        ["top.query.manualAfterHours"] = "24",
+        ["top.query.consistencyWindowSeconds"] = "600",
+        ["top.dispatch.leaseSeconds"] = "120",
+        ["top.retryPathCertified"] = "false",
+    };
 
     public static void EnsureBillContract(string prefix, long maxLength)
     {
@@ -303,6 +329,59 @@ IF @rc < 0 RAISERROR('applock %s failed (%d)', 16, 1, @res, @rc);",
 
     public async Task<int> GetUpstreamPollSecondsAsync(CancellationToken ct)
         => (int)await GetIntAsync("upstream.pollSeconds", ct);
+
+    // M3 读取器：与 GetIntAsync 同形（自开连接、单键读取、无行回落默认），默认值取 M3Defaults。
+
+    /// <summary>
+    /// 只接受 InvariantCulture 整数且必须 &gt; 0：非数字、0、负数一律回落默认值。
+    /// 0/负数若被采信会让回查退避变成 0 或负秒数（退避失效/立即重试），故按默认值 fail-safe。
+    /// 直接用 int.TryParse（不走 long 再强转），避免越界 long 静默截断成错误 int。
+    /// </summary>
+    private async Task<int> GetM3IntAsync(string key, CancellationToken ct)
+    {
+        var fallback = int.Parse(M3Defaults[key], CultureInfo.InvariantCulture);
+        var raw = await GetRawAsync(key, ct);
+        return raw is not null
+            && int.TryParse(raw.AsSpan().Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var n)
+            && n > 0
+            ? n
+            : fallback;
+    }
+
+    private async Task<string> GetM3StringAsync(string key, CancellationToken ct)
+    {
+        var fallback = JsonSerializer.Deserialize<string>(M3Defaults[key])!;
+        var raw = await GetRawAsync(key, ct);
+        if (raw is null) return fallback;
+        try { return JsonSerializer.Deserialize<string>(raw) ?? fallback; }
+        catch (JsonException) { return raw; } // 容忍未加引号的裸文本（人工直写 app_setting）
+    }
+
+    /// <summary>只接受大小写不敏感的 true/false 文本；其余（1/0、JSON 引号字符串、乱码）一律回落默认 false。</summary>
+    private async Task<bool> GetM3BoolAsync(string key, CancellationToken ct)
+    {
+        var fallback = bool.Parse(M3Defaults[key]);
+        var raw = await GetRawAsync(key, ct);
+        return raw is not null && bool.TryParse(raw.AsSpan().Trim(), out var b) ? b : fallback;
+    }
+
+    public async Task<SaleVerifySettings> GetSaleVerifySettingsAsync(CancellationToken ct) => new(
+        await GetM3StringAsync("sale.verify.ruleVersion", ct),
+        await GetM3IntAsync("sale.verify.maxCodesPerRun", ct));
+
+    public Task<int> GetPartMaxCodesAsync(CancellationToken ct)
+        => GetM3IntAsync("upload.part.maxCodes", ct);
+
+    public async Task<QueryPolicy> GetQueryPolicyAsync(CancellationToken ct) => new(
+        await GetM3IntAsync("top.query.backoffSeconds", ct),
+        await GetM3IntAsync("top.query.maxAttempts", ct),
+        await GetM3IntAsync("top.query.manualAfterHours", ct),
+        await GetM3IntAsync("top.query.consistencyWindowSeconds", ct),
+        await GetM3IntAsync("top.dispatch.leaseSeconds", ct));
+
+    /// <summary>受控重试合同门禁：默认 false，读取失败（缺行/非法值）一律按 false（fail-closed，不放行重试）。</summary>
+    public Task<bool> GetRetryPathCertifiedAsync(CancellationToken ct)
+        => GetM3BoolAsync("top.retryPathCertified", ct);
 
     public async Task<string> GetSecretAsync(string key, CancellationToken ct)
     {

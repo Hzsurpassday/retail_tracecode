@@ -44,7 +44,11 @@ public static class TopResponseParser
                 var subMsgCode = GetString(r, "sub_msg_code");
                 var msg = GetString(r, "sub_msg") ?? GetString(r, "msg");
                 var reqId = GetString(r, "request_id");
-                string? resultJson = r.TryGetProperty("result", out var result) ? result.GetRawText() : null;
+                // R-M3-2：既有 M2 fixture 与 billstatus 候选结构都用 model 承载业务体；无 result 时回退 model，
+                // 否则查询类响应（result_type/code_list）恒为 null 而被判 Unresolved。
+                string? resultJson = r.TryGetProperty("result", out var result) ? result.GetRawText()
+                    : r.TryGetProperty("model", out var model) ? model.GetRawText()
+                    : null;
 
                 if (msgCode == TopErrorTokens.PartialSuccess || subMsgCode == TopErrorTokens.PartialSuccess)
                     return new TopOutcome(TopOutcomeKind.PartialEvidence, msgCode, subMsgCode, msg, resultJson, reqId, retryAfterSeconds);

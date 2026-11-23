@@ -1,4 +1,5 @@
 using TraceFlow.Application.Abstractions;
+using TraceFlow.Infrastructure.Uploads;
 
 namespace TraceFlow.Host.Security;
 
@@ -20,6 +21,9 @@ public static class ApiErrors
             TopNotCertifiedException => (422, "TOP_NOT_CERTIFIED", false),
             AllocationConflictException => (409, "ALLOCATION_CONFLICT", false),
             AllocationValidationException => (422, "ALLOCATION_INVALID", false),
+            // M3 UI-06/07/09：未知资源 404；受控重试合同门禁 422（拒绝即零写入，见 UploadManualService）
+            ResourceNotFoundException => (404, "NOT_FOUND", false),
+            RetryPathNotCertifiedException => (422, "RETRY_PATH_NOT_CERTIFIED", false),
             FormatException => (422, "VALIDATION", false), // RowVer.FromHex 等格式校验（全局约束：FormatException→端点 422）
             Microsoft.AspNetCore.Antiforgery.AntiforgeryValidationException => (400, "CSRF_INVALID", false),
             BadHttpRequestException => (400, "BAD_REQUEST", false),
@@ -30,9 +34,21 @@ public static class ApiErrors
         // 动态错误码：409/422 的 code 由异常自带，如 CODE_CONTENDED/CANCEL_REFUSED/ALLOCATION_EXISTS/BIG_CODE_BLOCKED
         // 与 brief 的最小偏差：brief 的 `var fieldErrors = Array.Empty<object>()` 为 object[]，无法接收 IReadOnlyList<object>（CS0266）
         IReadOnlyList<object> fieldErrors = Array.Empty<object>();
-        if (ex is AllocationConflictException ace) code = ace.ErrorCode;
+        if (ex is AllocationConflictException ace)
+        {
+            code = ace.ErrorCode;
+            // 在途发送（RETRY_IN_FLIGHT）是「作业结束后即可重试」的瞬时冲突：仅它 retryable=true；
+            // 其余冲突码（VERSION_CONFLICT/CODE_CONTENDED/CANCEL_REFUSED/FROZEN/...）语义不变（false）。
+            retryable = string.Equals(ace.ErrorCode, UploadManualService.ErrorRetryInFlight, StringComparison.Ordinal);
+        }
         if (ex is AllocationValidationException ave) { code = ave.ErrorCode; fieldErrors = ave.FieldErrors ?? Array.Empty<object>(); }
+        // 限流：retryAfter（秒）来自异常，无可用值（≤0）时为 null；有值才写 Retry-After 响应头。
+        int? retryAfter = ex is TopRateLimitedException rateLimited && rateLimited.Wait > TimeSpan.Zero
+            ? (int)Math.Ceiling(rateLimited.Wait.TotalSeconds)
+            : null;
         ctx.Response.StatusCode = status;
+        if (retryAfter is int seconds)
+            ctx.Response.Headers["Retry-After"] = seconds.ToString(System.Globalization.CultureInfo.InvariantCulture);
         // 日志记录完整异常（服务端），响应只给安全信息；禁连接串/堆栈（NFR-05）
         ctx.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("ApiErrors")
             .LogError(ex, "request failed {RequestId}", ctx.TraceIdentifier);
@@ -42,10 +58,11 @@ public static class ApiErrors
                 or AdapterNotCertifiedException or SettingValidationException
                 or SettingVersionException or ImportBoundsException or FormatException
                 or TopRateLimitedException or ChannelPausedException or TopNotCertifiedException
-                or AllocationConflictException or AllocationValidationException => ex.Message,
+                or AllocationConflictException or AllocationValidationException
+                or ResourceNotFoundException or RetryPathNotCertifiedException => ex.Message,
             Microsoft.AspNetCore.Antiforgery.AntiforgeryValidationException => "CSRF 令牌缺失或无效",
             BadHttpRequestException or System.Text.Json.JsonException => "请求参数或格式无效",
             _ => "服务内部错误",
-        }, fieldErrors, retryable, requestId = ctx.TraceIdentifier });
+        }, fieldErrors, retryable, retryAfter, requestId = ctx.TraceIdentifier });
     }
 }

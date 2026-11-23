@@ -9,6 +9,9 @@ import ImportWizard from './pages/ImportWizard';
 import SuppliersPage from './pages/SuppliersPage';
 import UpstreamBillsPage from './pages/UpstreamBillsPage';
 import InboundsPage from './pages/InboundsPage';
+import SalesPage from './pages/SalesPage';
+import ReturnsPage from './pages/ReturnsPage';
+import UploadCenterPage from './pages/UploadCenterPage';
 import SettingsPage from './pages/SettingsPage';
 
 export default function App() {
@@ -30,6 +33,9 @@ export default function App() {
         <Route path="/suppliers" element={<SuppliersPage />} />
         <Route path="/upstream" element={<UpstreamBillsPage />} />
         <Route path="/inbounds" element={<InboundsPage />} />
+        <Route path="/sales" element={<SalesPage />} />
+        <Route path="/returns" element={<ReturnsPage />} />
+        <Route path="/uploads" element={<UploadCenterPage />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="*" element={<p>该模块在后续阶段交付（见路线图），当前未接入。</p>} />
       </Routes>

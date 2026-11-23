@@ -27,7 +27,8 @@ public sealed class WorkerHostedService : BackgroundService
                 if (DateTime.UtcNow - _lastRecovery > TimeSpan.FromSeconds(30))
                 {
                     await _queue.RecoverExpiredLeasesAsync(stoppingToken);
-                    await _recovery.RecoverAsync(stoppingToken); // 失租发送→受理未知→只回查（JOB-02）
+                    // 失租发送→受理未知→只回查（JOB-02）；只恢复本机环境的分片（MOCK worker 不动 LIVE）。
+                    await _recovery.RecoverAsync(_env, stoppingToken);
                     _lastRecovery = DateTime.UtcNow;
                     _logger.LogDebug("Worker 恢复扫描完成（租约回收 + 发送恢复回查）");
                 }

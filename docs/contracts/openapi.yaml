@@ -5,10 +5,12 @@ info:
   description: >
     PRD §12 最低资源契约。金额/数量/外部ID/rowversion 一律 JSON 字符串（API-01）。
     变更接口要求 Idempotency-Key 头与 expectedVersion（API-02）。x-phase 标注实现阶段。
-    M0 已实现端点（/auth/*、/admin/*、/dashboard、/health）与 M1 已实现端点
-    （/products、/suppliers、/imports*、/product-mappings/*、/supplier-mappings/*、
-    /products/{id}/trace-policy、/sync-jobs、/jobs/{id}、/audit-logs、/settings*）
-    按真实代码形状描述（traceflow/src/TraceFlow.Host/Endpoints/*.cs）；M2+ 端点为计划契约，尚未实现。
+    M0/M1 端点（/auth/*、/admin/*、/dashboard、/health、/products、/suppliers、/imports*、
+    /product-mappings/*、/supplier-mappings/*、/products/{id}/trace-policy、/sync-jobs、
+    /jobs/{id}、/audit-logs、/settings*）、M2 端点（/upstream-bills*、/inbounds*）与
+    M3 端点（/pos-sales*、/returns*、/upload-tasks*）均按真实代码形状描述
+    （traceflow/src/TraceFlow.Host/Endpoints/*.cs，以代码为准）。
+    x-phase 标注契约归属阶段：M0/M1/M2/M3 为已实现；M4 为计划契约（未实现，不提供端点）。
     已认证请求的所有 /api 变更方法（POST/PUT/DELETE/PATCH）必须携带 X-CSRF-TOKEN 头
     （全局 antiforgery 中间件，AUTH-02）；/auth/login 与 /auth/logout 匿名可达但自行校验 CSRF。
     失败统一 code/message/fieldErrors/retryable/requestId；401 未登录、403 无权、
@@ -30,8 +32,9 @@ components:
       properties:
         code: { type: string }
         message: { type: string }
-        fieldErrors: { type: array, items: { type: object } }
-        retryable: { type: boolean }
+        fieldErrors: { type: array, items: { type: object }, description: 逐行校验错误（422 ALLOCATION_INVALID 等）；无则空数组 }
+        retryable: { type: boolean, description: '可安全重试：仅 429 TOP_RATE_LIMITED 与 409 RETRY_IN_FLIGHT 为 true，其余 false' }
+        retryAfter: { type: integer, nullable: true, description: '建议等待秒数（仅 429 且平台/本地给出等待时间时返回；同时写 Retry-After 响应头）' }
         requestId: { type: string }
     PageMeta:
       type: object
@@ -74,13 +77,17 @@ components:
               codes: { type: array, items: { type: string }, description: 须属该上游行、全 MIN、S8P20、集合内无重复/父子关系；大码→BIG_CODE_BLOCKED }
     ReturnConfirmRequest:
       type: object
-      required: [originalEventKey, codes, expectedVersion, reason]
+      required: [expectedVersion, decision, evidence, idemKey]
       properties:
-        originalEventKey: { type: string }
-        codes: { type: array, items: { type: string } }
-        evidenceIds: { type: array, items: { type: string } }
-        expectedVersion: { type: string }
-        reason: { type: string }
+        expectedVersion: { type: integer, format: int64, description: 'upload_task.version 乐观版本（内部 int64，JSON number）；不匹配 409 VERSION_CONFLICT' }
+        decision: { type: string, enum: [CONFIRMED, REJECTED], description: 'CONFIRMED=确认并提升为可发送任务；REJECTED=驳回（占位任务保持 Blocked，原因 RETURN_CONFIRM_REJECTED）' }
+        predecessorEventIds:
+          type: array
+          items: { type: integer, format: int64 }
+          description: '前序 code_event.id 集合；仅回显，服务端锁定后重新解析并以服务端结论为准（与提交值不一致→422 PREDECESSOR_MISMATCH）'
+        evidence: { description: '确认/驳回证据（JSON 对象、数组或字符串，必填非空；落 return_confirmation.evidence_json）' }
+        idemKey: { type: string, description: '幂等键（请求体内，非 Idempotency-Key 头；按用户作用域命名空间化落 idempotency_record；同一键重放返回 Idempotent=true）' }
+        firstReportDeclared: { type: boolean, description: '首次上报声明：decision=CONFIRMED 时必填且必须为 true（否则 422 FIRST_REPORT_NOT_DECLARED）；REJECTED 忽略。服务端把 "firstReportDeclared":true 并入 evidence_json（保留原证据内容）并进入审计 before/after' }
     TaskActionRequest:
       type: object
       required: [reason]
@@ -587,6 +594,337 @@ components:
             leaseOwner: { type: string, nullable: true }
             fencingToken: { type: integer, format: int64, description: 'JSON number（int64 内部代理；API-01 字符串约定仅适用外部平台 ID/rowversion，裁决 #9）' }
         requestId: { type: string }
+    # ---- M3 已实现端点真实响应形状（T10 回写；以 SalesEndpoints.cs / UploadEndpoints.cs 为准） ----
+    PosSalesRow:
+      type: object
+      required: [snapshotId, docKey, version, completeness, lineCount, codeCount, env]
+      properties:
+        snapshotId: { type: string, description: source_snapshot.id（本地 int64 代理以字符串返回） }
+        docKey: { type: string, description: 来源单据键（字符串保留前导零） }
+        version: { type: integer, description: 同一单据版本号（列表只回最新版本） }
+        businessDatetimeUtc: { type: string, format: date-time, nullable: true }
+        completeness: { type: string, description: source_snapshot.completeness_status }
+        lineCount: { type: integer, description: event_kind=SALE 的来源行数 }
+        codeCount: { type: integer, description: event_kind=SALE 且 trace_code_normalized 非空的行数 }
+        env: { type: string, enum: [LIVE, MOCK], description: '环境视图=查询 env；未核验快照在 LIVE 与 MOCK 两个视图都可见（R-M3-17），行 env 即查询环境' }
+        verificationState: { type: string, nullable: true, description: 当前核验结论状态；未核验为 null }
+        taskId: { type: string, nullable: true }
+        taskState: { type: string, nullable: true }
+    PosSalesListResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [items, page, pageSize, total]
+          properties:
+            items: { type: array, items: { $ref: '#/components/schemas/PosSalesRow' } }
+            page: { type: integer }
+            pageSize: { type: integer }
+            total: { type: integer }
+        requestId: { type: string }
+    PosSaleDetailResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [snapshot, lines, codes, verification, task]
+          properties:
+            snapshot:
+              type: object
+              properties:
+                snapshotId: { type: string }
+                docKey: { type: string }
+                version: { type: integer }
+                businessDatetimeUtc: { type: string, format: date-time, nullable: true }
+                completeness: { type: string }
+                contentHash: { type: string, description: 快照内容摘要 }
+                observedAt: { type: string, format: date-time }
+            lines:
+              type: array
+              items:
+                type: object
+                properties:
+                  lineId: { type: string }
+                  sourceLineKey: { type: string }
+                  productSourceId: { type: string }
+                  quantity: { type: string, description: 'decimal(18,6) 以字符串返回（最多 6 位小数）' }
+                  unit: { type: string, nullable: true }
+                  batchRaw: { type: string, nullable: true }
+                  traceCodeNormalized: { type: string, nullable: true }
+                  codeFormat: { type: string }
+                  eventKind: { type: string, description: 'SALE / PURCHASE_IN / CONSUMER_RETURN 等' }
+            codes:
+              type: array
+              description: 当前核验逐码结论（verification_code）；未核验为空数组
+              items:
+                type: object
+                properties:
+                  codeId: { type: string }
+                  codeNormalized: { type: string }
+                  sourceLineId: { type: string }
+                  result: { type: string, enum: [PASS, FAIL, UNKNOWN] }
+                  reason: { type: string, nullable: true }
+                  checkedAt: { type: string, format: date-time }
+            verification:
+              type: object
+              nullable: true
+              properties:
+                id: { type: string }
+                state: { type: string, description: 'PASSED / FAILED / UNRESOLVED / WAIT_RETRY' }
+                ruleVersion: { type: string }
+                verifyReason: { type: string, nullable: true }
+                failCode: { type: string, nullable: true }
+                verifiedAt: { type: string, format: date-time, nullable: true }
+                isCurrent: { type: boolean }
+            task:
+              type: object
+              nullable: true
+              properties:
+                taskId: { type: string }
+                eventKey: { type: string }
+                taskType: { type: string, enum: [PURCHASE_IN_102, RETAIL_321, CONSUMER_RETURN_116, PURCHASE_RETURN_202] }
+                state: { type: string, description: 12 态之一 }
+                stateReason: { type: string, nullable: true }
+                version: { type: integer }
+                createdAt: { type: string, format: date-time }
+                parts:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      partId: { type: string }
+                      partIndex: { type: integer }
+                      billCode: { type: string }
+                      state: { type: string }
+        requestId: { type: string }
+    ReturnCandidate:
+      type: object
+      properties:
+        codeId: { type: string, nullable: true }
+        sourceLineId: { type: string, nullable: true }
+        predecessorEventId: { type: string, nullable: true }
+        error: { type: string, nullable: true, description: 'PREDECESSOR_MISSING / PREDECESSOR_AMBIGUOUS / ALREADY_RETURNED；无错误为 null' }
+        code: { type: string, nullable: true, description: 规范化码（联查 trace_code；缺行 null） }
+        occurredAt: { type: string, format: date-time, nullable: true, description: 前序事件发生时间（code_event.occurred_at） }
+        docKey: { type: string, nullable: true, description: 前序事件来源单据键（经快照链回查；缺行 null） }
+    ReturnTaskRow:
+      type: object
+      required: [id, eventKey, taskType, state, version, partCount, codeCount, createdAt]
+      properties:
+        id: { type: string }
+        eventKey: { type: string }
+        taskType: { type: string, enum: [CONSUMER_RETURN_116, PURCHASE_RETURN_202] }
+        state: { type: string, enum: [Blocked, Ready, Dispatching, Accepted, AcceptanceUnknown, Processing, RetryWait, PartialSuccess, ResultUnresolved, Succeeded, Failed, ManualAction, Cancelled] }
+        stateReason: { type: string, nullable: true, description: '如 RETURN_CONFIRM_REQUIRED / RETURN_CONFIRM_REJECTED / RETURN_CONFIRMED' }
+        version: { type: integer }
+        predecessorTaskId: { type: string, nullable: true }
+        partCount: { type: integer }
+        codeCount: { type: integer, description: code_event 行数 }
+        createdAt: { type: string, format: date-time }
+        predecessorCandidates: { type: array, items: { $ref: '#/components/schemas/ReturnCandidate' } }
+    ReturnListResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [items, page, pageSize, total]
+          properties:
+            items: { type: array, items: { $ref: '#/components/schemas/ReturnTaskRow' } }
+            page: { type: integer }
+            pageSize: { type: integer }
+            total: { type: integer }
+        requestId: { type: string }
+    ReturnConfirmResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [taskId, state, idempotent]
+          properties:
+            taskId: { type: string }
+            state: { type: string, description: '确认后任务状态：CONFIRMED→Ready（或聚合后状态）；REJECTED→Blocked' }
+            idempotent: { type: boolean, description: true=命中幂等重放（未重复写入） }
+        requestId: { type: string }
+    UploadTaskSummary:
+      type: object
+      required: [total, succeeded, failed, settled]
+      properties:
+        total: { type: integer }
+        succeeded: { type: integer }
+        failed: { type: integer }
+        settled: { type: integer, description: succeeded+failed }
+        partialSuccess: { type: integer }
+        processing: { type: integer }
+        acceptanceUnknown: { type: integer }
+        resultUnresolved: { type: integer }
+        manualAction: { type: integer }
+        finalSuccessRate: { type: number, nullable: true, description: 'Succeeded/(Succeeded+Failed)，4 位小数；分母=0 时 null。部分成功/中间态绝不混入' }
+    UploadTaskRow:
+      type: object
+      required: [id, eventKey, taskType, state, env, partCount, codeCount]
+      properties:
+        id: { type: string }
+        eventKey: { type: string }
+        taskType: { type: string, enum: [PURCHASE_IN_102, RETAIL_321, CONSUMER_RETURN_116, PURCHASE_RETURN_202] }
+        state: { type: string, description: 12 态之一 }
+        stateReason: { type: string, nullable: true }
+        env: { type: string, enum: [LIVE, MOCK] }
+        verificationState: { type: string, description: PASSED / FAILED / UNRESOLVED / NONE 等 }
+        partCount: { type: integer }
+        codeCount: { type: integer, description: 逐码最新结论数（同码多次取最新一行） }
+        succeededCodes: { type: integer }
+        failedCodes: { type: integer }
+        unknownCodes: { type: integer, description: UNKNOWN 单列，绝不并入成功 }
+        succeededParts: { type: integer }
+        failedParts: { type: integer }
+        partialSuccessParts: { type: integer }
+        processingParts: { type: integer }
+        acceptanceUnknownParts: { type: integer }
+        resultUnresolvedParts: { type: integer }
+        manualActionParts: { type: integer }
+        createdAt: { type: string, format: date-time }
+    UploadTaskListResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [items, page, pageSize, total, summary]
+          properties:
+            items: { type: array, items: { $ref: '#/components/schemas/UploadTaskRow' } }
+            page: { type: integer }
+            pageSize: { type: integer }
+            total: { type: integer }
+            summary: { $ref: '#/components/schemas/UploadTaskSummary' }
+        requestId: { type: string }
+    UploadTaskDetailResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [retryPathCertified, task, parts, attempts, codeResults, timeline]
+          properties:
+            retryPathCertified: { type: boolean, description: 'top.retryPathCertified 只读投影（fail-closed，默认 false）；false 时前端必须禁用受控重试' }
+            task:
+              type: object
+              properties:
+                taskId: { type: string }
+                eventKey: { type: string }
+                taskType: { type: string }
+                env: { type: string, enum: [LIVE, MOCK] }
+                sourceSnapshotId: { type: string, nullable: true }
+                predecessorTaskId: { type: string, nullable: true }
+                state: { type: string }
+                stateReason: { type: string, nullable: true }
+                version: { type: integer }
+                createdAt: { type: string, format: date-time }
+                verificationState: { type: string }
+                dependencyState: { type: string }
+                matchState: { type: string }
+                sourceIntegrity: { type: string }
+                payloadHash: { type: string }
+            parts:
+              type: array
+              items:
+                type: object
+                properties:
+                  partId: { type: string }
+                  partIndex: { type: integer }
+                  billCode: { type: string }
+                  state: { type: string }
+                  queryCount: { type: integer }
+                  nextQueryAt: { type: string, format: date-time, nullable: true }
+                  firstSentAt: { type: string, format: date-time, nullable: true }
+                  resultRows: { type: integer }
+            attempts:
+              type: array
+              items:
+                type: object
+                properties:
+                  attemptId: { type: string }
+                  partId: { type: string, nullable: true }
+                  attemptNo: { type: integer }
+                  attemptKind: { type: string, enum: [UPLOAD, QUERY] }
+                  startedAt: { type: string, format: date-time }
+                  finishedAt: { type: string, format: date-time, nullable: true }
+                  httpStatus: { type: integer, nullable: true }
+                  requestId: { type: string, nullable: true }
+                  platformTaskId: { type: string, nullable: true }
+                  errorKind: { type: string, nullable: true }
+                  isStaleEvidence: { type: boolean, description: 迟到写回只留证不改状态 }
+                  rawResponse: { type: string, nullable: true, description: 入库前已脱敏（不含 AppKey/AppSecret/签名/请求参数） }
+            codeResults:
+              type: array
+              items:
+                type: object
+                properties:
+                  resultId: { type: string }
+                  partId: { type: string }
+                  codeId: { type: string }
+                  codeNormalized: { type: string }
+                  result: { type: string, enum: [SUCCESS, FAILED, UNKNOWN] }
+                  reason: { type: string, nullable: true }
+                  attemptId: { type: string }
+                  recordedAt: { type: string, format: date-time }
+            timeline:
+              type: array
+              items:
+                type: object
+                properties:
+                  at: { type: string, format: date-time }
+                  kind: { type: string, description: 'TASK_CREATED / ATTEMPT_UPLOAD / ATTEMPT_QUERY_FINISHED / 审计 action' }
+                  detail: { type: string, nullable: true }
+                  actor: { type: string, nullable: true }
+        requestId: { type: string }
+    ManualVerifyRequest:
+      type: object
+      required: [decision]
+      properties:
+        decision: { type: string, enum: [ACCEPTED, PROCESSING, NOT_ACCEPTED] }
+        evidence:
+          type: object
+          properties:
+            platformBillCode: { type: string, nullable: true, description: 'ACCEPTED/PROCESSING 必填，且必须等于该任务某分片 bill_code（否则 422 EVIDENCE_MISMATCH）' }
+            contractEvidence: { description: 'NOT_ACCEPTED 必填的合同/平台协作证据（非空）；ACCEPTED/PROCESSING 可选' }
+        expectedVersion: { type: integer, nullable: true, description: upload_task.version；不一致 409 VERSION_CONFLICT }
+    ManualVerifyResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [taskId, state, version, decision, partIds]
+          properties:
+            taskId: { type: string }
+            state: { type: string, description: 人工核对后聚合任务状态 }
+            version: { type: integer }
+            decision: { type: string, enum: [ACCEPTED, PROCESSING, NOT_ACCEPTED] }
+            partIds: { type: array, items: { type: string }, description: 被推进的分片 }
+        requestId: { type: string }
+    ControlledRetryRequest:
+      type: object
+      properties:
+        expectedVersion: { type: integer, nullable: true, description: upload_task.version；不一致 409 VERSION_CONFLICT }
+    ControlledRetryResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [taskId, state, version, retryAllowed, jobsReset, partIds]
+          properties:
+            taskId: { type: string }
+            state: { type: string }
+            version: { type: integer }
+            retryAllowed: { type: boolean, description: 恒 true（在途发送已在写入前 409 RETRY_IN_FLIGHT 拒绝） }
+            jobsReset: { type: integer, description: 复位/新建的 upload-dispatch 作业数 }
+            partIds: { type: array, items: { type: string }, description: 被复核的 Failed 分片（成功分片绝不重发） }
+        requestId: { type: string }
   responses:
     Unauthorized: { description: 未登录, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
     Forbidden: { description: 无权限, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
@@ -1045,57 +1383,59 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { description: FROZEN（已发送或进入发送流程）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '422': { description: VALIDATION（reason 必填/分配不属于该快照）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
-  /sales:
+  /pos-sales:
     get:
       x-phase: M3
-      description: POS 销售列表（权限 trace:read，SALE-01）。时间/小票/商品/异常筛选；原始行与核验信息；禁止编辑原单码。
-      parameters: [{ $ref: '#/components/parameters/Page' }, { $ref: '#/components/parameters/PageSize' },
-        { name: lshh, in: query, schema: { type: string }, description: 小票号字符串（保留前导零） },
-        { name: productId, in: query, schema: { type: string }, description: spid 字符串 },
-        { name: exceptionOnly, in: query, schema: { type: boolean } },
-        { name: dateStart, in: query, schema: { type: string, format: date } },
-        { name: dateEnd, in: query, schema: { type: string, format: date } }]
+      description: POS 销售快照列表（权限：登录，SALE-01/02）。同一来源单只回最新版本；分页 ROW_NUMBER 区间（pageSize 上限 100，默认 20）；行只出白名单字段（raw_header/raw_line/payload 永不外泄）。未核验快照在 LIVE 与 MOCK 两个环境视图都可见（R-M3-17）。
+      parameters:
+        - { $ref: '#/components/parameters/Page' }
+        - { name: pageSize, in: query, schema: { type: integer, minimum: 1, default: 20 }, description: '1..100；>100 收敛为 100' }
+        - { name: dateFrom, in: query, schema: { type: string }, description: 'ISO-8601 日期或时间；仅日期按当日 0 点起' }
+        - { name: dateTo, in: query, schema: { type: string }, description: '仅日期按整日包含（转次日 0 点排他）；带时间按闭区间' }
+        - { name: env, in: query, schema: { type: string, enum: [LIVE, MOCK] }, description: 环境视图；缺省=当前宿主环境 }
       responses:
-        '200': { description: 分页销售事件, content: { application/json: { schema: { $ref: '#/components/schemas/PageMeta' } } } }
+        '200': { description: 分页销售快照, content: { application/json: { schema: { $ref: '#/components/schemas/PosSalesListResponse' } } } }
+        '400': { description: 'VALIDATION（page/pageSize 越界或 dateFrom/dateTo/env 非法）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-  /sales/{id}:
+  /pos-sales/{id}:
     get:
       x-phase: M3
-      description: 销售事件详情（权限 trace:read）。原始行（plh 分行不聚合）、码完整率、核验/依赖/上传态；不提供扫码或修改 TraceCode/原交易数量。
-      parameters: [{ $ref: '#/components/parameters/ResourceId' }]
+      description: 销售快照钻取（权限：登录，SALE-02/03）。来源行（plh 分行不聚合）、逐码核验结论、当前 verification 摘要与任务/分片；不提供扫码或修改码/原交易数量。可见性口径与列表一致（该环境有当前核验，或快照尚无任何当前核验）。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { name: env, in: query, schema: { type: string, enum: [LIVE, MOCK] }, description: 环境视图；缺省=当前宿主环境 }
       responses:
-        '200': { description: 销售详情, content: { application/json: { schema: { type: object, properties: { data: { type: object }, requestId: { type: string } } } } } }
+        '200': { description: 销售快照详情, content: { application/json: { schema: { $ref: '#/components/schemas/PosSaleDetailResponse' } } } }
+        '400': { description: VALIDATION（env 非法）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
   /returns:
     get:
       x-phase: M3
-      description: 退货列表（权限 trace:read，RET-01/03）。消费者/供应商页签；负数来源行、原小票、码、匹配证据、确认/依赖/上传态；无来源采购退货显示未接入。
-      parameters: [{ $ref: '#/components/parameters/Page' }, { $ref: '#/components/parameters/PageSize' },
-        { name: returnKind, in: query, schema: { type: string, enum: [CONSUMER_RETURN, PURCHASE_RETURN] } },
-        { name: lshh, in: query, schema: { type: string } },
-        { name: dateStart, in: query, schema: { type: string, format: date } },
-        { name: dateEnd, in: query, schema: { type: string, format: date } }]
+      description: 退货任务列表（权限：登录，RET-01/02/04）。只列 CONSUMER_RETURN_116 与 PURCHASE_RETURN_202；页签分组以 return_confirmation 存在性为准（confirmStatus），不用 state_reason 文本推导；待确认行附前序销售候选（单号/时间/码/错误）。采购退货来源未接入（G-ERP），不伪造入口。
+      parameters:
+        - { $ref: '#/components/parameters/Page' }
+        - { name: pageSize, in: query, schema: { type: integer, minimum: 1, default: 20 }, description: '1..100；>100 收敛为 100' }
+        - { name: state, in: query, schema: { type: string }, description: '上传状态精确匹配（大小写敏感，非法值 422 VALIDATION）' }
+        - { name: confirmStatus, in: query, schema: { type: string, enum: [PENDING, CONFIRMED, REJECTED] }, description: '页签：PENDING=Blocked 且 RETURN_CONFIRM_REQUIRED 且无确认记录；CONFIRMED/REJECTED=存在对应 decision 的 return_confirmation（大小写敏感，非法值 422）' }
       responses:
-        '200': { description: 分页退货事件, content: { application/json: { schema: { $ref: '#/components/schemas/PageMeta' } } } }
+        '200': { description: 分页退货任务, content: { application/json: { schema: { $ref: '#/components/schemas/ReturnListResponse' } } } }
+        '400': { description: VALIDATION（page/pageSize）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { description: VALIDATION（state/confirmStatus 非法）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
   /returns/{id}:
     get:
-      x-phase: M3
-      description: 退货事件详情（权限 trace:read）。原负数行/码/原销售候选与证据；保留原值不净额抵消。
+      x-phase: M4
+      description: '（M3 未实现，计划契约）退货任务详情（权限：登录）。M3 的退货展示由 GET /returns 列表（含 predecessorCandidates）与 GET /pos-sales/{id} 销售钻取覆盖；独立退货详情端点留待 M4。'
       parameters: [{ $ref: '#/components/parameters/ResourceId' }]
       responses:
-        '200': { description: 退货详情, content: { application/json: { schema: { type: object, properties: { data: { type: object }, requestId: { type: string } } } } } }
+        '200': { description: 退货详情（计划）, content: { application/json: { schema: { type: object, properties: { data: { type: object }, requestId: { type: string } } } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
   /verifications/{id}/recheck:
     post:
-      x-phase: M3
-      description: 重新核验（权限 upload:query，SALE-02）。202 入队；不绕过同步完整性；核验绑定源头摘要/码集合摘要/规则版本。
+      x-phase: M4
+      description: '（M3 未实现，计划契约）重新核验（权限 upload:query，SALE-02）。M3 的核验由 sale-verify 作业（COMPLETE 快照入队）与 SyncScheduler 兜底自动触发；人工重核入口留待 M4。'
       parameters:
         - { $ref: '#/components/parameters/ResourceId' }
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -1113,21 +1453,21 @@ paths:
   /returns/{id}/confirm:
     post:
       x-phase: M3
-      description: 消费者退货首次人工确认（权限 return:confirm，DEF-02/RET-02）。须真实退回码、商品一致及可解释原销售关系；无候选或多候选阻断（422）；原销售存在则等待其终态；确认后校验建 116 任务；不默认自动首次上报。
+      description: 退货首次人工确认/驳回（权限 return:confirm，DEF-02/RET-02/RET-04）。仅 Blocked + RETURN_CONFIRM_REQUIRED 的 116/202 占位任务可提交；前序由服务端锁定后重新解析（0 条 PREDECESSOR_MISSING、多条 PREDECESSOR_AMBIGUOUS、已退回 ALREADY_RETURNED、与提交值不一致 PREDECESSOR_MISMATCH）；CONFIRMED 必须携带 firstReportDeclared=true（首次上报声明，服务端强制，缺失/false→422 FIRST_REPORT_NOT_DECLARED，声明并入 evidence_json 并进入审计），同事务建占用/事件/分片/发送作业并推进 Ready；REJECTED 忽略该声明，只写确认记录与审计（不改分片）。审计 env 恒 LIVE，任务/确认行 env 保持自身环境。幂等键在请求体内（idemKey），非 Idempotency-Key 头。
       parameters:
         - { $ref: '#/components/parameters/ResourceId' }
-        - { $ref: '#/components/parameters/IdempotencyKey' }
         - { $ref: '#/components/parameters/CsrfToken' }
       requestBody:
         required: true
         content: { application/json: { schema: { $ref: '#/components/schemas/ReturnConfirmRequest' } } }
       responses:
-        '200': { description: 已确认并按条件建退货任务, content: { application/json: { schema: { $ref: '#/components/schemas/EmptyDataResponse' } } } }
+        '200': { description: 已确认/已驳回, content: { application/json: { schema: { $ref: '#/components/schemas/ReturnConfirmResponse' } } } }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        '422': { description: 原销售关系不可解释/多候选/码不一致/G-RETURN 未取证, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: 'VERSION_CONFLICT（版本/状态已变化）或 IDEMPOTENCY_CONFLICT（同键不同请求）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: 'VALIDATION / FIRST_REPORT_NOT_DECLARED / NOT_RETURNABLE / PREDECESSOR_MISMATCH / PREDECESSOR_MISSING / PREDECESSOR_AMBIGUOUS / ALREADY_RETURNED', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
   /trace-codes/{code}/events:
     get:
       x-phase: M4
@@ -1144,32 +1484,72 @@ paths:
   /upload-tasks:
     get:
       x-phase: M3
-      description: 上传任务列表（权限 trace:read）。类型/状态/日期/平台号/本地号筛选；子单、尝试数、失败码计数、request_id、下次运行。
-      parameters: [{ $ref: '#/components/parameters/Page' }, { $ref: '#/components/parameters/PageSize' },
-        { name: taskType, in: query, schema: { type: string, enum: [PURCHASE_IN_102, RETAIL_321, CONSUMER_RETURN_116, PURCHASE_RETURN_202] } },
-        { name: state, in: query, schema: { type: string, description: 12 态之一（Blocked/Ready/Dispatching/Accepted/AcceptanceUnknown/Processing/RetryWait/PartialSuccess/ResultUnresolved/Succeeded/Failed/ManualAction） } },
-        { name: billCode, in: query, schema: { type: string }, description: 平台单号字符串 },
-        { name: eventKey, in: query, schema: { type: string }, description: 本地业务事件键字符串 },
-        { name: dateStart, in: query, schema: { type: string, format: date } },
-        { name: dateEnd, in: query, schema: { type: string, format: date } }]
+      description: 上传任务列表（权限：登录，UI-09）。只出白名单字段（raw_response 不在此层）；成功率口径=最终全部成功 Succeeded÷(Succeeded+Failed)，部分成功/处理中/受理未知/结果未定/转人工单列计数，绝不混入分子或分母。
+      parameters:
+        - { $ref: '#/components/parameters/Page' }
+        - { name: pageSize, in: query, schema: { type: integer, minimum: 1, default: 20 }, description: '1..100；>100 收敛为 100' }
+        - { name: state, in: query, schema: { type: string, description: '12 态之一（Blocked/Ready/Dispatching/Accepted/AcceptanceUnknown/Processing/RetryWait/PartialSuccess/ResultUnresolved/Succeeded/Failed/ManualAction）；非法值 422' } }
+        - { name: taskType, in: query, schema: { type: string, enum: [PURCHASE_IN_102, RETAIL_321, CONSUMER_RETURN_116, PURCHASE_RETURN_202] }, description: 精确匹配 }
+        - { name: env, in: query, schema: { type: string, enum: [LIVE, MOCK] }, description: 环境视图；缺省=当前宿主环境 }
       responses:
-        '200': { description: 分页上传任务, content: { application/json: { schema: { $ref: '#/components/schemas/PageMeta' } } } }
+        '200': { description: 分页上传任务 + 状态汇总, content: { application/json: { schema: { $ref: '#/components/schemas/UploadTaskListResponse' } } } }
+        '400': { description: VALIDATION（page/pageSize/env 非法）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { description: VALIDATION（state 非法）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
   /upload-tasks/{id}:
     get:
       x-phase: M3
-      description: 上传任务详情（权限 trace:read）。子单/尝试/失败码/脱敏原文（原文响应受权限保护并脱敏，AUD-01）；成功/部分成功禁通用重发。
-      parameters: [{ $ref: '#/components/parameters/ResourceId' }]
+      description: 上传任务详情（权限：登录，IDEM-04/05、TOP-03）。分片/尝试/逐码三态/时间线；raw_response 为入库前脱敏证据；根节点 retryPathCertified 驱动前端受控重试门禁（fail-closed）。任务须属于「活动机构 + 目标环境」，范围外 404。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { name: env, in: query, schema: { type: string, enum: [LIVE, MOCK] }, description: 环境视图；缺省=当前宿主环境 }
       responses:
-        '200': { description: 任务详情（子单/尝试/逐码结果）, content: { application/json: { schema: { type: object, properties: { data: { type: object }, requestId: { type: string } } } } } }
+        '200': { description: 任务详情（分片/尝试/逐码结果/时间线/重试门禁）, content: { application/json: { schema: { $ref: '#/components/schemas/UploadTaskDetailResponse' } } } }
+        '400': { description: VALIDATION（env 非法）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /upload-tasks/{id}/manual-verify:
+    post:
+      x-phase: M3
+      description: 受理未知人工核对（权限 upload:verify，IDEM-04、TOP-02）。仅 ManualAction 任务可提交；ACCEPTED/PROCESSING 须 platformBillCode 且等于该任务某分片 bill_code；NOT_ACCEPTED 须当前时间 ≥ 该任务最晚发送时间 + top.query.consistencyWindowSeconds 且 contractEvidence 非空，通过后分片→RetryWait 并复位发送作业。拒绝路径零写入（含幂等记录），审计 env 恒 LIVE。须 Idempotency-Key 头。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ManualVerifyRequest' } } }
+      responses:
+        '200': { description: 已按人工结论推进分片, content: { application/json: { schema: { $ref: '#/components/schemas/ManualVerifyResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
-  /upload-tasks/{id}/query:
+        '409': { description: 'VERSION_CONFLICT（版本已变化）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: 'VALIDATION / NOT_MANUAL_ACTION / EVIDENCE_REQUIRED / EVIDENCE_MISMATCH / CONSISTENCY_WINDOW_NOT_MET / TRANSITION_NOT_ALLOWED', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /upload-tasks/{id}/controlled-retry:
     post:
       x-phase: M3
-      description: 状态回查（权限 upload:query，IDEM-04/05）。只排回查作业（202），不上传；ACCEPTANCE_UNKNOWN 首先回查，禁止自动重发。
+      description: 受控重试（权限 upload:retry，IDEM-05）。合同门禁最前：top.retryPathCertified=false → 422 RETRY_PATH_NOT_CERTIFIED 且零写入；仅 Failed 任务可重试；目标 Failed 分片存在 RUNNING 发送作业（不看租约是否过期）→ 409 RETRY_IN_FLIGHT（retryable=true）；成功分片绝不重发，upload_attempt 历史不改写。须 Idempotency-Key 头。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: false
+        content: { application/json: { schema: { $ref: '#/components/schemas/ControlledRetryRequest' } } }
+      responses:
+        '200': { description: 失败分片已复位为可发送并复位/新建发送作业, content: { application/json: { schema: { $ref: '#/components/schemas/ControlledRetryResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: 'RETRY_IN_FLIGHT（在途发送，retryable=true）或 VERSION_CONFLICT', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: 'RETRY_PATH_NOT_CERTIFIED（合同未取证）或 NOT_FAILED / TRANSITION_NOT_ALLOWED', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /upload-tasks/{id}/query:
+    post:
+      x-phase: M4
+      description: '（M3 未实现，计划契约）手动状态回查（权限 upload:query，IDEM-04/05）。M3 的回查由 bill-query 作业（发送/核对后入队 + query:scan 兜底）自动执行，无手动入口；端点留待 M4。'
       parameters:
         - { $ref: '#/components/parameters/ResourceId' }
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -1186,8 +1566,8 @@ paths:
         '422': { $ref: '#/components/responses/Unprocessable' }
   /upload-tasks/{id}/retry:
     post:
-      x-phase: M3
-      description: 受控重试（权限 upload:retry，IDEM-05）。后端判定可证明未受理且合同允许重传才入队（202，复用任务与单号）；否则 409（状态不允许）/422（证据不足）；部分成功/成功任务禁全单重发；无通用"强制成功"。
+      x-phase: M4
+      description: '（M3 未实现，计划契约）通用重试。M3 只提供受控重试 POST /upload-tasks/{id}/controlled-retry（合同门禁 fail-closed）；不提供绕过门禁的通用重发入口，本端点仅为 M4 预留，当前无实现且不得用于生产。'
       parameters:
         - { $ref: '#/components/parameters/ResourceId' }
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -1196,12 +1576,12 @@ paths:
         required: true
         content: { application/json: { schema: { $ref: '#/components/schemas/TaskActionRequest' } } }
       responses:
-        '202': { description: 受控重试已入队（RETRY_WAIT→READY）, content: { application/json: { schema: { $ref: '#/components/schemas/JobAccepted' } } } }
+        '202': { description: 受控重试已入队, content: { application/json: { schema: { $ref: '#/components/schemas/JobAccepted' } } } }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
-        '409': { description: 当前状态不允许重试（已受理/处理中/成功/部分成功）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
-        '422': { description: 未受理证据不足/合同不允许重传, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
   /reconciliation-runs:
     post:
       x-phase: M4

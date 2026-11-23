@@ -1,0 +1,11 @@
+{
+  "_verified": false,
+  "_note": "消费者退货 116 uploadretail 受理响应候选；G-TOP 验证后替换为真实脱敏响应（当前仅供假平台）",
+  "alibaba_alihealth_drugtrace_top_lsyd_uploadretail_response": {
+    "response_success": true,
+    "msg_code": "SUCCESS",
+    "sub_msg_code": null,
+    "model": { "bill_code": "TF-RET1", "task_id": "MOCK-RET-TASK-1" },
+    "request_id": "mock-ret-req-1"
+  }
+}

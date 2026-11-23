@@ -95,4 +95,57 @@ VALUES(@s,N'sale',N'WINDOW',@ws,@we,@we)", new { s = sysId, ws = oldEnd.AddDays(
         Assert.Equal(end, await c.ExecuteScalarAsync<DateTime>(
             "SELECT window_end FROM dbo.sync_checkpoint WHERE source_system_id=@s AND entity=N'purchase-in' AND checkpoint_kind=N'WINDOW'", new { s = sysId }));
     }
+
+    /// <summary>
+    /// F7：核验入队失败不得让已落库的 source-sync 失败（异常被吞并按 sale.verify.enqueue.failed 审计），
+    /// 漏入队由 SyncScheduler 兜底。注入抛异常的 IJobQueue 使用构造器已有的可选 queue 缝，不改 handler 结构。
+    /// </summary>
+    [Fact]
+    public async Task Enqueue_failure_is_audited_and_sync_job_still_completes()
+    {
+        var (orgId, sysId) = await SeedAsync();
+        // 需至少一个 COMPLETE SALE 快照，核验入队查询才会真正调用 EnqueueAsync（否则空转不触发故障）。
+        await using (var seedConn = new SqlConnection(_fx.ConnectionString))
+        {
+            await seedConn.OpenAsync();
+            await seedConn.ExecuteAsync(@"
+INSERT INTO dbo.source_snapshot(org_id,source_system_id,source_document_key,document_type,version,completeness_status,content_hash)
+VALUES(@org,@sys,N'SALE-ENQFAIL',N'SALE',1,N'COMPLETE',REPLICATE('a',64))", new { org = orgId, sys = sysId });
+        }
+        var job = await EnqueueAndClaimAsync(orgId,
+            $$"""{"orgId":{{orgId}},"env":"MOCK","entity":"sale","trigger":"periodic"}""",
+            "h-enqfail-" + Guid.NewGuid().ToString("N"));
+        var handler = new SourceSyncJobHandler(_fx.ConnectionString, new FixtureKsoaAdapter(FixtureDir),
+            new SettingsService(_fx.ConnectionString, new DpapiProtector()), new AuditLog(), new ThrowingJobQueue());
+
+        // 不抛异常 = 作业成功完成（WorkerHostedService 会 Complete 而不是退避重排）
+        await handler.HandleAsync(job, CancellationToken.None);
+
+        await using var c = new SqlConnection(_fx.ConnectionString);
+        Assert.True(await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.source_snapshot") >= 3,
+            "同步本身必须已落库");
+        Assert.Equal(1, await c.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'sale.verify.enqueue.failed'"));
+        // 没有 sale-verify 入队行（入队整体失败回滚），由调度兜底补发
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'sale-verify'"));
+    }
+
+    /// <summary>仅 EnqueueAsync 抛错的队列替身：模拟源同步后的核验入队失败。</summary>
+    private sealed class ThrowingJobQueue : IJobQueue
+    {
+        public Task<long> EnqueueAsync(SqlConnection conn, SqlTransaction tx, long orgId, string env, string jobKind,
+            string intentKey, string? payloadJson, DateTime? nextRunAtUtc, CancellationToken ct)
+            => throw new InvalidOperationException("模拟核验入队失败");
+
+        public Task<ClaimedJob?> ClaimAsync(string workerId, string env, IReadOnlyCollection<string> jobKinds,
+            TimeSpan lease, CancellationToken ct) => throw new NotSupportedException();
+        public Task<bool> CompleteAsync(long jobId, string workerId, long fencingToken, CancellationToken ct)
+            => throw new NotSupportedException();
+        public Task<bool> RescheduleAsync(long jobId, string workerId, long fencingToken, DateTime nextRunAtUtc,
+            string? error, CancellationToken ct) => throw new NotSupportedException();
+        public Task<bool> FailAsync(long jobId, string workerId, long fencingToken, string error, CancellationToken ct)
+            => throw new NotSupportedException();
+        public Task<int> RecoverExpiredLeasesAsync(CancellationToken ct) => throw new NotSupportedException();
+    }
 }

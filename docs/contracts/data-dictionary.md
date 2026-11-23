@@ -1,6 +1,6 @@
 # 数据字典（PRD §11.2 逻辑实体 → 物理表映射）
 
-物理表名与关键约束已逐一核对实际迁移脚本 `traceflow/db/migrations/0001_core.sql` … `0006_upload.sql` + M1 增量 `0007_m1_source_master.sql`（HEAD 以实际 M1 末提交为准）。
+物理表名与关键约束已逐一核对实际迁移脚本 `traceflow/db/migrations/0001_core.sql` … `0006_upload.sql` + M1 增量 `0007_m1_source_master.sql` + M2 增量 `0008_m2_upstream_allocation.sql` + M3 增量 `0009_m3_sale_upload.sql`（HEAD 以实际 M3 末提交为准）。
 **核对结论：任务简报映射表中的全部物理表名与实际 DDL 一致，无需更正**（含 `sync_checkpoint` 与 `download_progress`，两者均真实存在：`sync_checkpoint` 在 0002，`download_progress` 在 0004）。
 关键约束列使用实际约束/索引名。通用规则（DB-01/02）：外部 ID/单号/码为 nvarchar + `Latin1_General_BIN2` 排序规则；内部 UTC `datetime2(3)`；并发版本 `rowversion`（序列化为字符串）；数量 `decimal(18,6)`；禁止 float 计量。
 
@@ -65,6 +65,20 @@ CodeFormat token 映射由 `TraceFlow.Domain.Codes.CodeFormatStorage` 统一（�
 
 Cancelled 为纯本地行政终态，非平台状态；`UploadStateMachine` 仅增两条边（UploadStateMachineTests 全边覆盖含新边）。
 
+## 0009 迁移增量（M3，`0009_m3_sale_upload.sql`）
+
+不修改 0001–0008 任何字节；0009 以 ALTER/CREATE 增量演进。**注意：`upload_part` / `upload_attempt` / `code_result` 均为 0006 既有表，0009 只改 `upload_part` 三列，不新建任何 `upload_task_part`/`upload_attempt`/`code_result` 变体。**
+
+| 对象 | 变更 | 列/约束明细 | 用途 |
+| --- | --- | --- | --- |
+| upload_task | 新列 + FK + 筛选索引 | `predecessor_task_id bigint NULL`，`FK_task_predecessor REFERENCES upload_task(id)`；`IX_task_predecessor(predecessor_task_id) WHERE predecessor_task_id IS NOT NULL` | 116 退货任务关联原销售任务（RET-04）；仅非空行入索引，2008 R2 支持 |
+| upload_part | 三列 + 索引 | `next_query_at datetime2(3) NULL`、`query_count int NOT NULL CONSTRAINT DF_part_qcount DEFAULT 0`、`first_sent_at datetime2(3) NULL`；`IX_part_query(state, next_query_at)` | billstatus 退避回查调度（TOP-02/03/04）；到期同状态分片不回表扫描 |
+| verification_code | 新表 | `id bigint IDENTITY PK`；`verification_id bigint NOT NULL FK → verification(id)`；`org_id bigint NOT NULL`；`env char(4) NOT NULL`；`code_id bigint NOT NULL FK → trace_code(id)`；`source_line_id bigint NOT NULL`（无 FK）；`result nvarchar(8) NOT NULL`，`CK_vcode_result CHECK (result IN ('PASS','FAIL','UNKNOWN'))`；`reason nvarchar(500) NULL`；`evidence_json nvarchar(max) NULL`；`checked_at datetime2(3) NOT NULL DEFAULT SYSUTCDATETIME()`（`DF_vcode_at`）；`UQ_vcode UNIQUE(verification_id, code_id)`；`IX_vcode_code(code_id)` | 零售校验逐码三态结论与证据（SALE-02/TOP-04）；同一核验内每码仅一行，按码反查走 IX_vcode_code |
+| verification | 新索引 | `IX_verif_snapshot(source_snapshot_id, is_current, state)` | 源同步/核验兜底按快照判重，避免全表扫描 |
+| return_confirmation | 新表 | `id bigint IDENTITY PK`；`org_id bigint NOT NULL FK → organization(id)`；`env char(4) NOT NULL`；`task_id bigint NOT NULL FK → upload_task(id)` + `UQ_retconf_task UNIQUE(task_id)`（一任务一确认）；`decision nvarchar(16) NOT NULL`，`CK_retconf_decision CHECK (decision IN ('CONFIRMED','REJECTED'))`；`relation_kind nvarchar(16) NOT NULL`，`CK_retconf_relation CHECK (relation_kind IN ('SALE','PURCHASE_IN'))`；`predecessor_task_id bigint NULL`（无 FK）；`evidence_json nvarchar(max) NOT NULL`；`confirmed_by nvarchar(64) NOT NULL`；`confirmed_at datetime2(3) NOT NULL DEFAULT SYSUTCDATETIME()`（`DF_retconf_at`）；`ver rowversion NOT NULL` | 116 退货候选人工确认/拒绝留证（RET-01/02）；`ver` 供确认接口 `expectedVersion` 乐观锁 |
+
+`verification_code.env` 与 `return_confirmation.env` 沿用 char(4) LIVE/MOCK 隔离（无独立 CHECK，与既有表一致）；`return_confirmation` 的 `predecessor_task_id` 是留证快照而非外键，避免平台/本地任务历史级联约束。除 `DF_part_qcount` 外，新增列均可空或带默认，0009 对既有行无数据迁移。
+
 ## 环境隔离（Live/Mock）
 
-`upstream_bill`、`download_progress`、`code_event`、`code_claim`、`inbound_allocation`、`verification`、`upload_task`、`upload_part`、`upload_attempt`、`outbox_job`、`reconciliation_run`、`audit_log` 均含 `env` 列（LIVE/MOCK，多数有 CHECK）；Mock 与 Live 数据互不串扰（CodeConstraintTests.Mock_and_live_claims_isolated、UploadConstraintTests.Mock_task_with_same_event_key_isolated、JobQueueTests.Claim_only_returns_jobs_of_requested_env）。宿主配置 `TraceFlow:Env` 大小写不敏感、启动规范化为 LIVE/MOCK（默认 MOCK；非法值启动失败），LIVE 须门禁后显式开启。
+`upstream_bill`、`download_progress`、`code_event`、`code_claim`、`inbound_allocation`、`verification`、`verification_code`、`upload_task`、`upload_part`、`upload_attempt`、`outbox_job`、`reconciliation_run`、`return_confirmation`、`audit_log` 均含 `env` 列（LIVE/MOCK，多数有 CHECK；`verification_code`/`return_confirmation` 为 char(4) 无独立 CHECK）；Mock 与 Live 数据互不串扰（CodeConstraintTests.Mock_and_live_claims_isolated、UploadConstraintTests.Mock_task_with_same_event_key_isolated、JobQueueTests.Claim_only_returns_jobs_of_requested_env）。宿主配置 `TraceFlow:Env` 大小写不敏感、启动规范化为 LIVE/MOCK（默认 MOCK；非法值启动失败），LIVE 须门禁后显式开启。

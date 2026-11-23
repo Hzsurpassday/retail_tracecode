@@ -39,10 +39,10 @@ public class SyncSchedulerTests : IAsyncLifetime
         await SeedAsync();
         var now = new DateTime(2026, 11, 22, 8, 0, 0, DateTimeKind.Utc);
         var n = await NewSvc().TickAsync(now, CancellationToken.None);
-        Assert.Equal(8, n); // 2 实体 × (periodic+daily) + 1 match + 1 upstream + 1 enterprise + 1 inbound
-        Assert.Equal(8, await JobCountAsync());
+        Assert.Equal(9, n); // 2 实体 × (periodic+daily) + 1 match + 1 upstream + 1 enterprise + 1 bill-query scan + 1 inbound
+        Assert.Equal(9, await JobCountAsync());
         await NewSvc().TickAsync(now, CancellationToken.None); // 同意图桶→幂等
-        Assert.Equal(8, await JobCountAsync());
+        Assert.Equal(9, await JobCountAsync());
         await using var c = new SqlConnection(_fx.ConnectionString);
         // unix(2026-11-22T08:00Z)/300 动态计算，不硬编码桶号
         var unix = new DateTimeOffset(now).ToUnixTimeSeconds();
@@ -59,7 +59,7 @@ public class SyncSchedulerTests : IAsyncLifetime
         var now = new DateTime(2026, 11, 22, 8, 0, 0, DateTimeKind.Utc);
         await NewSvc().TickAsync(now, CancellationToken.None);
         await NewSvc().TickAsync(now.AddSeconds(30), CancellationToken.None); // 默认 pollSeconds=30 → 新桶
-        Assert.Equal(10, await JobCountAsync()); // +2 periodic（其余桶未变）
+        Assert.Equal(11, await JobCountAsync()); // +2 periodic（其余桶含 bill-query 扫描桶未变）
     }
 
     [Fact]

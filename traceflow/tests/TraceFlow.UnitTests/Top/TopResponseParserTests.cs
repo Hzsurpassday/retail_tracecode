@@ -124,4 +124,35 @@ public class TopResponseParserTests
         Assert.Equal(TopOutcomeKind.SystemError, o2.Kind);
         Assert.Equal("[]", o2.ResultJson);
     }
+
+    /// <summary>R-M3-2：billstatus 候选结构把业务体放在 model（无 result），必须回退 model 作为 ResultJson。</summary>
+    [Fact]
+    public void Missing_result_falls_back_to_model_node()
+    {
+        var biz = """{"response_success":true,"request_id":"req-m","model":{"result_type":"1","sub_process_flag":null}}""";
+        var o = TopResponseParser.Parse(true, null, biz, null);
+        Assert.Equal(TopOutcomeKind.Success, o.Kind);
+        Assert.Equal("req-m", o.RequestId);
+        Assert.NotNull(o.ResultJson);
+        Assert.Contains("result_type", o.ResultJson);
+        Assert.DoesNotContain("response_success", o.ResultJson);
+    }
+
+    [Fact]
+    public void Result_node_wins_over_model_when_both_present()
+    {
+        var biz = """{"response_success":true,"result":{"bill_code":"B1"},"model":{"bill_code":"B2"}}""";
+        var o = TopResponseParser.Parse(true, null, biz, null);
+        Assert.NotNull(o.ResultJson);
+        Assert.Contains("B1", o.ResultJson);
+        Assert.DoesNotContain("B2", o.ResultJson);
+    }
+
+    [Fact]
+    public void Neither_result_nor_model_leaves_result_json_null()
+    {
+        var o = TopResponseParser.Parse(true, null, """{"response_success":true,"request_id":"r"}""", null);
+        Assert.Equal(TopOutcomeKind.Success, o.Kind);
+        Assert.Null(o.ResultJson);
+    }
 }

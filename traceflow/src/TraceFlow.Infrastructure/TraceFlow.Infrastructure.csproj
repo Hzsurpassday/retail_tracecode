@@ -4,6 +4,11 @@
     <ProjectReference Include="..\TraceFlow.Application\TraceFlow.Application.csproj" />
   </ItemGroup>
 
+  <!-- 故障注入套件（AT-068）：UploadDispatchService 的 beforeSend/afterSend/beforeCommit 钩子仅测试可见。 -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="TraceFlow.IntegrationTests" />
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="Dapper" Version="2.1.35" />
     <PackageReference Include="Microsoft.Data.SqlClient" Version="5.2.2" />
