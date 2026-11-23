@@ -51,6 +51,11 @@ builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Top.TopClientSe
     sp.GetRequiredService<TraceFlow.Infrastructure.Top.RateBudgetService>(),
     sp.GetRequiredService<TraceFlow.Infrastructure.Top.ChannelPauseService>(),
     sp.GetRequiredService<IAuditLog>()));
+builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Upstream.UpstreamDownloadService(
+    connectionString, sp.GetRequiredService<TraceFlow.Infrastructure.Top.TopClientService>(),
+    sp.GetRequiredService<IJobQueue>(), sp.GetRequiredService<IAuditLog>()));
+builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Jobs.UpstreamDownloadJobHandler(
+    sp.GetRequiredService<TraceFlow.Infrastructure.Upstream.UpstreamDownloadService>()));
 builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Sources.SyncScheduler(
     connectionString, sp.GetRequiredService<IJobQueue>(),
     sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(), env));

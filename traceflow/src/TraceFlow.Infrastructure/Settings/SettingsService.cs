@@ -35,6 +35,7 @@ public sealed class SettingsService
         ["supplier.auditPassValues"] = new("supplier.auditPassValues", false, "[]", "stringArray", 0, 0),
         ["import.maxFileBytes"] = new("import.maxFileBytes", false, "20971520", "int", 1024, 104857600),
         ["import.maxRows"] = new("import.maxRows", false, "10000", "int", 1, 100000),
+        ["upstream.pollSeconds"] = new("upstream.pollSeconds", false, "300", "int", 30, 3600),
     };
 
     private readonly string _cs;
@@ -184,6 +185,9 @@ WHERE setting_key=@k AND ver=@ver",
 
     public async Task<(long MaxFileBytes, int MaxRows)> GetImportBoundsAsync(CancellationToken ct)
         => (await GetIntAsync("import.maxFileBytes", ct), (int)await GetIntAsync("import.maxRows", ct));
+
+    public async Task<int> GetUpstreamPollSecondsAsync(CancellationToken ct)
+        => (int)await GetIntAsync("upstream.pollSeconds", ct);
 
     public async Task<string> GetSecretAsync(string key, CancellationToken ct)
     {

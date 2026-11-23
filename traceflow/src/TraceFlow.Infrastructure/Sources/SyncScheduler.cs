@@ -9,7 +9,7 @@ namespace TraceFlow.Infrastructure.Sources;
 /// <summary>
 /// 周期调度（SYNC-04）：30 秒轮询桶 + 每日全量回扫 + 5 分钟匹配桶。
 /// 意图键含时间桶→outbox UQ(org,env,kind,intent) 天然去重，多实例并发安全。
-/// 仅 MOCK（M1）；暂停通道跳过 source-sync（master-match 为本地计算，继续）。
+/// 仅 MOCK（M1）；暂停通道跳过 source-sync/upstream-download（master-match 为本地计算，继续）。
 /// </summary>
 public sealed class SyncScheduler
 {
@@ -35,6 +35,7 @@ public sealed class SyncScheduler
             "SELECT id FROM dbo.organization WHERE is_active=1", cancellationToken: ct));
         if (orgId is null) return 0;
         var policy = await _settings.GetSyncPolicyAsync(ct);
+        var upstreamPoll = await _settings.GetUpstreamPollSecondsAsync(ct);
         var paused = await _settings.IsChannelPausedAsync(ct);
         var unix = new DateTimeOffset(nowUtc).ToUnixTimeSeconds();
         var n = 0;
@@ -52,6 +53,10 @@ public sealed class SyncScheduler
                     $"daily:{entity}:{nowUtc:yyyyMMdd}", dailyPayload, nowUtc, ct);
                 n++;
             }
+            var upPayload = JsonSerializer.Serialize(new { orgId = orgId.Value, env = _env, trigger = "periodic", start = nowUtc.AddDays(-7), end = nowUtc });
+            await _queue.EnqueueAsync(c, tx, orgId.Value, _env, "upstream-download",
+                $"periodic:{unix / upstreamPoll}", upPayload, nowUtc, ct);
+            n++;
         }
         var matchPayload = JsonSerializer.Serialize(new { orgId = orgId.Value, env = _env, entity = (string?)null, trigger = "periodic" });
         await _queue.EnqueueAsync(c, tx, orgId.Value, _env, "master-match",

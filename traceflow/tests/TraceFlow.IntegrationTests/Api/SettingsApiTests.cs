@@ -95,7 +95,7 @@ IF NOT EXISTS (SELECT 1 FROM dbo.user_permission WHERE user_id=@id AND permissio
         Assert.Equal(JsonValueKind.String, root.GetProperty("requestId").ValueKind);
         var data = root.GetProperty("data");
         Assert.Equal(JsonValueKind.Array, data.ValueKind);
-        Assert.Equal(12, data.GetArrayLength()); // SettingsService.Catalog 全目录（含未持久化默认值）
+        Assert.Equal(13, data.GetArrayLength()); // SettingsService.Catalog 全目录（含未持久化默认值）；T5 +upstream.pollSeconds（brief 遗漏的目录计数锁，同 Step 6b 型同步）
         foreach (var el in data.EnumerateArray())
         {
             // camelCase 记录形状（Results.Json Web）；id 为 JSON number（内部 int64 代理，裁决 #9）

@@ -43,8 +43,9 @@ public sealed class WorkerHostedService : BackgroundService
                         }
                         catch (Exception ex)
                         {
-                            // 有限退避（JOB-03/04 参数化在 M2/M3 细化）；不 tight loop
-                            var delay = TimeSpan.FromSeconds(Math.Min(600, 30 * Math.Pow(2, Math.Min(job.AttemptCount, 5))));
+                            var delay = ex is TopRateLimitedException rle
+                                ? rle.Wait
+                                : TimeSpan.FromSeconds(Math.Min(600, 30 * Math.Pow(2, Math.Min(job.AttemptCount, 5))));
                             await _queue.RescheduleAsync(job.Id, _workerId, job.FencingToken, DateTime.UtcNow + delay, ex.Message, stoppingToken);
                         }
                         continue; // 立即尝试下一个

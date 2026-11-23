@@ -1,0 +1,28 @@
+[
+  {
+    "match": { "page_no": "1" },
+    "response": {
+      "alibaba_alihealth_drugtrace_top_listupout_detail_response": {
+        "response_success": true,
+        "request_id": "fixture-detail-1",
+        "result": {
+          "total_pages": 1,
+          "page_no": 1,
+          "lines": [
+            {
+              "platform_line_id": "FIX-L1",
+              "platform_drug_id": "FIX-PD1",
+              "batch_no": "P20260101",
+              "quantity": 1,
+              "unit": "盒",
+              "package_level": "MIN",
+              "codes": [
+                { "code": "81234567890123456799", "package_level": "MIN", "parent_code": null }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+]
