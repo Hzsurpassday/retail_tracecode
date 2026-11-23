@@ -28,7 +28,10 @@ public sealed record RetailTaskContext(long OrgId, string Env, long SnapshotId, 
     public IReadOnlyDictionary<long, long>? PredecessorEventByCodeId { get; init; }
 }
 
-/// <summary>PartIds 按 part_index 升序；Reused=true 表示复用既有任务（未新建/未复活）。</summary>
+/// <summary>
+/// PartIds 按 part_index 升序，且仅含 state &lt;&gt; 'Cancelled' 的分片（分片收缩后遗留的取消分片不返回）。
+/// Reused=true 表示复用既有任务（未新建/未复活/未提升）。
+/// </summary>
 public sealed record RetailTaskResult(long TaskId, IReadOnlyList<long> PartIds, bool Reused);
 
 /// <summary>
@@ -36,6 +39,8 @@ public sealed record RetailTaskResult(long TaskId, IReadOnlyList<long> PartIds, 
 /// upload_task + 多分片 + 每分片 outbox + 逐码 T2 占用（RETAIL:321 / RETURN:116）+ code_event。
 /// 分片按行顺序装填且单行不可拆（行码数 &gt; upload.part.maxCodes → 422 PART_TOO_LARGE）；
 /// bill_code = BillCodeGenerator(contract, taskId, partIndex)（P1/P2 后缀），Cancelled 复活不换单号。
+/// Blocked + RETURN_CONFIRM_REQUIRED（116 人工确认）走同一绑定写路径，但任务保持 Blocked，
+/// 由 Task 6 确认服务在确认事务内执行 Blocked→Ready；其他 Blocked 原因拒绝复用（REUSE_STATE_INVALID）。
 /// 调用方负责事务边界与提交；本类只抛出异常，不做回滚。
 /// </summary>
 public sealed class RetailTaskFactory
@@ -43,6 +48,9 @@ public sealed class RetailTaskFactory
     public const string Retail321 = "RETAIL_321";
     public const string ConsumerReturn116 = "CONSUMER_RETURN_116";
     private const string CancelledState = "Cancelled";
+    private const string BlockedState = "Blocked";
+    private const string ReturnConfirmRequired = "RETURN_CONFIRM_REQUIRED";
+    private const int ClaimGateBatch = 500;
 
     private readonly SettingsService _settings;
     private readonly IJobQueue _queue;
@@ -63,7 +71,8 @@ public sealed class RetailTaskFactory
 
         var eventKey = $"KSOA:{ctx.DocKey}:{ctx.TaskType}";
         var maxCodes = await _settings.GetPartMaxCodesAsync(ct);
-        var buckets = Split(ctx.Lines, maxCodes);
+        var buckets = Split(ctx.Lines, maxCodes); // 先分片：PART_TOO_LARGE 在任何写入前抛出
+        await ValidatePredecessorsAsync(conn, tx, ctx, ct);
         var predecessorTaskId = await ResolvePredecessorTaskAsync(conn, tx, ctx, ct);
         var predecessorBillCodes = predecessorTaskId is null
             ? Array.Empty<string>()
@@ -76,36 +85,53 @@ public sealed class RetailTaskFactory
         var mappingSnapshot = Sha(ctx.MappingDigest);
 
         var existing = await conn.QuerySingleOrDefaultAsync<ExistingRow>(new CommandDefinition(@"
-SELECT id,state FROM dbo.upload_task WITH (UPDLOCK, HOLDLOCK) WHERE org_id=@orgId AND env=@env AND event_key=@key",
+SELECT id,state,state_reason,source_snapshot_id,source_hash
+FROM dbo.upload_task WITH (UPDLOCK, HOLDLOCK) WHERE org_id=@orgId AND env=@env AND event_key=@key",
             new { orgId = ctx.OrgId, env = ctx.Env, key = eventKey }, tx, cancellationToken: ct));
-        if (existing is not null && existing.state != CancelledState)
+
+        // 复用既有活动任务：来源漂移即拒绝（载荷已发送/已接受，不可改写）。
+        if (existing is not null && existing.state != CancelledState && existing.state != BlockedState)
         {
+            if (existing.source_snapshot_id != ctx.SnapshotId
+                || !string.Equals(existing.source_hash, ctx.SourceHash, StringComparison.Ordinal))
+                throw new AllocationConflictException("SOURCE_CHANGED",
+                    $"事件键 {eventKey} 已绑定其他来源快照/摘要，禁止复用改写载荷");
             var reusedPartIds = (await conn.QueryAsync<long>(new CommandDefinition(
-                "SELECT id FROM dbo.upload_part WHERE task_id=@id ORDER BY part_index",
+                "SELECT id FROM dbo.upload_part WHERE task_id=@id AND state<>N'Cancelled' ORDER BY part_index",
                 new { id = existing.id }, tx, cancellationToken: ct))).ToList();
             return new RetailTaskResult(existing.id, reusedPartIds, true);
         }
 
-        var reactivating = existing is not null;
+        var promote = false; // Blocked + RETURN_CONFIRM_REQUIRED：全量绑定写，但任务保持 Blocked
         long taskId;
         if (existing is not null)
         {
             var sent = await conn.ExecuteScalarAsync<int>(new CommandDefinition(
                 "SELECT COUNT(*) FROM dbo.upload_attempt WHERE task_id=@id AND attempt_kind=N'UPLOAD'",
                 new { id = existing.id }, tx, cancellationToken: ct));
-            if (sent > 0)
-                throw new AllocationConflictException("REACTIVATE_REFUSED", "Cancelled 任务已有 UPLOAD 尝试，禁止同行复活");
+            if (existing.state == CancelledState)
+            {
+                if (sent > 0)
+                    throw new AllocationConflictException("REACTIVATE_REFUSED", "Cancelled 任务已有 UPLOAD 尝试，禁止同行复活");
+            }
+            else // Blocked：仅人工确认中的退货任务可提升，其余 Blocked 原因（WAIT_DEPENDENCY 等）拒绝改写
+            {
+                if (!string.Equals(existing.state_reason, ReturnConfirmRequired, StringComparison.Ordinal) || sent > 0)
+                    throw new AllocationConflictException("REUSE_STATE_INVALID",
+                        $"任务处于 {existing.state}/{existing.state_reason}，不可复用写入");
+                promote = true;
+            }
             taskId = existing.id;
-            await conn.ExecuteAsync(new CommandDefinition(@"
-UPDATE dbo.upload_task SET state=N'Ready', state_reason=N'Cancelled 任务复活（从未发送）',
-       source_snapshot_id=@snap, source_hash=@sh, payload_json=@pj, payload_hash=@ph, mapping_version_snapshot=@mv,
-       source_integrity=N'COMPLETE', match_state=N'COMPLETE', verification_state=N'PASSED', dependency_state=N'NONE',
-       predecessor_task_id=@pred, version=version+1
-WHERE id=@id",
-                new { id = taskId, snap = ctx.SnapshotId, sh = ctx.SourceHash, pj = payloadJson, ph = payloadHash,
-                      mv = mappingSnapshot, pred = predecessorTaskId }, tx, cancellationToken: ct));
         }
         else
+        {
+            taskId = 0;
+        }
+
+        // 失败先行：绑定前以 UPDLOCK/HOLDLOCK 读同范围 ACTIVE 占用；任意外来占用（含无任务占用）即冲突，零写入。
+        await AssertClaimsAvailableAsync(conn, tx, ctx, ClaimScope(ctx.TaskType), existing?.id, ct);
+
+        if (existing is null)
         {
             taskId = await conn.ExecuteScalarAsync<long>(new CommandDefinition(@"
 INSERT INTO dbo.upload_task(org_id,env,event_key,task_type,source_snapshot_id,source_hash,mapping_version_snapshot,
@@ -116,8 +142,27 @@ VALUES(@orgId,@env,@key,@taskType,@snap,@sh,@mv,@pj,@ph,N'Ready',N'COMPLETE',N'C
                       sh = ctx.SourceHash, mv = mappingSnapshot, pj = payloadJson, ph = payloadHash, pred = predecessorTaskId },
                 tx, cancellationToken: ct));
         }
+        else
+        {
+            // 提升保留 Blocked/原因（Task 6 确认后才 Blocked→Ready）；Cancelled 复活直接 Ready。
+            await conn.ExecuteAsync(new CommandDefinition(@"
+UPDATE dbo.upload_task SET state=@state, state_reason=@reason,
+       source_snapshot_id=@snap, source_hash=@sh, payload_json=@pj, payload_hash=@ph, mapping_version_snapshot=@mv,
+       source_integrity=N'COMPLETE', match_state=N'COMPLETE', verification_state=N'PASSED', dependency_state=N'NONE',
+       predecessor_task_id=@pred, version=version+1
+WHERE id=@id",
+                new
+                {
+                    id = taskId, state = promote ? BlockedState : "Ready",
+                    reason = promote ? existing.state_reason : "Cancelled 任务复活（从未发送）",
+                    snap = ctx.SnapshotId, sh = ctx.SourceHash, pj = payloadJson, ph = payloadHash,
+                    mv = mappingSnapshot, pred = predecessorTaskId,
+                }, tx, cancellationToken: ct));
+        }
 
-        var partIds = await UpsertPartsAsync(conn, tx, ctx, eventKey, taskId, buckets, maxCodes, reactivating, predecessorBillCodes, ct);
+        var reuseExistingParts = existing is not null;
+        var partIds = await UpsertPartsAsync(conn, tx, ctx, eventKey, taskId, buckets, maxCodes, reuseExistingParts,
+            predecessorBillCodes, ct);
         await InsertClaimsAsync(conn, tx, ctx, taskId, ClaimScope(ctx.TaskType), ct);
         await InsertEventsAsync(conn, tx, ctx, taskId, ct);
         return new RetailTaskResult(taskId, partIds, false);
@@ -149,14 +194,15 @@ VALUES(@orgId,@env,@key,@taskType,@snap,@sh,@mv,@pj,@ph,N'Ready',N'COMPLETE',N'C
     }
 
     /// <summary>
-    /// 逐分片落库：复活时复用既有 part_index → bill_code（不换单号），分片数变少的多余分片行政性取消；
-    /// 每个分片一条 upload-dispatch（intent part:{partId}，trigger sale-verify），CANCELLED 队列行复位。
+    /// 逐分片落库：Cancelled 复活 / Blocked 确认提升时复用既有 part_index → bill_code（不换单号），
+    /// 分片数变少的多余分片行政性取消；每个分片一条 upload-dispatch（intent part:{partId}，trigger sale-verify），
+    /// CANCELLED 队列行复位。
     /// </summary>
     private async Task<IReadOnlyList<long>> UpsertPartsAsync(SqlConnection conn, SqlTransaction tx, RetailTaskContext ctx,
-        string eventKey, long taskId, IReadOnlyList<List<RetailLine>> buckets, int maxCodes, bool reactivating,
+        string eventKey, long taskId, IReadOnlyList<List<RetailLine>> buckets, int maxCodes, bool reuseExistingParts,
         IReadOnlyList<string> predecessorBillCodes, CancellationToken ct)
     {
-        var existingParts = reactivating
+        var existingParts = reuseExistingParts
             ? (await conn.QueryAsync<PartRow>(new CommandDefinition(
                 "SELECT id, part_index, bill_code FROM dbo.upload_part WHERE task_id=@id ORDER BY part_index",
                 new { id = taskId }, tx, cancellationToken: ct))).ToList()
@@ -213,7 +259,7 @@ WHERE org_id=@orgId AND env=@env AND job_kind=N'upload-dispatch' AND intent_key=
         return partIds;
     }
 
-    /// <summary>T2 占用：每码一条 ACTIVE（scope 与 M2 的 PURCHASE_IN 分开）；同任务已持有的占用不重复插入，其余冲突 2601/2627 → CODE_CONTENDED。</summary>
+    /// <summary>T2 占用：每码一条 ACTIVE（scope 与 M2 的 PURCHASE_IN 分开）；同任务已持有的占用不重复插入，其余冲突 2601/2627 → 409 CODE_CONTENDED。</summary>
     private static async Task InsertClaimsAsync(SqlConnection conn, SqlTransaction tx, RetailTaskContext ctx, long taskId,
         string scope, CancellationToken ct)
     {
@@ -233,11 +279,66 @@ VALUES(@orgId,@env,@codeId,@scope,@taskId,NULL,N'ACTIVE')",
                 }
                 catch (SqlException ex) when (ex.Number is 2601 or 2627)
                 {
-                    // 唯一索引 UX_claim_active 争用：由调用方回滚整个事务（无半成品任务）。
-                    throw new AllocationValidationException("CODE_CONTENDED",
+                    // 唯一索引 UX_claim_active 争用（失败先行门禁之后仍可能并发插入）：由调用方回滚整个事务。
+                    throw new AllocationConflictException("CODE_CONTENDED",
                         $"码 {code.CodeNormalized} 在 {scope} 范围已被其他有效任务占用");
                 }
             }
+    }
+
+    /// <summary>
+    /// 失败先行占用门禁：写入前以 UPDLOCK/HOLDLOCK 读同 scope/org/env 的 ACTIVE 占用。
+    /// 同任务（taskId 非空）已持有的占用允许；upload_task_id 为空或属于其他任务 → 冲突，调用方回滚且零写入。
+    /// 分批查询避免超过 2100 个参数上限。
+    /// </summary>
+    private static async Task AssertClaimsAvailableAsync(SqlConnection conn, SqlTransaction tx, RetailTaskContext ctx,
+        string scope, long? taskId, CancellationToken ct)
+    {
+        var codeIds = ctx.Lines.SelectMany(l => l.Codes.Select(c => c.CodeId)).Distinct().ToList();
+        for (var offset = 0; offset < codeIds.Count; offset += ClaimGateBatch)
+        {
+            var batch = codeIds.Skip(offset).Take(ClaimGateBatch).ToList();
+            var contended = await conn.ExecuteScalarAsync<int>(new CommandDefinition(@"
+SELECT COUNT(*) FROM dbo.code_claim WITH (UPDLOCK, HOLDLOCK)
+WHERE claim_state=N'ACTIVE' AND event_scope=@scope AND org_id=@orgId AND env=@env AND code_id IN @codes
+  AND (upload_task_id IS NULL OR upload_task_id<>@taskId)",
+                new { orgId = ctx.OrgId, env = ctx.Env, scope, codes = batch, taskId = taskId ?? -1L },
+                tx, cancellationToken: ct));
+            if (contended > 0)
+                throw new AllocationConflictException("CODE_CONTENDED",
+                    $"提交的码中有 {contended} 个已在 {scope} 范围被其他有效任务占用");
+        }
+    }
+
+    /// <summary>
+    /// 116 前序映射校验：每个码必须给出前序事件，且该 code_event 必须存在、code_id 与码一致。
+    /// 任一缺失/错配 → PREDECESSOR_INVALID（在任何写入前抛出）。
+    /// </summary>
+    private static async Task ValidatePredecessorsAsync(SqlConnection conn, SqlTransaction tx,
+        RetailTaskContext ctx, CancellationToken ct)
+    {
+        if (ctx.TaskType != ConsumerReturn116) return;
+        var map = ctx.PredecessorEventByCodeId;
+        var codeIds = ctx.Lines.SelectMany(l => l.Codes.Select(c => c.CodeId)).Distinct().ToList();
+        if (map is null || codeIds.Any(id => !map.ContainsKey(id)))
+            throw new AllocationValidationException("PREDECESSOR_INVALID", "退货码缺少前序销售事件映射");
+
+        var eventIds = map.Values.Distinct().ToList();
+        var codeByEventId = new Dictionary<long, long>();
+        for (var offset = 0; offset < eventIds.Count; offset += ClaimGateBatch)
+        {
+            var batch = eventIds.Skip(offset).Take(ClaimGateBatch).ToList();
+            var rows = await conn.QueryAsync<EventCodeRow>(new CommandDefinition(@"
+SELECT id, code_id FROM dbo.code_event WHERE org_id=@orgId AND env=@env AND id IN @ids",
+                new { orgId = ctx.OrgId, env = ctx.Env, ids = batch }, tx, cancellationToken: ct));
+            foreach (var row in rows) codeByEventId[row.id] = row.code_id;
+        }
+        foreach (var pair in map)
+        {
+            if (!codeByEventId.TryGetValue(pair.Value, out var eventCodeId) || eventCodeId != pair.Key)
+                throw new AllocationValidationException("PREDECESSOR_INVALID",
+                    $"码 {pair.Key} 的前序事件 {pair.Value} 不存在或归属其他码");
+        }
     }
 
     /// <summary>321 → 每码 SALE/OUT；116 → 每码 CONSUMER_RETURN/IN（predecessor_event_id 由调用方映射，缺省 NULL）。</summary>
@@ -332,6 +433,15 @@ SELECT upload_task_id FROM dbo.code_event WHERE id IN @ids AND upload_task_id IS
     {
         public long id { get; set; }
         public string state { get; set; } = "";
+        public string? state_reason { get; set; }
+        public long? source_snapshot_id { get; set; }
+        public string source_hash { get; set; } = "";
+    }
+
+    private sealed class EventCodeRow
+    {
+        public long id { get; set; }
+        public long code_id { get; set; }
     }
 
     private sealed class PartRow
