@@ -31,6 +31,9 @@ GO
 -- 按码回查（trace_code → 结论）走此索引；与 UQ_vcode 的 (verification_id, code_id) 前缀互补
 CREATE INDEX IX_vcode_code ON dbo.verification_code(code_id);
 GO
+-- 核验兜底/源同步入队按「快照 + 是否当前 + 结论状态」判重（SyncScheduler/SourceSyncJobHandler），避免扫全表
+CREATE INDEX IX_verif_snapshot ON dbo.verification(source_snapshot_id, is_current, state);
+GO
 CREATE TABLE dbo.return_confirmation (
   id bigint IDENTITY(1,1) NOT NULL CONSTRAINT PK_return_confirmation PRIMARY KEY,
   org_id bigint NOT NULL CONSTRAINT FK_retconf_org REFERENCES dbo.organization(id),

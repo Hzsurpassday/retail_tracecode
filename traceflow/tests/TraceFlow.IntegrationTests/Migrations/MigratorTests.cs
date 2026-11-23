@@ -63,8 +63,8 @@ public class Migration0009Tests : IClassFixture<Sql2008Fixture>
         var row = await c.QuerySingleAsync<(string name, string checksum)>(
             "SELECT name, checksum FROM dbo.schema_version WHERE version=9 AND success=1");
         Assert.StartsWith("0009_", row.name);
-        // 0009 在本未合并分支上仍在演进（本轮加索引），期望值随文件字节更新；0001–0008 见下一用例（不可变）。
-        Assert.Equal("23E10ACA2D01A7A76DBB0A7E0E8A16FF28A2031D71E2C53400989F2C32442C1F",
+        // 0009 在本未合并分支上仍在演进（本轮加索引 + 核验兜底索引），期望值随文件字节更新；0001–0008 见下一用例（不可变）。
+        Assert.Equal("99643903AC84A930CB1FD9E633445081F5CFE3E23E91557C7F3952E13D51D6BB",
             row.checksum.Trim(), StringComparer.OrdinalIgnoreCase);
     }
 

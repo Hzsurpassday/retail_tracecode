@@ -55,6 +55,12 @@ public class SaleVerificationTests : IAsyncLifetime
     private static TopRawResponse RateLimited() => new(true, 200,
         """{"code":7,"sub_code":"FAIL_BIZ_RATE_LIMIT","sub_msg":"触发限流"}""", null, 30);
 
+    private static TopRawResponse PlatformNotFound() => new(true, 200, null,
+        """{"response_success":true,"request_id":"r-404","result":{"_verified":false,"model":{"exists":false,"instore":false}}}""", null);
+
+    private static TopRawResponse BusinessRejected() => new(true, 200, null,
+        """{"response_success":false,"msg_code":"40004","sub_msg":"码不在当前企业","request_id":"r-rejected"}""", null);
+
     /// <summary>20 位 8 前缀码（同库内按 n 唯一）。</summary>
     private static string Code(int n) => "8" + n.ToString("D19");
 
@@ -90,6 +96,10 @@ INSERT INTO dbo.trace_code(code_normalized,code_raw,format) VALUES(@code,@code,N
 SELECT id FROM dbo.trace_code WHERE code_normalized=@code", new { code });
 
     private async Task<Seed> SeedSaleAsync(SqlConnection c, string docKey, params LineSeed[] lines)
+        => await SeedSaleVersionAsync(c, docKey, 1, lines);
+
+    /// <summary>同单据新版本快照（version 递增、来源摘要随版本变化）：验证规则版本/退货占位刷新等重算路径。</summary>
+    private async Task<Seed> SeedSaleVersionAsync(SqlConnection c, string docKey, int version, params LineSeed[] lines)
     {
         var (orgId, sysId) = await TestSeed.EnsureAsync(c);
         foreach (var spid in lines.Select(l => l.Spid).Distinct(StringComparer.Ordinal))
@@ -99,8 +109,9 @@ SELECT id FROM dbo.trace_code WHERE code_normalized=@code", new { code });
         }
         var snapId = await c.ExecuteScalarAsync<long>(@"
 INSERT INTO dbo.source_snapshot(org_id,source_system_id,source_document_key,document_type,version,completeness_status,content_hash,business_datetime)
-OUTPUT INSERTED.id VALUES(@orgId,@sysId,@key,N'SALE',1,N'COMPLETE',@hash,@biz)",
-            new { orgId, sysId, key = docKey, hash = Sha256(docKey), biz = new DateTime(2026, 11, 20, 6, 0, 0) });
+OUTPUT INSERTED.id VALUES(@orgId,@sysId,@key,N'SALE',@ver,N'COMPLETE',@hash,@biz)",
+            new { orgId, sysId, key = docKey, ver = version, hash = Sha256(docKey + "#" + version),
+                  biz = new DateTime(2026, 11, 20, 6, 0, 0) });
         var lineIds = new List<(long LineId, string Key)>();
         var codeIds = new Dictionary<string, long>(StringComparer.Ordinal);
         foreach (var line in lines)
@@ -114,13 +125,30 @@ OUTPUT INSERTED.id VALUES(@snapId,@key,@spid,@qty,N'盒',N'B2026',@raw,@norm,@fm
                 {
                     snapId, key = line.Key, spid = line.Spid, qty = line.Qty, raw = line.Code,
                     norm = normalized.Normalized, fmt = CodeFormatStorage.ToToken(normalized.Format),
-                    hash = Sha256(docKey + "|" + line.Key), kind = line.EventKind,
+                    hash = Sha256(docKey + "#" + version + "|" + line.Key), kind = line.EventKind,
                 });
             lineIds.Add((lineId, line.Key));
             if (normalized.Normalized is not null && !codeIds.ContainsKey(normalized.Normalized))
                 codeIds[normalized.Normalized] = await EnsureCodeAsync(c, normalized.Normalized);
         }
         return new Seed(orgId, sysId, snapId, lineIds, codeIds);
+    }
+
+    /// <summary>他人的 321 任务 + 同码 ACTIVE 占用：用于复核阻断不越界与 CODE_CONTENDED 争用。</summary>
+    private static async Task<long> SeedOtherTaskWithClaimAsync(SqlConnection c, long orgId, string code, string key)
+    {
+        var codeId = await EnsureCodeAsync(c, code);
+        var taskId = await c.ExecuteScalarAsync<long>(@"
+INSERT INTO dbo.upload_task(org_id,env,event_key,task_type,source_hash,payload_hash,state,source_integrity,match_state,
+    verification_state,dependency_state)
+OUTPUT INSERTED.id
+VALUES(@orgId,N'MOCK',@key,N'RETAIL_321',@hash,@hash,N'Blocked',N'COMPLETE',N'COMPLETE',N'PASSED',N'NONE')",
+            new { orgId, key = "KSOA:" + key + ":RETAIL_321", hash = Sha256(key) });
+        await c.ExecuteAsync(@"
+INSERT INTO dbo.code_claim(org_id,env,code_id,event_scope,upload_task_id,claim_state)
+VALUES(@orgId,N'MOCK',@codeId,N'RETAIL:321',@taskId,N'ACTIVE')",
+            new { orgId, codeId, taskId });
+        return taskId;
     }
 
     /// <summary>播种前序采购入库：code_event(PURCHASE_IN) 指向指定状态的任务（Succeeded 才满足依赖）。</summary>
@@ -518,4 +546,332 @@ JOIN dbo.trace_code tc ON tc.id=vc.code_id WHERE vc.verification_id=@id", new { 
             "SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'sale-verify' AND intent_key=@k",
             new { k = $"snapshot:{seed.SnapshotId}" }));
     }
+
+    // ---------- Fix Round 1（评审 HIGH 1/2/3、MEDIUM 4/5/7） ----------
+
+    [Fact]
+    public async Task Return_only_doc_creates_116_placeholder_and_no_321()
+    {
+        await using var c = await _fx.OpenAsync();
+        var returnCode = Code(20);
+        var seed = await SeedSaleAsync(c, "SALE-F1",
+            new LineSeed("1", "SP0001", -1, "CONSUMER_RETURN", returnCode));
+
+        var id = await NewService(_ => throw new InvalidOperationException("退货行不做平台核验"))
+            .VerifySnapshotAsync(seed.SnapshotId, default);
+
+        Assert.Equal("PASSED", await ScalarAsync<string>("SELECT state FROM dbo.verification WHERE id=@id", new { id }));
+        Assert.Equal(1, await ScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.verification WHERE id=@id AND upload_task_id IS NULL", new { id }));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.upload_task WHERE task_type=N'RETAIL_321'"));
+        var returnTaskId = await ScalarAsync<long>(
+            "SELECT id FROM dbo.upload_task WHERE event_key=N'KSOA:SALE-F1:CONSUMER_RETURN_116'");
+        Assert.Equal("Blocked", await ScalarAsync<string>("SELECT state FROM dbo.upload_task WHERE id=@id", new { id = returnTaskId }));
+        Assert.Equal("RETURN_CONFIRM_REQUIRED", await ScalarAsync<string>(
+            "SELECT state_reason FROM dbo.upload_task WHERE id=@id", new { id = returnTaskId }));
+        Assert.Contains(returnCode, await ScalarAsync<string>(
+            "SELECT payload_json FROM dbo.upload_task WHERE id=@id", new { id = returnTaskId }));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.upload_part"));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.code_claim"));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.outbox_job"));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.verification_code"));
+    }
+
+    [Fact]
+    public async Task All_exempt_doc_passes_without_task()
+    {
+        await using var c = await _fx.OpenAsync();
+        var seed = await SeedSaleAsync(c, "SALE-F2",
+            new LineSeed("1", "SP0001", 2, "SALE", null, "EXEMPT", "OTC 不纳入追溯"));
+
+        var id = await NewService(_ => throw new InvalidOperationException("全 EXEMPT 不应查平台"))
+            .VerifySnapshotAsync(seed.SnapshotId, default);
+
+        Assert.Equal("PASSED", await ScalarAsync<string>("SELECT state FROM dbo.verification WHERE id=@id", new { id }));
+        Assert.Contains(SaleVerificationService.ReasonNoUploadableLines, await ScalarAsync<string>(
+            "SELECT result_json FROM dbo.verification WHERE id=@id", new { id }));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.upload_task"));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.verification_code"));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.outbox_job"));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.code_claim"));
+    }
+
+    [Fact]
+    public async Task Rule_version_change_reevaluates_passed_snapshot()
+    {
+        await using var c = await _fx.OpenAsync();
+        var code = Code(21);
+        var seed = await SeedSaleAsync(c, "SALE-F3", new LineSeed("1", "SP0001", 1, "SALE", code));
+        await SeedPurchaseAsync(c, seed, code, "Succeeded");
+        var svc = NewService(_ => throw new InvalidOperationException("依赖已满足，不应查平台"));
+
+        var first = await svc.VerifySnapshotAsync(seed.SnapshotId, default);
+        Assert.Equal("PASSED", await ScalarAsync<string>("SELECT state FROM dbo.verification WHERE id=@id", new { id = first }));
+        Assert.Equal("M3-1", await ScalarAsync<string>("SELECT rule_version FROM dbo.verification WHERE id=@id", new { id = first }));
+
+        await SetSettingAsync("sale.verify.ruleVersion", "\"M3-2\"");
+        var second = await svc.VerifySnapshotAsync(seed.SnapshotId, default);
+
+        Assert.NotEqual(first, second); // 规则版本变化 → 不得复用已定局 PASSED
+        Assert.Equal(2, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.verification"));
+        Assert.Equal(1, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.verification WHERE is_current=1"));
+        Assert.Equal("M3-2", await ScalarAsync<string>(
+            "SELECT rule_version FROM dbo.verification WHERE id=@id AND is_current=1", new { id = second }));
+        Assert.Equal(1, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.upload_task WHERE task_type=N'RETAIL_321'"));
+        Assert.Equal("Ready", await ScalarAsync<string>(
+            "SELECT state FROM dbo.upload_task WHERE event_key=N'KSOA:SALE-F3:RETAIL_321'"));
+        Assert.Equal(1, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.upload_part"));
+    }
+
+    [Fact]
+    public async Task Failed_reverification_cancels_unsent_parts_jobs_and_claims()
+    {
+        await using var c = await _fx.OpenAsync();
+        var code = Code(22);
+        var seed = await SeedSaleAsync(c, "SALE-F4", new LineSeed("1", "SP0001", 1, "SALE", code));
+        await SeedPurchaseAsync(c, seed, code, "Succeeded");
+        var svc = NewService(_ => throw new InvalidOperationException("依赖已满足，不应查平台"));
+        var first = await svc.VerifySnapshotAsync(seed.SnapshotId, default);
+        Assert.Equal("PASSED", await ScalarAsync<string>("SELECT state FROM dbo.verification WHERE id=@id", new { id = first }));
+        var taskId = await ScalarAsync<long>("SELECT id FROM dbo.upload_task WHERE event_key=N'KSOA:SALE-F4:RETAIL_321'");
+        // 其他任务的占用：复核阻断不得越界
+        var otherTaskId = await SeedOtherTaskWithClaimAsync(c, seed.OrgId, Code(23), "SALE-F4-OTHER");
+
+        var v2 = await SeedSaleVersionAsync(c, "SALE-F4", 2, new LineSeed("1", "SP0001", 1, "SALE", Code(24)));
+        var failed = await NewService(_ => PlatformNotFound()).VerifySnapshotAsync(v2.SnapshotId, default);
+
+        Assert.Equal("FAILED", await ScalarAsync<string>("SELECT state FROM dbo.verification WHERE id=@id", new { id = failed }));
+        Assert.Equal("Blocked", await ScalarAsync<string>("SELECT state FROM dbo.upload_task WHERE id=@id", new { id = taskId }));
+        Assert.StartsWith("VERIFY_FAILED:", await ScalarAsync<string>(
+            "SELECT state_reason FROM dbo.upload_task WHERE id=@id", new { id = taskId }));
+        Assert.Equal(0, await ScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.upload_part WHERE task_id=@id AND state<>N'Cancelled'", new { id = taskId }));
+        Assert.Equal(1, await ScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'upload-dispatch' AND job_state=N'CANCELLED'"));
+        Assert.Equal(0, await ScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'upload-dispatch' AND lease_owner IS NOT NULL"));
+        Assert.Equal(0, await ScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.code_claim WHERE upload_task_id=@id AND claim_state=N'ACTIVE'", new { id = taskId }));
+        Assert.Equal(1, await ScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.code_claim WHERE upload_task_id=@id AND claim_state=N'RELEASED' AND released_by=N'SYSTEM'",
+            new { id = taskId }));
+        Assert.Contains("VERIFY_BLOCKED", await ScalarAsync<string>(
+            "SELECT release_evidence FROM dbo.code_claim WHERE upload_task_id=@id AND claim_state=N'RELEASED'", new { id = taskId }));
+        Assert.Equal(1, await ScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'task.verify.blocked'"));
+        // 他人占用原样保留
+        Assert.Equal("ACTIVE", await ScalarAsync<string>(
+            "SELECT claim_state FROM dbo.code_claim WHERE upload_task_id=@id", new { id = otherTaskId }));
+    }
+
+    [Fact]
+    public async Task Failed_after_upload_attempt_goes_manual_action()
+    {
+        await using var c = await _fx.OpenAsync();
+        var code = Code(25);
+        var seed = await SeedSaleAsync(c, "SALE-F5", new LineSeed("1", "SP0001", 1, "SALE", code));
+        await SeedPurchaseAsync(c, seed, code, "Succeeded");
+        var svc = NewService(_ => throw new InvalidOperationException("依赖已满足，不应查平台"));
+        var first = await svc.VerifySnapshotAsync(seed.SnapshotId, default);
+        Assert.Equal("PASSED", await ScalarAsync<string>("SELECT state FROM dbo.verification WHERE id=@id", new { id = first }));
+        var taskId = await ScalarAsync<long>("SELECT id FROM dbo.upload_task WHERE event_key=N'KSOA:SALE-F5:RETAIL_321'");
+        await c.ExecuteAsync(@"
+INSERT INTO dbo.upload_attempt(task_id,attempt_no,attempt_kind,env,fencing_token)
+VALUES(@taskId,1,N'UPLOAD',N'MOCK',0)", new { taskId });
+
+        var v2 = await SeedSaleVersionAsync(c, "SALE-F5", 2, new LineSeed("1", "SP0001", 1, "SALE", Code(26)));
+        var failed = await NewService(_ => PlatformNotFound()).VerifySnapshotAsync(v2.SnapshotId, default);
+
+        Assert.Equal("FAILED", await ScalarAsync<string>("SELECT state FROM dbo.verification WHERE id=@id", new { id = failed }));
+        Assert.Equal("ManualAction", await ScalarAsync<string>("SELECT state FROM dbo.upload_task WHERE id=@id", new { id = taskId }));
+        Assert.Equal(SaleVerificationService.ReasonVerifyChangedAfterSend, await ScalarAsync<string>(
+            "SELECT state_reason FROM dbo.upload_task WHERE id=@id", new { id = taskId }));
+        // 已发送：分片/占用/发送作业一律不动
+        Assert.Equal("Ready", await ScalarAsync<string>(
+            "SELECT state FROM dbo.upload_part WHERE task_id=@id", new { id = taskId }));
+        Assert.Equal(1, await ScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.code_claim WHERE upload_task_id=@id AND claim_state=N'ACTIVE'", new { id = taskId }));
+        Assert.Equal("PENDING", await ScalarAsync<string>(
+            "SELECT job_state FROM dbo.outbox_job WHERE job_kind=N'upload-dispatch'"));
+        Assert.Equal(1, await ScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'task.verify.manual_action'"));
+    }
+
+    [Fact]
+    public async Task Scheduler_tick_skips_wait_retry_snapshot()
+    {
+        await using var c = await _fx.OpenAsync();
+        var (orgId, sysId) = await TestSeed.EnsureAsync(c);
+        var waitRetrySnap = await SeedBareSnapshotAsync(c, orgId, sysId, "SALE-F6-WR");
+        var dependencySnap = await SeedBareSnapshotAsync(c, orgId, sysId, "SALE-F6-DEP");
+        await SeedVerificationRowAsync(c, orgId, waitRetrySnap, "SALE-F6-WR", "WAIT_RETRY");
+        await SeedVerificationRowAsync(c, orgId, dependencySnap, "SALE-F6-DEP", "UNRESOLVED");
+
+        var scheduler = new SyncScheduler(_fx.ConnectionString, new JobQueue(_fx.ConnectionString, new AuditLog()),
+            new SettingsService(_fx.ConnectionString, new DpapiProtector()), "MOCK");
+        var unix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var bucket = DateTimeOffset.FromUnixTimeSeconds(unix - unix % 300).UtcDateTime;
+        await scheduler.TickAsync(bucket, default);
+        await scheduler.TickAsync(bucket.AddSeconds(30), default); // 新 poll 桶、验核 300s 桶不变
+        await scheduler.TickAsync(bucket.AddSeconds(60), default);
+
+        // WAIT_RETRY 已由作业退避重排：调度不得再补（否则形成重试风暴）；UNRESOLVED 仍须兜底。
+        Assert.Equal(1, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'sale-verify'"));
+        Assert.Equal(0, await ScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'sale-verify' AND payload_json=@p",
+            new { p = JsonSerializer.Serialize(new { orgId, env = "MOCK", snapshotId = waitRetrySnap }) }));
+        Assert.Equal(1, await ScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'sale-verify' AND payload_json=@p",
+            new { p = JsonSerializer.Serialize(new { orgId, env = "MOCK", snapshotId = dependencySnap }) }));
+    }
+
+    [Fact]
+    public async Task Return_placeholder_refreshes_on_new_snapshot_before_confirm()
+    {
+        await using var c = await _fx.OpenAsync();
+        var oldReturn = Code(27);
+        var newReturn = Code(28);
+        var svc = NewService(_ => throw new InvalidOperationException("退货行不做平台核验"));
+        var v1 = await SeedSaleVersionAsync(c, "SALE-F7", 1,
+            new LineSeed("1", "SP0001", -1, "CONSUMER_RETURN", oldReturn));
+        await svc.VerifySnapshotAsync(v1.SnapshotId, default);
+        var placeholderId = await ScalarAsync<long>(
+            "SELECT id FROM dbo.upload_task WHERE event_key=N'KSOA:SALE-F7:CONSUMER_RETURN_116'");
+        Assert.Contains(oldReturn, await ScalarAsync<string>(
+            "SELECT payload_json FROM dbo.upload_task WHERE id=@id", new { id = placeholderId }));
+
+        var v2 = await SeedSaleVersionAsync(c, "SALE-F7", 2,
+            new LineSeed("1", "SP0001", -2, "CONSUMER_RETURN", newReturn));
+        await svc.VerifySnapshotAsync(v2.SnapshotId, default);
+
+        Assert.Equal(1, await ScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.upload_task WHERE task_type=N'CONSUMER_RETURN_116'"));
+        Assert.Equal(placeholderId, await ScalarAsync<long>(
+            "SELECT id FROM dbo.upload_task WHERE event_key=N'KSOA:SALE-F7:CONSUMER_RETURN_116'"));
+        Assert.Equal(v2.SnapshotId, await ScalarAsync<long>(
+            "SELECT source_snapshot_id FROM dbo.upload_task WHERE id=@id", new { id = placeholderId }));
+        var payload = await ScalarAsync<string>("SELECT payload_json FROM dbo.upload_task WHERE id=@id", new { id = placeholderId });
+        Assert.Contains(newReturn, payload);
+        Assert.DoesNotContain(oldReturn, payload);
+        Assert.Equal("Blocked", await ScalarAsync<string>("SELECT state FROM dbo.upload_task WHERE id=@id", new { id = placeholderId }));
+        Assert.Equal("RETURN_CONFIRM_REQUIRED", await ScalarAsync<string>(
+            "SELECT state_reason FROM dbo.upload_task WHERE id=@id", new { id = placeholderId }));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.upload_part"));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.upload_attempt"));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.outbox_job"));
+    }
+
+    [Fact]
+    public async Task Code_contended_is_wait_retry_not_failed()
+    {
+        await using var c = await _fx.OpenAsync();
+        var code = Code(29);
+        var seed = await SeedSaleAsync(c, "SALE-F8", new LineSeed("1", "SP0001", 1, "SALE", code));
+        await SeedPurchaseAsync(c, seed, code, "Succeeded");
+        var otherTaskId = await SeedOtherTaskWithClaimAsync(c, seed.OrgId, code, "SALE-F8-OTHER");
+        var svc = NewService(_ => throw new InvalidOperationException("依赖已满足，不应查平台"));
+
+        var first = await svc.VerifySnapshotAsync(seed.SnapshotId, default);
+
+        Assert.Equal("WAIT_RETRY", await ScalarAsync<string>("SELECT state FROM dbo.verification WHERE id=@id", new { id = first }));
+        Assert.Contains("CODE_CONTENDED", await ScalarAsync<string>("SELECT result_json FROM dbo.verification WHERE id=@id", new { id = first }));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.upload_task WHERE event_key=N'KSOA:SALE-F8:RETAIL_321'"));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.upload_part"));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.verification_code"));
+
+        // 释放争用后重跑可成功：证明 WAIT_RETRY 非终态
+        await c.ExecuteAsync(@"
+UPDATE dbo.code_claim SET claim_state=N'RELEASED', released_at=SYSUTCDATETIME(), released_by=N'test'
+WHERE upload_task_id=@id AND claim_state=N'ACTIVE'", new { id = otherTaskId });
+        var second = await svc.VerifySnapshotAsync(seed.SnapshotId, default);
+
+        Assert.NotEqual(first, second);
+        Assert.Equal("PASSED", await ScalarAsync<string>("SELECT state FROM dbo.verification WHERE id=@id", new { id = second }));
+        Assert.Equal("Ready", await ScalarAsync<string>(
+            "SELECT state FROM dbo.upload_task WHERE event_key=N'KSOA:SALE-F8:RETAIL_321'"));
+        Assert.Equal(1, await ScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.upload_task WHERE event_key=N'KSOA:SALE-F8:RETAIL_321'"));
+    }
+
+    [Fact]
+    public async Task Platform_rejection_is_failed_code_not_dependency()
+    {
+        await using var c = await _fx.OpenAsync();
+        var code = Code(30);
+        var seed = await SeedSaleAsync(c, "SALE-F9", new LineSeed("1", "SP0001", 1, "SALE", code));
+
+        var id = await NewService(_ => BusinessRejected()).VerifySnapshotAsync(seed.SnapshotId, default);
+
+        Assert.Equal("FAILED", await ScalarAsync<string>("SELECT state FROM dbo.verification WHERE id=@id", new { id }));
+        Assert.Equal("FAIL", await ScalarAsync<string>(
+            "SELECT result FROM dbo.verification_code WHERE verification_id=@id", new { id }));
+        Assert.Equal("PLATFORM_REJECTED", await ScalarAsync<string>(
+            "SELECT reason FROM dbo.verification_code WHERE verification_id=@id", new { id }));
+        // 平台拒绝是逐码 FAIL（终态），不是依赖等待；新建单据无既有任务 → 不建任务、无分片/作业。
+        Assert.Contains("\"dependencyState\":\"NONE\"", await ScalarAsync<string>(
+            "SELECT result_json FROM dbo.verification WHERE id=@id", new { id }));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.upload_task"));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.upload_part"));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.outbox_job"));
+    }
+
+    [Fact]
+    public async Task Platform_not_found_blocks_with_PLATFORM_NOT_FOUND_no_parts_or_outbox()
+    {
+        await using var c = await _fx.OpenAsync();
+        var code = Code(31);
+        var seed = await SeedSaleAsync(c, "SALE-F10", new LineSeed("1", "SP0001", 1, "SALE", code));
+
+        var id = await NewService(_ => PlatformNotFound()).VerifySnapshotAsync(seed.SnapshotId, default);
+
+        Assert.Equal("FAILED", await ScalarAsync<string>("SELECT state FROM dbo.verification WHERE id=@id", new { id }));
+        Assert.Equal("FAIL", await ScalarAsync<string>(
+            "SELECT result FROM dbo.verification_code WHERE verification_id=@id", new { id }));
+        Assert.Equal(SaleVerificationService.ReasonPlatformNotFound, await ScalarAsync<string>(
+            "SELECT reason FROM dbo.verification_code WHERE verification_id=@id", new { id }));
+        // 平台查无此码 → FAIL（PLATFORM_NOT_FOUND）终态：新建单据无既有任务 → 不建任务、无分片/占用/作业。
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.upload_task"));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.upload_part"));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.code_claim"));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.outbox_job"));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.code_event"));
+    }
+
+    [Fact]
+    public async Task Wait_retry_then_pass_leaves_one_current_row_and_one_task()
+    {
+        await using var c = await _fx.OpenAsync();
+        var code = Code(32);
+        var seed = await SeedSaleAsync(c, "SALE-F11", new LineSeed("1", "SP0001", 1, "SALE", code));
+
+        var first = await NewService(_ => throw new HttpRequestException("网络中断"))
+            .VerifySnapshotAsync(seed.SnapshotId, default);
+        Assert.Equal("WAIT_RETRY", await ScalarAsync<string>("SELECT state FROM dbo.verification WHERE id=@id", new { id = first }));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.upload_task"));
+
+        var second = await NewService(_ => Instore()).VerifySnapshotAsync(seed.SnapshotId, default);
+
+        Assert.NotEqual(first, second);
+        Assert.Equal(2, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.verification"));
+        Assert.Equal(1, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.verification WHERE is_current=1"));
+        Assert.Equal("PASSED", await ScalarAsync<string>(
+            "SELECT state FROM dbo.verification WHERE id=@id AND is_current=1", new { id = second }));
+        Assert.Equal(1, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.upload_task WHERE task_type=N'RETAIL_321'"));
+        Assert.Equal("Ready", await ScalarAsync<string>(
+            "SELECT state FROM dbo.upload_task WHERE event_key=N'KSOA:SALE-F11:RETAIL_321'"));
+        Assert.Equal(1, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.upload_part"));
+        Assert.Equal(1, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'upload-dispatch'"));
+    }
+
+    private static async Task<long> SeedBareSnapshotAsync(SqlConnection c, long orgId, long sysId, string docKey)
+        => await c.ExecuteScalarAsync<long>(@"
+INSERT INTO dbo.source_snapshot(org_id,source_system_id,source_document_key,document_type,version,completeness_status,content_hash)
+OUTPUT INSERTED.id VALUES(@orgId,@sysId,@key,N'SALE',1,N'COMPLETE',@hash)",
+            new { orgId, sysId, key = docKey, hash = Sha256(docKey) });
+
+    private static Task SeedVerificationRowAsync(SqlConnection c, long orgId, long snapId, string docKey, string state)
+        => c.ExecuteAsync(@"
+INSERT INTO dbo.verification(org_id,env,event_key,source_snapshot_id,source_hash,code_set_hash,rule_version,state,is_current)
+VALUES(@orgId,N'MOCK',@key,@snap,REPLICATE('a',64),REPLICATE('b',64),N'M3-1',@state,1)",
+            new { orgId, key = "KSOA:" + docKey + ":SALE", snap = snapId, state });
 }

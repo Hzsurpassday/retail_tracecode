@@ -63,14 +63,14 @@ public sealed class SyncScheduler
                 $"daily:{nowUtc:yyyyMMdd}", entPayload, nowUtc, ct);
             n++;
             // 核验兜底（SALE-05）：近 24h COMPLETE SALE 且当前结论非 PASSED/FAILED 的快照（漏入队/依赖等待/未知重核），
-            // 按 5 分钟桶重入队；无候选时零入队（既有桶计数不变）。
+            // 按 5 分钟桶重入队；WAIT_RETRY/RUNNING 已由作业自身退避重排，此处排除以杜绝重试风暴（HIGH 4）。
             var verifyIds = (await c.QueryAsync<long>(new CommandDefinition(@"
 SELECT s.id FROM dbo.source_snapshot s
 WHERE s.org_id=@orgId AND s.document_type=N'SALE' AND s.completeness_status=N'COMPLETE'
   AND s.observed_at >= DATEADD(hour,-24,@now)
   AND NOT EXISTS (SELECT 1 FROM dbo.verification v
                   WHERE v.org_id=s.org_id AND v.env=@env AND v.source_snapshot_id=s.id AND v.is_current=1
-                    AND v.state IN (N'PASSED',N'FAILED'))
+                    AND v.state IN (N'PASSED',N'FAILED',N'WAIT_RETRY',N'RUNNING'))
   AND NOT EXISTS (SELECT 1 FROM dbo.source_snapshot n
                   WHERE n.org_id=s.org_id AND n.source_system_id=s.source_system_id
                     AND n.source_document_key=s.source_document_key AND n.version>s.version)

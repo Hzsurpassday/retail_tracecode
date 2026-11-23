@@ -69,7 +69,35 @@ public sealed class SourceSyncJobHandler : IJobHandler
         }
         var svc = new SourceSyncService(_cs, _adapter, _settings, _audit);
         await svc.RunAsync(orgId, env, entity, start, end, ct);
-        await EnqueueSaleVerificationsAsync(orgId, env, ct);
+        // 入队失败不得让已落库的同步失败（HIGH 6）：吞掉并留审计，漏入队由 SyncScheduler 兜底补发。
+        try
+        {
+            await EnqueueSaleVerificationsAsync(orgId, env, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            await TryAuditEnqueueFailureAsync(orgId, env, ex, ct);
+        }
+    }
+
+    /// <summary>入队失败审计（best-effort）：审计自身失败也绝不把异常抛回 source-sync，调度兜底仍会补入队。</summary>
+    private async Task TryAuditEnqueueFailureAsync(long orgId, string env, Exception error, CancellationToken ct)
+    {
+        try
+        {
+            await using var c = new SqlConnection(_cs);
+            await c.OpenAsync(ct);
+            await using var tx = (SqlTransaction)await c.BeginTransactionAsync(ct);
+            await _audit.AppendAsync(c, tx, new AuditEntry("SYSTEM", "Worker", "sale.verify.enqueue.failed",
+                "organization", orgId.ToString(), error.Message, null,
+                JsonSerializer.Serialize(new { error = error.GetType().Name, message = error.Message }),
+                null, null, env));
+            await tx.CommitAsync(ct);
+        }
+        catch (Exception auditError) when (auditError is not OperationCanceledException)
+        {
+            // 审计写入同样失败（库不可用等）：仅吞掉，交给调度兜底与日志观测。
+        }
     }
 
     /// <summary>

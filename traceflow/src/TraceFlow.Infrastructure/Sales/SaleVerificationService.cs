@@ -34,9 +34,19 @@ public sealed class SaleVerificationService
     public const string StateWaitRetry = "WAIT_RETRY";
     public const string ReasonReturnConfirmRequired = "RETURN_CONFIRM_REQUIRED";
     public const string ReasonPlatformNotFound = "PLATFORM_NOT_FOUND";
+    /// <summary>平台业务拒绝（response_success=false）：该码判 FAIL，不是依赖等待。</summary>
+    public const string ReasonPlatformRejected = "PLATFORM_REJECTED";
+    /// <summary>核验通但无可上传行（全 EXEMPT）：结论 PASSED、不建任务。</summary>
+    public const string ReasonNoUploadableLines = "NO_UPLOADABLE_LINES";
+    /// <summary>已发送后复核结论变化：任务转 ManualAction，分片/占用一律不动。</summary>
+    public const string ReasonVerifyChangedAfterSend = "VERIFY_CHANGED_AFTER_SEND";
+    /// <summary>工厂 T2 占用争用（非终态）：保持 WAIT_RETRY 由作业退避重排。</summary>
+    public const string ErrorCodeContended = "CODE_CONTENDED";
 
     private const string TaskTypeSale = RetailTaskFactory.Retail321;
     private const string TaskTypeReturn = RetailTaskFactory.ConsumerReturn116;
+    private const string ReasonVerifyBlocked = "VERIFY_BLOCKED";
+    private const string ClaimReleaseVerifyBlocked = "{\"reason\":\"VERIFY_BLOCKED\"}";
     private const int CodeChunk = 500;
     private const int ReasonMaxChars = 500;
     private const int EvidenceMaxChars = 4000;
@@ -78,7 +88,7 @@ FROM dbo.source_snapshot WHERE id=@id", new { id = snapshotId }, cancellationTok
         var settings = await _settings.GetSaleVerifySettingsAsync(ct);
         var eventKey = $"KSOA:{snap.source_document_key}:SALE";
         var settled = await ReadCurrentAsync(conn, snap.org_id, eventKey, null, ct);
-        if (IsSettledPassed(settled, snap))
+        if (IsSettledPassed(settled, snap, settings.RuleVersion))
             return settled!.id;
 
         var org = await conn.QuerySingleAsync<OrgRow>(new CommandDefinition(
@@ -205,6 +215,7 @@ WHERE t.org_id=@orgId AND t.env=@env AND t.state=N'Blocked' AND t.state_reason=@
             : state == "UNRESOLVED" && dependencyMissing ? ReasonWaitDependency
             : state == "UNRESOLVED" ? ReasonWaitVerify
             : state == StateWaitRetry ? StateWaitRetry
+            : rules.SaleLines.Count == 0 && rules.ReturnLines.Count == 0 ? ReasonNoUploadableLines
             : null;
         var dependencyState = dependencyMissing ? "WAIT" : "NONE";
 
@@ -227,7 +238,7 @@ WHERE t.org_id=@orgId AND t.env=@env AND t.state=N'Blocked' AND t.state_reason=@
         // ---- 阶段 C：单事务落库（verification + verification_code + 任务）----
         await using var tx = (SqlTransaction)await conn.BeginTransactionAsync(ct);
         var current = await ReadCurrentAsync(conn, snap.org_id, eventKey, tx, ct);
-        if (IsSettledPassed(current, snap))
+        if (IsSettledPassed(current, snap, settings.RuleVersion))
         {
             await tx.CommitAsync(ct);
             return current!.id;
@@ -241,10 +252,11 @@ WHERE t.org_id=@orgId AND t.env=@env AND t.state=N'Blocked' AND t.state_reason=@
         var mappingDigest = MappingDigest(rows);
 
         long? taskId = null;
-        if (state == "PASSED")
+        // 只有确有销售行才创建 321；退货行只落 116 占位；全 EXEMPT（两桶皆空）不建任何任务（HIGH 1）。
+        if (state == "PASSED" && saleLines.Count > 0)
             taskId = await CreateSaleTaskAsync(conn, tx, snap, settings.RuleVersion, mappingDigest, saleLines, ct);
         else if (state == "FAILED")
-            taskId = await BlockExistingTaskAsync(conn, tx, snap, reason!, "NONE", "FAILED", ct);
+            taskId = await BlockExistingTaskAsync(conn, tx, snap, settings.RuleVersion, reason!, "NONE", "FAILED", ct);
         else if (state == "UNRESOLVED")
             taskId = await EnsurePlaceholderTaskAsync(conn, tx, snap, reason!, dependencyState,
                 settings.RuleVersion, mappingDigest, saleLines, ct);
@@ -295,13 +307,14 @@ WHERE t.org_id=@orgId AND t.env=@env AND t.state=N'Blocked' AND t.state_reason=@
         var current = await ReadCurrentAsync(conn, snap.org_id, eventKey, tx, ct);
         if (current is not null && current.state == "FAILED" && current.source_snapshot_id == snap.id
             && string.Equals(current.source_hash, snap.content_hash, StringComparison.Ordinal)
+            && string.Equals(current.rule_version, ruleVersion, StringComparison.Ordinal)
             && string.Equals(current.result_json, resultJson, StringComparison.Ordinal))
         {
-            await tx.CommitAsync(ct); // 同一结论重跑：零写入
+            await tx.CommitAsync(ct); // 同一结论、同规则版本重跑：零写入
             return current.id;
         }
         await FlipCurrentAsync(conn, tx, snap.org_id, eventKey, ct);
-        var taskId = await BlockExistingTaskAsync(conn, tx, snap, rules.FailCode!, "NONE", "FAILED", ct);
+        var taskId = await BlockExistingTaskAsync(conn, tx, snap, ruleVersion, rules.FailCode!, "NONE", "FAILED", ct);
         var verificationId = await InsertVerificationAsync(conn, tx, snap, eventKey, ruleVersion, "FAILED", resultJson,
             codeSetHash, ct);
         if (taskId is not null)
@@ -316,16 +329,23 @@ WHERE t.org_id=@orgId AND t.env=@env AND t.state=N'Blocked' AND t.state_reason=@
         return verificationId;
     }
 
-    /// <summary>核验通过但任务创建冲突（CODE_CONTENDED/SOURCE_CHANGED/分片超限等）：事务已回滚，落 FAILED 结论留证。</summary>
+    /// <summary>
+    /// 核验通过但任务创建冲突（事务已回滚）：CODE_CONTENDED（T2 占用被其他有效任务持有）不是终态，
+    /// 落 WAIT_RETRY 交作业退避重排；SOURCE_CHANGED/PART_TOO_LARGE/REACTIVATE_REFUSED 等仍终态 FAILED（载荷不可变/需人工）。
+    /// </summary>
     private async Task<long> WriteTaskConflictAsync(SqlConnection conn, SnapshotRow snap, string eventKey,
         string ruleVersion, SaleRuleResult rules, Exception error, CancellationToken ct)
     {
         var errorCode = error is AllocationConflictException conflict
             ? conflict.ErrorCode
             : ((AllocationValidationException)error).ErrorCode;
+        var contended = string.Equals(errorCode, ErrorCodeContended, StringComparison.Ordinal);
+        var state = contended ? StateWaitRetry : "FAILED";
+        var reason = contended ? StateWaitRetry : ReasonVerifyFailedPrefix + errorCode;
         var resultJson = JsonSerializer.Serialize(new
         {
-            state = "FAILED",
+            state,
+            reason,
             failCode = errorCode,
             eventKey,
             ruleVersion,
@@ -339,18 +359,29 @@ WHERE t.org_id=@orgId AND t.env=@env AND t.state=N'Blocked' AND t.state_reason=@
         });
         var codeSetHash = SourceHasher.CodeSetHash(rules.SaleLines.Select(l => l.CodeNormalized!).ToList());
         await using var tx = (SqlTransaction)await conn.BeginTransactionAsync(ct);
-        await FlipCurrentAsync(conn, tx, snap.org_id, eventKey, ct);
-        var taskId = await BlockExistingTaskAsync(conn, tx, snap, ReasonVerifyFailedPrefix + errorCode,
-            "NONE", "FAILED", ct);
-        var verificationId = await InsertVerificationAsync(conn, tx, snap, eventKey, ruleVersion, "FAILED", resultJson,
+        var current = await ReadCurrentAsync(conn, snap.org_id, eventKey, tx, ct);
+        if (contended && current is not null && current.state == StateWaitRetry && current.source_snapshot_id == snap.id
+            && string.Equals(current.source_hash, snap.content_hash, StringComparison.Ordinal)
+            && string.Equals(current.rule_version, ruleVersion, StringComparison.Ordinal))
+        {
+            await tx.CommitAsync(ct); // 同一争用重跑：保持 WAIT_RETRY，零写入
+            return current.id;
+        }
+        if (current is not null)
+            await FlipCurrentAsync(conn, tx, snap.org_id, eventKey, ct);
+        // CODE_CONTENDED 不降级既有任务（争用方是别人的占用，本任务状态未被本结论否定）。
+        long? taskId = contended
+            ? null
+            : await BlockExistingTaskAsync(conn, tx, snap, ruleVersion, reason, "NONE", "FAILED", ct);
+        var verificationId = await InsertVerificationAsync(conn, tx, snap, eventKey, ruleVersion, state, resultJson,
             codeSetHash, ct);
         if (taskId is not null)
             await conn.ExecuteAsync(new CommandDefinition(
                 "UPDATE dbo.verification SET upload_task_id=@taskId WHERE id=@id",
                 new { taskId, id = verificationId }, tx, cancellationToken: ct));
         await _audit.AppendAsync(conn, tx, new AuditEntry("SYSTEM", "Worker", "sale.verify", "source_snapshot",
-            snap.id.ToString(CultureInfo.InvariantCulture), errorCode, null,
-            JsonSerializer.Serialize(new { verificationId, state = "FAILED", failCode = errorCode }),
+            snap.id.ToString(CultureInfo.InvariantCulture), reason, null,
+            JsonSerializer.Serialize(new { verificationId, state, failCode = errorCode }),
             null, ruleVersion, _env));
         await tx.CommitAsync(ct);
         return verificationId;
@@ -458,6 +489,8 @@ WHERE e.org_id=@orgId AND e.env=@env AND e.event_type=N'PURCHASE_IN' AND t.state
                 // instore=false / 字段缺失：码存在性未证实或不在店 → 依赖未满足，等采购入库成功。
                 return (new CodeConclusion(entry, "UNKNOWN", ReasonWaitDependency, evidence), false);
             case TopOutcomeKind.BusinessRejected:
+                // 平台明确拒绝查询该码（response_success=false）：逐码 FAIL，不得当作依赖等待无限重排。
+                return (new CodeConclusion(entry, "FAIL", ReasonPlatformRejected, evidence), false);
             case TopOutcomeKind.DuplicateBillCode:
                 return (new CodeConclusion(entry, "UNKNOWN", ReasonWaitDependency, evidence), false);
             default:
@@ -584,26 +617,77 @@ WHERE id=@id AND state IN (N'Blocked',N'Cancelled')", new { id = existing.id }, 
         return result.TaskId;
     }
 
-    /// <summary>把已存在的 321 任务改挂 Blocked/原因（已发送任务冻结，绝不回退）。</summary>
+    /// <summary>
+    /// 复核未通过/未决时把既有 321 任务变为不可发送（HIGH 3）：
+    /// 已有 UPLOAD 尝试 → ManualAction + VERIFY_CHANGED_AFTER_SEND，绝不取消分片/占用（已发送不可回退）；
+    /// 零尝试且有分片 → Blocked + 原因，非 Cancelled 分片置 Cancelled、其 upload-dispatch 作业置 CANCELLED（清租约）、
+    /// 仅本任务的 RETAIL:321 ACTIVE 占用释放（released_by=SYSTEM，证据 VERIFY_BLOCKED），并审计 task.verify.blocked。
+    /// 占用释放严格按 upload_task_id 过滤，其他任务的占用一律不动。
+    /// </summary>
     private async Task<long?> BlockExistingTaskAsync(SqlConnection conn, SqlTransaction tx, SnapshotRow snap,
-        string reason, string dependencyState, string verificationState, CancellationToken ct)
+        string ruleVersion, string reason, string dependencyState, string verificationState, CancellationToken ct)
     {
         var eventKey = TaskEventKey(snap, TaskTypeSale);
         var existing = await LoadTaskAsync(conn, tx, snap.org_id, eventKey, ct);
         if (existing is null) return null;
         var sent = await CountUploadAttemptsAsync(conn, tx, existing.id, ct);
-        if (sent > 0) return existing.id;
+        if (sent > 0)
+        {
+            await conn.ExecuteAsync(new CommandDefinition(@"
+UPDATE dbo.upload_task SET state=N'ManualAction', state_reason=@reason, verification_state=@vs, dependency_state=@dep,
+       version=version+1
+WHERE id=@id",
+                new { id = existing.id, reason = ReasonVerifyChangedAfterSend, vs = verificationState, dep = dependencyState },
+                tx, cancellationToken: ct));
+            await _audit.AppendAsync(conn, tx, new AuditEntry("SYSTEM", "Worker", "task.verify.manual_action", "upload_task",
+                existing.id.ToString(CultureInfo.InvariantCulture), ReasonVerifyChangedAfterSend, null,
+                JsonSerializer.Serialize(new { reason, verificationState, uploadAttempts = sent }),
+                null, ruleVersion, _env));
+            return existing.id;
+        }
+
         await conn.ExecuteAsync(new CommandDefinition(@"
 UPDATE dbo.upload_task SET state=N'Blocked', state_reason=@reason, verification_state=@vs, dependency_state=@dep,
        version=version+1
-WHERE id=@id", new { id = existing.id, reason = Truncate(reason, ReasonMaxChars), vs = verificationState, dep = dependencyState },
+WHERE id=@id",
+            new { id = existing.id, reason = Truncate(reason, ReasonMaxChars), vs = verificationState, dep = dependencyState },
             tx, cancellationToken: ct));
+
+        var partIds = (await conn.QueryAsync<long>(new CommandDefinition(@"
+SELECT id FROM dbo.upload_part WITH (UPDLOCK, HOLDLOCK)
+WHERE task_id=@id AND state<>N'Cancelled'", new { id = existing.id }, tx, cancellationToken: ct))).ToList();
+        if (partIds.Count == 0) return existing.id;
+
+        await conn.ExecuteAsync(new CommandDefinition(
+            "UPDATE dbo.upload_part SET state=N'Cancelled' WHERE task_id=@id AND state<>N'Cancelled'",
+            new { id = existing.id }, tx, cancellationToken: ct));
+        foreach (var partId in partIds)
+            await conn.ExecuteAsync(new CommandDefinition(@"
+UPDATE dbo.outbox_job SET job_state=N'CANCELLED', lease_owner=NULL, lease_until=NULL, finished_at=SYSUTCDATETIME(),
+       last_error=@err
+WHERE org_id=@orgId AND env=@env AND job_kind=N'upload-dispatch' AND intent_key=@intent
+  AND job_state IN (N'PENDING',N'RUNNING',N'FAILED')",
+                new { orgId = snap.org_id, env = _env, intent = $"part:{partId}", err = ReasonVerifyBlocked },
+                tx, cancellationToken: ct));
+        var claims = await conn.ExecuteAsync(new CommandDefinition(@"
+UPDATE dbo.code_claim SET claim_state=N'RELEASED', released_at=SYSUTCDATETIME(), released_by=N'SYSTEM',
+       release_evidence=@ev
+WHERE org_id=@orgId AND env=@env AND event_scope=N'RETAIL:321' AND claim_state=N'ACTIVE'
+  AND upload_task_id=@taskId",
+            new { orgId = snap.org_id, env = _env, ev = ClaimReleaseVerifyBlocked, taskId = existing.id },
+            tx, cancellationToken: ct));
+        await _audit.AppendAsync(conn, tx, new AuditEntry("SYSTEM", "Worker", "task.verify.blocked", "upload_task",
+            existing.id.ToString(CultureInfo.InvariantCulture), reason, null,
+            JsonSerializer.Serialize(new { reason, verificationState, parts = partIds.Count, claims }),
+            null, ruleVersion, _env));
         return existing.id;
     }
 
     /// <summary>
     /// 未决（WAIT_DEPENDENCY/WAIT_VERIFY）占位任务：无分片/占用/outbox/code_event，只承载不可变载荷与状态，
     /// 供 EnqueueDependentVerifications 重唤醒与 T4 前置状态校验。
+    /// 既有任务一律先经 <see cref="BlockExistingTaskAsync"/> 变为不可发送（已发送 → ManualAction；
+    /// 未发送有分片 → 取消分片/作业/占用），仅「零尝试且零分片」时才刷新载荷/来源快照。
     /// </summary>
     private async Task<long> EnsurePlaceholderTaskAsync(SqlConnection conn, SqlTransaction tx, SnapshotRow snap,
         string reason, string dependencyState, string ruleVersion, string mappingDigest,
@@ -624,58 +708,77 @@ VALUES(@orgId,@env,@key,@taskType,@snap,@sh,@mv,@pj,@ph,N'Blocked',@reason,N'COM
                       sh = snap.content_hash, mv = mappingSnapshot, pj = payloadJson, ph = payloadHash,
                       reason = Truncate(reason, ReasonMaxChars), dep = dependencyState }, tx, cancellationToken: ct));
 
+        await BlockExistingTaskAsync(conn, tx, snap, ruleVersion, reason, dependencyState, "UNRESOLVED", ct);
         var sent = await CountUploadAttemptsAsync(conn, tx, existing.id, ct);
-        if (sent > 0 || existing.state is not ("Blocked" or "Ready")) return existing.id;
+        if (sent > 0) return existing.id;
         var parts = await conn.ExecuteScalarAsync<int>(new CommandDefinition(
             "SELECT COUNT(*) FROM dbo.upload_part WHERE task_id=@id", new { id = existing.id }, tx, cancellationToken: ct));
-        if (parts == 0)
-            await conn.ExecuteAsync(new CommandDefinition(@"
+        if (parts > 0) return existing.id;
+        await conn.ExecuteAsync(new CommandDefinition(@"
 UPDATE dbo.upload_task SET state=N'Blocked', state_reason=@reason, verification_state=N'UNRESOLVED', dependency_state=@dep,
        source_snapshot_id=@snap, source_hash=@sh, mapping_version_snapshot=@mv, payload_json=@pj, payload_hash=@ph,
        version=version+1
 WHERE id=@id",
-                new { id = existing.id, reason = Truncate(reason, ReasonMaxChars), dep = dependencyState, snap = snap.id,
-                      sh = snap.content_hash, mv = mappingSnapshot, pj = payloadJson, ph = payloadHash }, tx, cancellationToken: ct));
-        else
-            await conn.ExecuteAsync(new CommandDefinition(@"
-UPDATE dbo.upload_task SET state=N'Blocked', state_reason=@reason, verification_state=N'UNRESOLVED', dependency_state=@dep,
-       version=version+1
-WHERE id=@id", new { id = existing.id, reason = Truncate(reason, ReasonMaxChars), dep = dependencyState }, tx,
-                cancellationToken: ct));
+            new { id = existing.id, reason = Truncate(reason, ReasonMaxChars), dep = dependencyState, snap = snap.id,
+                  sh = snap.content_hash, mv = mappingSnapshot, pj = payloadJson, ph = payloadHash }, tx, cancellationToken: ct));
         return existing.id;
     }
 
     /// <summary>
     /// 116 退货占位：核验通过即落 Blocked + RETURN_CONFIRM_REQUIRED（不可变载荷=退货行），无分片/占用/outbox；
-    /// Task 6 确认事务内经工厂同行提升（R-M3-7）。已存在则一字不改（幂等）。
+    /// Task 6 确认事务内经工厂同行提升（R-M3-7）。仍是待确认占位（Blocked + RETURN_CONFIRM_REQUIRED、
+    /// 无分片、无 UPLOAD 尝试）且新快照 id/摘要不同 → 就地刷新载荷/哈希/来源快照（同一行、同一事件键），
+    /// 保证确认时发送最新退货行；已确认/已分片/已发送的任务一律不动。
     /// </summary>
     private async Task EnsureReturnPlaceholderTaskAsync(SqlConnection conn, SqlTransaction tx, SnapshotRow snap,
         string ruleVersion, string mappingDigest, IReadOnlyList<RetailLine> lines, CancellationToken ct)
     {
         var eventKey = TaskEventKey(snap, TaskTypeReturn);
-        var existing = await LoadTaskAsync(conn, tx, snap.org_id, eventKey, ct);
-        if (existing is not null) return;
         var payloadJson = DocPayloadJson(eventKey, snap, ruleVersion, TaskTypeReturn, lines);
-        await conn.ExecuteAsync(new CommandDefinition(@"
+        var existing = await LoadTaskAsync(conn, tx, snap.org_id, eventKey, ct);
+        if (existing is null)
+        {
+            await conn.ExecuteAsync(new CommandDefinition(@"
 INSERT INTO dbo.upload_task(org_id,env,event_key,task_type,source_snapshot_id,source_hash,mapping_version_snapshot,
     payload_json,payload_hash,state,state_reason,source_integrity,match_state,verification_state,dependency_state)
 VALUES(@orgId,@env,@key,@taskType,@snap,@sh,@mv,@pj,@ph,N'Blocked',@reason,N'COMPLETE',N'COMPLETE',N'PASSED',N'NONE')",
-            new { orgId = snap.org_id, env = _env, key = eventKey, taskType = TaskTypeReturn, snap = snap.id,
-                  sh = snap.content_hash, mv = Sha(mappingDigest), pj = payloadJson, ph = Sha(payloadJson),
-                  reason = ReasonReturnConfirmRequired }, tx, cancellationToken: ct));
+                new { orgId = snap.org_id, env = _env, key = eventKey, taskType = TaskTypeReturn, snap = snap.id,
+                      sh = snap.content_hash, mv = Sha(mappingDigest), pj = payloadJson, ph = Sha(payloadJson),
+                      reason = ReasonReturnConfirmRequired }, tx, cancellationToken: ct));
+            return;
+        }
+        if (existing.state != "Blocked"
+            || !string.Equals(existing.state_reason, ReasonReturnConfirmRequired, StringComparison.Ordinal))
+            return; // 已确认（Ready 及之后）或已被处置：占位载荷不可改写
+        var sent = await CountUploadAttemptsAsync(conn, tx, existing.id, ct);
+        if (sent > 0) return;
+        var parts = await conn.ExecuteScalarAsync<int>(new CommandDefinition(
+            "SELECT COUNT(*) FROM dbo.upload_part WHERE task_id=@id", new { id = existing.id }, tx, cancellationToken: ct));
+        if (parts > 0) return;
+        if (existing.source_snapshot_id == snap.id
+            && string.Equals(existing.source_hash, snap.content_hash, StringComparison.Ordinal))
+            return; // 同一快照：幂等零写入
+        await conn.ExecuteAsync(new CommandDefinition(@"
+UPDATE dbo.upload_task SET source_snapshot_id=@snap, source_hash=@sh, mapping_version_snapshot=@mv,
+       payload_json=@pj, payload_hash=@ph, version=version+1
+WHERE id=@id",
+            new { id = existing.id, snap = snap.id, sh = snap.content_hash, mv = Sha(mappingDigest),
+                  pj = payloadJson, ph = Sha(payloadJson) }, tx, cancellationToken: ct));
     }
 
     private async Task<CurrentRow?> ReadCurrentAsync(SqlConnection conn, long orgId, string eventKey,
         SqlTransaction? tx, CancellationToken ct)
         => await conn.QuerySingleOrDefaultAsync<CurrentRow>(new CommandDefinition(@"
-SELECT id, state, source_snapshot_id, source_hash, result_json
+SELECT id, state, source_snapshot_id, source_hash, rule_version, result_json
 FROM dbo.verification WITH (UPDLOCK, HOLDLOCK)
 WHERE org_id=@orgId AND env=@env AND event_key=@key AND is_current=1",
             new { orgId, env = _env, key = eventKey }, tx, cancellationToken: ct));
 
-    private static bool IsSettledPassed(CurrentRow? current, SnapshotRow snap)
+    /// <summary>已定局即零写入复用：PASSED 且同快照/同来源摘要，且规则版本未变（HIGH 2，规则升级必须重算）。</summary>
+    private static bool IsSettledPassed(CurrentRow? current, SnapshotRow snap, string ruleVersion)
         => current is not null && current.state == "PASSED" && current.source_snapshot_id == snap.id
-           && string.Equals(current.source_hash, snap.content_hash, StringComparison.Ordinal);
+           && string.Equals(current.source_hash, snap.content_hash, StringComparison.Ordinal)
+           && string.Equals(current.rule_version, ruleVersion, StringComparison.Ordinal);
 
     private Task<int> FlipCurrentAsync(SqlConnection conn, SqlTransaction tx, long orgId, string eventKey, CancellationToken ct)
         => conn.ExecuteAsync(new CommandDefinition(@"
@@ -712,7 +815,7 @@ VALUES(@vid,@orgId,@env,@codeId,@lineId,@result,@reason,@evidence)",
     private async Task<TaskRow?> LoadTaskAsync(SqlConnection conn, SqlTransaction tx, long orgId, string eventKey,
         CancellationToken ct)
         => await conn.QuerySingleOrDefaultAsync<TaskRow>(new CommandDefinition(@"
-SELECT id, state, state_reason FROM dbo.upload_task WITH (UPDLOCK, HOLDLOCK)
+SELECT id, state, state_reason, source_snapshot_id, source_hash FROM dbo.upload_task WITH (UPDLOCK, HOLDLOCK)
 WHERE org_id=@orgId AND env=@env AND event_key=@key",
             new { orgId, env = _env, key = eventKey }, tx, cancellationToken: ct));
 
@@ -806,6 +909,7 @@ WHERE org_id=@orgId AND env=@env AND event_key=@key",
         public string state { get; set; } = "";
         public long? source_snapshot_id { get; set; }
         public string source_hash { get; set; } = "";
+        public string rule_version { get; set; } = "";
         public string? result_json { get; set; }
     }
 
@@ -814,5 +918,7 @@ WHERE org_id=@orgId AND env=@env AND event_key=@key",
         public long id { get; set; }
         public string state { get; set; } = "";
         public string? state_reason { get; set; }
+        public long? source_snapshot_id { get; set; }
+        public string source_hash { get; set; } = "";
     }
 }
