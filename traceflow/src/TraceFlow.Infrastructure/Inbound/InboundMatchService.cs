@@ -244,6 +244,10 @@ WHERE p.code_normalized IN @allCodes AND ch.code_normalized IN @allCodes",
         if (existing is not null && existing.state != "Cancelled")
             await InboundCancelService.CancelPreSendAsync(c, tx, orgId, env, existing.source_snapshot_id, "SYSTEM", "来源版本变化，重建补配", env, ct);
 
+        // 版本推进回收：同 docKey 旧快照上残留的 RESERVED/TENTATIVE 分配会永久占用码（UI 只列最新版，旧版无取消入口），
+        // 不先回收则下面插入占用必撞 UX_claim_active → CODE_CONTENDED。无旧版本残留时零写入。
+        await InboundCancelService.RevokeStaleDocKeyAllocationsAsync(c, tx, orgId, env, snap.source_document_key, snapshotId, ct);
+
         var allocLines = new List<AllocatedLine>();
         var mappingVersions = new List<string> { $"supplier:{dwbh}:{sup.map_version}" };
         foreach (var l in required)

@@ -155,6 +155,10 @@ WHERE p.org_id=@orgId AND p.source_system_id=@sys AND p.spid=@spid",
         if (parsed.Count == 0)
             throw new AllocationValidationException("EMPTY_LINES", "至少提交一条补配行");
 
+        // 版本推进回收：同 docKey 旧版本上残留的 RESERVED/TENTATIVE 分配会永久占用码（UI 只列最新版本，
+        // 旧版本无入口取消），旧占用对本快照是“外来占用”，必须在争用断言前先回收，否则此保存永远 409 CODE_CONTENDED。
+        await InboundCancelService.RevokeStaleDocKeyAllocationsAsync(conn, tx, orgId, env, snap.source_document_key, snapshotId, ct);
+
         await AssertNoForeignClaimsAsync(conn, tx, orgId, env, snapshotId, parsed.SelectMany(p => p.CodeIds).Distinct().ToList(), ct);
 
         // R9a：先回退该快照旧占用（任务存在→发送前取消整单回退；否则撤销 RESERVED/TENTATIVE 分配并释放占用）。
@@ -374,13 +378,14 @@ SELECT id, source_line_key, product_source_id, quantity_original, unit_original,
 FROM dbo.source_line WHERE snapshot_id=@snapshotId AND event_kind=N'PURCHASE_IN'",
             new { snapshotId }, tx, cancellationToken: ct))).ToList();
         var required = await RequiredLineIdsAsync(conn, tx, orgId, snap.source_system_id, snapshotId, ct);
-        var bySource = allocs.GroupBy(a => a.source_line_id).ToDictionary(g => g.Key, g => g.ToList());
+        // 覆盖合计只统计通过资格复核的行（lines）；被 continue 掉的拒绝行不得计入，否则不合格分配会被算成已覆盖。
+        var bySource = lines.GroupBy(l => l.SourceLineId).ToDictionary(g => g.Key, g => g.ToList());
         foreach (var rid in required)
         {
             if (!bySource.TryGetValue(rid, out var group))
             { fieldErrors.Add(new { sourceLineId = rid, code = "LINE_UNCOVERED", message = "REQUIRED 行未被补配覆盖" }); continue; }
             var src = allLines.First(l => l.id == rid);
-            if (group.Sum(g => g.quantity) != src.quantity_original)
+            if (group.Sum(l => l.Quantity) != src.quantity_original)
                 fieldErrors.Add(new { sourceLineId = rid, code = "QTY_COVERAGE", message = "分配数量合计与来源行数量不一致" });
         }
         foreach (var a in allocs)

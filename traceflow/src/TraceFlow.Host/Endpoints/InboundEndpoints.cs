@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using Dapper;
 using Microsoft.Data.SqlClient;
@@ -54,7 +55,15 @@ SELECT snapshotId,docKey,version,businessDatetimeUtc,completeness,matchState,mat
            m.supplier_dwbh AS supplierDwbh, t.id AS taskId, t.state AS taskState
     {baseSql}
 ) x WHERE rn2 BETWEEN @lo AND @hi ORDER BY rn2", args, cancellationToken: ctx.RequestAborted));
-            return Results.Ok(new { data = new { records = rows, total, page = p, pageSize = size }, requestId = ctx.TraceIdentifier });
+            // API-01：外部 ID 与数量一律 JSON 字符串（JS 精度），taskId 与 confirm 响应同为字符串
+            var records = rows.Select(r => new
+            {
+                snapshotId = r.snapshotId.ToString(),
+                r.docKey, r.version, r.businessDatetimeUtc, r.completeness, r.matchState, r.matchVersion, r.reason, r.supplierDwbh,
+                taskId = r.taskId?.ToString(),
+                r.taskState,
+            }).ToList();
+            return Results.Ok(new { data = new { records, total, page = p, pageSize = size }, requestId = ctx.TraceIdentifier });
         }).WithMetadata(new RequirePermissionAttribute(PermissionCatalog.TraceRead));
 
         app.MapGet("/api/v1/inbounds/{id:long}", async (HttpContext ctx, long id) =>
@@ -93,14 +102,17 @@ FROM dbo.upload_task t LEFT JOIN dbo.upload_part p ON p.task_id=t.id AND p.part_
 WHERE t.org_id=@orgId AND t.env=@env AND t.source_snapshot_id=@id AND t.task_type=N'PURCHASE_IN_102'",
                 new { orgId, env, id }, cancellationToken: ctx.RequestAborted));
             return Results.Ok(new { data = new {
-                snapshot = new { snapshotId = snap.id, docKey = snap.source_document_key, snap.version,
+                snapshot = new { snapshotId = snap.id.ToString(), docKey = snap.source_document_key, snap.version,
                     businessDatetimeUtc = snap.business_datetime, completeness = snap.completeness_status, contentHash = snap.content_hash },
-                lines,
+                lines = lines.Select(l => new { lineId = l.lineId.ToString(), l.sourceLineKey, l.productSourceId,
+                    quantity = Qty(l.quantity), l.unit, l.batchRaw, l.classification }),
                 match = match is null ? null : new { match.matchState, match.version, match.reason },
-                allocations = allocs.Select(a => new { a.allocationId, a.sourceLineId, a.upstreamLineId, a.quantity,
+                allocations = allocs.Select(a => new { allocationId = a.allocationId.ToString(),
+                    sourceLineId = a.sourceLineId.ToString(), upstreamLineId = a.upstreamLineId.ToString(),
+                    quantity = Qty(a.quantity),
                     unitRatio = $"{a.num}/{a.den}", a.state,
-                    codes = allocCodes.Where(k => k.allocationId == a.allocationId).Select(k => new { k.codeId, k.codeNormalized }) }),
-                task = task is null ? null : new { task.taskId, task.state, task.billCode } }, requestId = ctx.TraceIdentifier });
+                    codes = allocCodes.Where(k => k.allocationId == a.allocationId).Select(k => new { codeId = k.codeId.ToString(), k.codeNormalized }) }),
+                task = task is null ? null : new { taskId = task.taskId.ToString(), task.state, task.billCode } }, requestId = ctx.TraceIdentifier });
         }).WithMetadata(new RequirePermissionAttribute(PermissionCatalog.TraceRead));
 
         app.MapPost("/api/v1/inbounds/{id:long}/rematch", (HttpContext ctx, long id, IdempotencyExecutor idem, IJobQueue queue, IAuditLog audit) =>
@@ -163,6 +175,9 @@ WHERE t.org_id=@orgId AND t.env=@env AND t.source_snapshot_id=@id AND t.task_typ
 
     private static (int, string) Err(HttpContext ctx, int status, string code, string message)
         => (status, JsonSerializer.Serialize(new { code, message, retryable = false, requestId = ctx.TraceIdentifier }));
+
+    // decimal(18,6) 序列化为字符串时去掉尾随零（"2.000000"→"2"），保持 API-01 字符串约定与可读性
+    private static string Qty(decimal v) => v.ToString("0.######", CultureInfo.InvariantCulture);
 
     public sealed record ConfirmRequest(string ExpectedMatchVersion);
     public sealed record CancelRequest(long? AllocationId, string Reason);

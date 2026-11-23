@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using Dapper;
 using Microsoft.Data.SqlClient;
@@ -40,7 +41,13 @@ SELECT billId,platformBillId,billNo,billDate,upstreamRefEntId,toEntId,completene
            upstream_ref_ent_id AS upstreamRefEntId, to_ent_id AS toEntId, completeness, source_version AS sourceVersion, fetched_at AS fetchedAtUtc
     FROM dbo.upstream_bill {where}
 ) t WHERE rn BETWEEN @lo AND @hi ORDER BY rn", args, cancellationToken: ctx.RequestAborted));
-            return Results.Ok(new { data = new { records = rows, total, page = p, pageSize = size }, requestId = ctx.TraceIdentifier });
+            // API-01：外部 ID 用 JSON 字符串（billId 为 bigint，JS 精度）
+            var records = rows.Select(r => new
+            {
+                billId = r.billId.ToString(),
+                r.platformBillId, r.billNo, r.billDate, r.upstreamRefEntId, r.toEntId, r.completeness, r.sourceVersion, r.fetchedAtUtc,
+            }).ToList();
+            return Results.Ok(new { data = new { records, total, page = p, pageSize = size }, requestId = ctx.TraceIdentifier });
         }).WithMetadata(new RequirePermissionAttribute(PermissionCatalog.TraceRead));
 
         app.MapGet("/api/v1/upstream-bills/{id:long}", async (HttpContext ctx, long id) =>
@@ -61,8 +68,11 @@ FROM dbo.upstream_bill_line WHERE bill_id=@id ORDER BY id", new { id }, cancella
             var codes = lines.Count == 0 ? new List<CodeRow>() : (await conn.QueryAsync<CodeRow>(new CommandDefinition(@"
 SELECT line_id AS lineId, code_normalized AS codeNormalized, package_level AS packageLevel
 FROM dbo.upstream_bill_code WHERE line_id IN @ids", new { ids = lines.Select(l => l.lineId).ToList() }, cancellationToken: ctx.RequestAborted))).ToList();
-            return Results.Ok(new { data = new { bill,
-                lines = lines.Select(l => new { l.lineId, l.platformLineId, l.platformDrugId, l.batchNo, l.quantity, l.unit,
+            return Results.Ok(new { data = new { bill = new {
+                    billId = bill.billId.ToString(), bill.platformBillId, bill.billNo, bill.billDate, bill.upstreamRefEntId,
+                    bill.toEntId, bill.completeness, bill.sourceVersion, bill.fetchedAtUtc },
+                lines = lines.Select(l => new { lineId = l.lineId.ToString(), l.platformLineId, l.platformDrugId, l.batchNo,
+                    quantity = l.quantity is null ? null : Qty(l.quantity.Value), l.unit,
                     codes = codes.Where(k => k.lineId == l.lineId).Select(k => new { k.codeNormalized, k.packageLevel }) }) },
                 requestId = ctx.TraceIdentifier });
         }).WithMetadata(new RequirePermissionAttribute(PermissionCatalog.TraceRead));
@@ -89,6 +99,9 @@ FROM dbo.upstream_bill_code WHERE line_id IN @ids", new { ids = lines.Select(l =
 
     private static (int, string) Err(HttpContext ctx, int status, string code, string message)
         => (status, JsonSerializer.Serialize(new { code, message, retryable = false, requestId = ctx.TraceIdentifier }));
+
+    // decimal(18,6) 序列化为字符串时去掉尾随零（"2.000000"→"2"），保持 API-01 字符串约定与可读性
+    private static string Qty(decimal v) => v.ToString("0.######", CultureInfo.InvariantCulture);
 
     private sealed class BillListRow
     {

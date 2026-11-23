@@ -1,6 +1,7 @@
 using System.Runtime.Versioning;
 using System.Net;
 using System.Net.Http.Json;
+using System.Text.Json;
 using Dapper;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -146,6 +147,20 @@ OUTPUT INSERTED.id VALUES(@billId,N'L1',@drug,N'B2026',2,N'盒')", new { billId,
         var detailText = await detail.Content.ReadAsStringAsync();
         Assert.Contains("COMMITTED", detailText);
         Assert.Contains(s.Code1, detailText);
+        // API-01：外部 ID 与数量必须是 JSON 字符串（JS 精度），与 confirm 的 taskId 一致
+        using var detailDoc = JsonDocument.Parse(detailText);
+        var data = detailDoc.RootElement.GetProperty("data");
+        Assert.Equal(JsonValueKind.String, data.GetProperty("snapshot").GetProperty("snapshotId").ValueKind);
+        var line = data.GetProperty("lines")[0];
+        Assert.Equal(JsonValueKind.String, line.GetProperty("lineId").ValueKind);
+        Assert.Equal("2", line.GetProperty("quantity").GetString());
+        var alloc = data.GetProperty("allocations")[0];
+        Assert.Equal(JsonValueKind.String, alloc.GetProperty("allocationId").ValueKind);
+        Assert.Equal(JsonValueKind.String, alloc.GetProperty("sourceLineId").ValueKind);
+        Assert.Equal(JsonValueKind.String, alloc.GetProperty("upstreamLineId").ValueKind);
+        Assert.Equal("2", alloc.GetProperty("quantity").GetString());
+        Assert.Equal(JsonValueKind.String, alloc.GetProperty("codes")[0].GetProperty("codeId").ValueKind);
+        Assert.Equal(JsonValueKind.String, data.GetProperty("task").GetProperty("taskId").ValueKind);
     }
 
     [Fact]
@@ -188,7 +203,15 @@ OUTPUT INSERTED.id VALUES(@billId,N'L1',@drug,N'B2026',2,N'盒')", new { billId,
         Assert.Equal("COMPLETE", rec.Completeness);
         var detail = await client.GetAsync($"/api/v1/upstream-bills/{rec.BillId}");
         Assert.Equal(HttpStatusCode.OK, detail.StatusCode);
-        Assert.Contains(s.Code1, await detail.Content.ReadAsStringAsync());
+        var detailText = await detail.Content.ReadAsStringAsync();
+        Assert.Contains(s.Code1, detailText);
+        // API-01：billId/lineId/quantity 同为 JSON 字符串
+        using var detailDoc = JsonDocument.Parse(detailText);
+        var data = detailDoc.RootElement.GetProperty("data");
+        Assert.Equal(JsonValueKind.String, data.GetProperty("bill").GetProperty("billId").ValueKind);
+        var line = data.GetProperty("lines")[0];
+        Assert.Equal(JsonValueKind.String, line.GetProperty("lineId").ValueKind);
+        Assert.Equal("2", line.GetProperty("quantity").GetString());
         NewKey(client);
         var re = await client.PostAsJsonAsync($"/api/v1/upstream-bills/{rec.BillId}/redownload", new { });
         Assert.Equal(HttpStatusCode.Accepted, re.StatusCode);
@@ -251,8 +274,9 @@ VALUES(@taskId,1,N'UPLOAD',N'MOCK',0,SYSUTCDATETIME())", new { taskId });
     private sealed record JobData(string JobId);
     private sealed record InboundList(InboundListData Data);
     private sealed record InboundListData(InboundRecord[] Records, int Total);
-    private sealed record InboundRecord(long SnapshotId, string DocKey, string? MatchState, string? TaskState);
+    // API-01：外部 ID 与数量走 JSON 字符串
+    private sealed record InboundRecord(string SnapshotId, string DocKey, string? MatchState, string? TaskState);
     private sealed record UpstreamList(UpstreamListData Data);
     private sealed record UpstreamListData(UpstreamRecord[] Records, int Total);
-    private sealed record UpstreamRecord(long BillId, string? BillNo, string Completeness);
+    private sealed record UpstreamRecord(string BillId, string? BillNo, string Completeness);
 }
