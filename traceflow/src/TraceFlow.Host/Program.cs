@@ -9,6 +9,7 @@ using TraceFlow.Infrastructure.Security;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Host.UseWindowsService();
+builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 104_857_600); // 100 MiB，与 import.maxFileBytes 上界一致（R11e）
 
 if (args.Contains("--init-admin"))
     return await AdminInitializer.RunAsync(args, builder.Configuration);

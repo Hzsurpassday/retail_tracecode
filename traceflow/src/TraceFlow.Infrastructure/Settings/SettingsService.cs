@@ -185,7 +185,19 @@ WHERE setting_key=@k AND ver=@ver",
         (int)await GetIntAsync("sync.roundIntervalSeconds", ct));
 
     public async Task<bool> IsChannelPausedAsync(CancellationToken ct)
-        => (await GetRawAsync("sync.paused", ct)) == "true";
+    {
+        var raw = await GetRawAsync("sync.paused", ct);
+        if (raw is null) return false;
+        try
+        {
+            using var doc = JsonDocument.Parse(raw);
+            return doc.RootElement.ValueKind != JsonValueKind.False; // R11a：非布尔 false 一律视为暂停（fail-closed）
+        }
+        catch (JsonException)
+        {
+            return true;
+        }
+    }
 
     public async Task<IReadOnlyList<string>> GetAuditPassValuesAsync(CancellationToken ct)
     {
