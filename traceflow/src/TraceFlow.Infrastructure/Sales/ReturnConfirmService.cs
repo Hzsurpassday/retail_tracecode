@@ -28,6 +28,8 @@ public sealed record ReturnConfirmResult(long TaskId, string State, bool Idempot
 /// 占位任务（Blocked + RETURN_CONFIRM_REQUIRED）就地经 <see cref="RetailTaskFactory"/> 提升
 /// （分片/占用/CONSUMER_RETURN|PURCHASE_RETURN 事件/outbox），再走状态机 Blocked→Ready（EligibilitySatisfied），
 /// 同事务写 return_confirmation 与审计；拒绝则保持 Blocked 并改写原因 RETURN_CONFIRM_REJECTED。
+/// 拒绝对「该来源版本」终态（R-M3-16）：后续新快照/退货行消失时由 <see cref="SaleVerificationService"/>
+/// 把占位撤销为 Cancelled + RETURN_CONFIRM_REJECTED_SUPERSEDED，本服务不提供重开（v1 无 reopen 流程）。
 /// 前序语义（决策 4）：每码唯一未退货前序事件（116=SALE，202=PURCHASE_IN），0 条 MISSING、多条 AMBIGUOUS、
 /// 已退货 ALREADY_RETURNED；前序事件所属任务必须 RETAIL_321/PURCHASE_IN_102 且 Succeeded 或有平台受理证据。
 /// 并发（决策 5）：先按 id 升序 UPDLOCK/HOLDLOCK 锁前序任务行，再锁自身任务行并重解析前序；
@@ -47,6 +49,10 @@ public sealed class ReturnConfirmService
     public const string ActionRejected = "task.return.rejected";
 
     private const int BatchSize = 500;
+    /// <summary>return_confirmation 的唯一约束（一任务一决定）；用于区分重复键来源（F6）。</summary>
+    private const string ReturnConfirmationTaskConstraint = "UQ_retconf_task";
+    /// <summary>幂等表的唯一约束（idem_key + user_id）；用于区分重复键来源（F6）。</summary>
+    private const string IdempotencyKeyConstraint = "UQ_idempotency_user_key";
 
     private readonly string _cs;
     private readonly string _env;
@@ -101,7 +107,7 @@ public sealed class ReturnConfirmService
             throw new AllocationConflictException(ErrorVersionConflict, "任务版本已变化，请刷新后重试");
         EnsureConfirmableState(task);
 
-        var ruleVersion = await ResolveRuleVersionAsync(conn, tx, task, fallbackRuleVersion, ct);
+        var ruleVersion = ResolveRuleVersion(task, fallbackRuleVersion);
         var beforeDigest = Digest(task.version, task.state, task.state_reason, predecessors);
         ReturnConfirmResult result;
         string afterDigest;
@@ -148,7 +154,8 @@ WHERE id=@id AND state=N'Blocked' AND version=@ver",
             if (await CountUploadAttemptsAsync(conn, tx, taskId, ct) > 0)
                 throw new AllocationValidationException(ErrorNotReturnable, "任务已有发送尝试，不可人工确认改写");
 
-            var ctx = new RetailTaskContext(task.org_id, _env, task.source_snapshot_id ?? 0,
+            // F5：夹具播种的 202 无来源快照，保持 NULL（不得用 0 冒充快照 id）。
+            var ctx = new RetailTaskContext(task.org_id, _env, task.source_snapshot_id,
                 DocKey(task.event_key, task.task_type), task.business_datetime, task.source_hash.Trim(),
                 mappingDigest, ruleVersion, lines, task.task_type)
             {
@@ -186,8 +193,15 @@ WHERE id=@id AND state=N'Blocked'",
         }
         catch (SqlException ex) when (ex.Number is 2601 or 2627)
         {
-            // 同键并发竞态败者：业务+幂等整体回滚后重读胜者记录（与 IdempotencyExecutor 同裁定）。
+            // F6：按约束名区分重复键，而非吞掉所有 2601/2627。
+            // UQ_retconf_task = 同一任务已有确认决定（并发穿透 Blocked 守卫）→ 409 冲突，提示刷新；
+            // UQ_idempotency_user_key = 幂等键并发竞态败者 → 业务+幂等整体回滚后重读胜者记录（与 IdempotencyExecutor 同裁定）；
+            // 其他唯一键冲突原样抛出，交由调用方回滚。
             await tx.RollbackAsync(ct);
+            if (ex.Message.Contains(ReturnConfirmationTaskConstraint, StringComparison.Ordinal))
+                throw new AllocationConflictException(ErrorVersionConflict, "任务已有退货确认决定，请刷新后重试");
+            if (!ex.Message.Contains(IdempotencyKeyConstraint, StringComparison.Ordinal))
+                throw;
             var winner = await _idempotency.TryGetAsync(conn, null!, storeKey, requestHash, userId, ct);
             if (winner is null) throw new IdempotencyConflictException();
             return ParseHit(taskId, winner);
@@ -538,18 +552,13 @@ WHERE l.snapshot_id=@snap",
             .OrderBy(s => s, StringComparer.Ordinal));
     }
 
-    private async Task<string> ResolveRuleVersionAsync(SqlConnection conn, SqlTransaction tx, TaskRow task,
-        string fallback, CancellationToken ct)
-    {
-        var fromPayload = RuleVersionFromPayload(task.payload_json);
-        if (fromPayload is not null) return fromPayload;
-        var saleKey = $"KSOA:{DocKey(task.event_key, task.task_type)}:SALE";
-        var current = await conn.ExecuteScalarAsync<string?>(new CommandDefinition(@"
-SELECT TOP 1 rule_version FROM dbo.verification
-WHERE org_id=@orgId AND env=@env AND event_key=@key AND is_current=1",
-            new { orgId = task.org_id, env = _env, key = saleKey }, tx, cancellationToken: ct));
-        return string.IsNullOrWhiteSpace(current) ? fallback : current!;
-    }
+    /// <summary>
+    /// 规则版本：占位载荷由写入方固化（116 由核验事务、202 由夹具/上级写入口），载荷恒带 ruleVersion；
+    /// 缺失时退回当前设置版本。不再按 verification 事件键回查（F3：原回退用的是 SALE 核验键，
+    /// 既不是任务键也与 verification 的键空间不匹配，属不可达死代码）。
+    /// </summary>
+    private static string ResolveRuleVersion(TaskRow task, string fallback)
+        => RuleVersionFromPayload(task.payload_json) ?? fallback;
 
     private async Task InsertReturnConfirmationAsync(SqlConnection conn, SqlTransaction tx, TaskRow task,
         string decision, string evidence, string actor, long? predecessorTaskId, CancellationToken ct)

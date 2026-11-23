@@ -84,6 +84,22 @@ public class ReturnRulesTests
     }
 
     [Fact]
+    public void Occurred_at_is_reserved_and_never_disambiguates_multiple_unreturned()
+    {
+        // F2：OccurredAt 仅为调用方展示/排序预留；时间先后绝不能把 AMBIGUOUS 静默降级为「最近一条」。
+        var result = ReturnRules.ResolvePredecessors(
+            new[]
+            {
+                Entry(20, new DateTime(2026, 11, 1), 701),
+                Entry(20, new DateTime(2026, 11, 5), 702),
+            }, Array.Empty<long>());
+
+        var candidate = Assert.Single(result);
+        Assert.Null(candidate.PredecessorEventId);
+        Assert.Equal(ReturnRules.ErrorAmbiguous, candidate.Error);
+    }
+
+    [Fact]
     public void Codes_are_resolved_independently()
     {
         var result = ReturnRules.ResolvePredecessors(

@@ -46,6 +46,10 @@ public sealed class SaleVerificationService
     public const string ReasonSaleLinesRemoved = "SALE_LINES_REMOVED";
     /// <summary>新快照已无退货行：未确认的 116 占位行政取消（从未发送、无分片、无占用）。</summary>
     public const string ReasonReturnLinesRemoved = "RETURN_LINES_REMOVED";
+    /// <summary>人工确认拒绝后的占位原因（该来源版本终态，普通刷新不改写）。</summary>
+    public const string ReasonReturnConfirmRejected = "RETURN_CONFIRM_REJECTED";
+    /// <summary>被拒绝占位遇到的来源版本已更新/退货行消失：撤销（R-M3-16，不重开、保留拒绝确认行）。</summary>
+    public const string ReasonReturnConfirmRejectedSuperseded = "RETURN_CONFIRM_REJECTED_SUPERSEDED";
     /// <summary>规则版本升级导致未发送任务载荷过期：取消经工厂重建（绝不改已发送载荷）。</summary>
     public const string ReasonRuleVersionChanged = "RULE_VERSION_CHANGED";
     /// <summary>工厂 T2 占用争用（非终态）：保持 WAIT_RETRY 由作业退避重排。</summary>
@@ -300,6 +304,9 @@ WHERE t.org_id=@orgId AND t.env=@env AND t.state=N'Blocked' AND t.state_reason=@
         else if (returnLines.Count == 0)
             await ReconcileReturnPlaceholderAsync(conn, tx, snap, settings.RuleVersion,
                 state == "PASSED" ? "PASSED" : state, dependencyState, ct);
+        else
+            // 未决（WAIT_DEPENDENCY 等）但有退货行：不刷新占位，但被拒绝占位遇到新快照仍必须撤销（F1）。
+            await SupersedeRejectedReturnPlaceholderAsync(conn, tx, snap, settings.RuleVersion, ct);
 
         await _audit.AppendAsync(conn, tx, new AuditEntry("SYSTEM", "Worker", "sale.verify", "source_snapshot",
             snap.id.ToString(CultureInfo.InvariantCulture), reason, null,
@@ -406,6 +413,8 @@ WHERE t.org_id=@orgId AND t.env=@env AND t.state=N'Blocked' AND t.state_reason=@
         // 非终态争用（WAIT_RETRY）不动任何任务；终态失败且无退货行时同样撤销未确认 116 占位（F1）。
         if (!contended && rules.ReturnLines.Count == 0)
             await ReconcileReturnPlaceholderAsync(conn, tx, snap, ruleVersion, "FAILED", "NONE", ct);
+        else if (!contended)
+            await SupersedeRejectedReturnPlaceholderAsync(conn, tx, snap, ruleVersion, ct); // 有退货行：只撤销被拒绝占位
         var verificationId = await InsertVerificationAsync(conn, tx, snap, eventKey, ruleVersion, state, resultJson,
             codeSetHash, ct);
         if (taskId is not null)
@@ -766,9 +775,10 @@ WHERE id=@id AND state IN (N'Ready',N'RetryWait')",
     }
 
     /// <summary>
-    /// 116 占位与最新结论对账（F1）：无退货行时，仍是未确认占位（Blocked + RETURN_CONFIRM_REQUIRED、无分片、无 UPLOAD 尝试）
-    /// → Cancelled + RETURN_LINES_REMOVED + 审计 task.return_placeholder.cancelled；已有分片/尝试/已确认 → ManualAction
-    /// （VERIFY_CHANGED_AFTER_SEND，绝不删除证据）。
+    /// 116 占位与最新结论对账（F1）：无退货行时，仍是待处置占位（Blocked + RETURN_CONFIRM_REQUIRED 或
+    /// RETURN_CONFIRM_REJECTED、无分片、无 UPLOAD 尝试）→ Cancelled + RETURN_LINES_REMOVED
+    /// （被拒绝的占位用 RETURN_CONFIRM_REJECTED_SUPERSEDED）+ 审计 task.return_placeholder.cancelled；
+    /// 已有分片/尝试 → ManualAction（VERIFY_CHANGED_AFTER_SEND，绝不删除证据）。
     /// </summary>
     private async Task ReconcileReturnPlaceholderAsync(SqlConnection conn, SqlTransaction tx, SnapshotRow snap,
         string ruleVersion, string verificationState, string dependencyState, CancellationToken ct)
@@ -779,25 +789,41 @@ WHERE id=@id AND state IN (N'Ready',N'RetryWait')",
         var sent = await CountUploadAttemptsAsync(conn, tx, existing.id, ct);
         var parts = await conn.ExecuteScalarAsync<int>(new CommandDefinition(
             "SELECT COUNT(*) FROM dbo.upload_part WHERE task_id=@id", new { id = existing.id }, tx, cancellationToken: ct));
-        var placeholder = existing.state == "Blocked"
+        var blocked = existing.state == "Blocked";
+        var placeholder = blocked
             && string.Equals(existing.state_reason, ReasonReturnConfirmRequired, StringComparison.Ordinal);
-        if (placeholder && sent == 0 && parts == 0)
+        var rejected = blocked
+            && string.Equals(existing.state_reason, ReasonReturnConfirmRejected, StringComparison.Ordinal);
+        if ((placeholder || rejected) && sent == 0 && parts == 0)
         {
-            var updated = await conn.ExecuteAsync(new CommandDefinition(@"
-UPDATE dbo.upload_task SET state=N'Cancelled', state_reason=@reason, version=version+1
-WHERE id=@id AND state=N'Blocked'",
-                new { id = existing.id, reason = ReasonReturnLinesRemoved }, tx, cancellationToken: ct));
-            if (updated == 0) return;
-            await _audit.AppendAsync(conn, tx, new AuditEntry("SYSTEM", "Worker", "task.return_placeholder.cancelled",
-                "upload_task", existing.id.ToString(CultureInfo.InvariantCulture), ReasonReturnLinesRemoved, null,
-                JsonSerializer.Serialize(new { priorState = existing.state, priorReason = existing.state_reason,
-                    reason = ReasonReturnLinesRemoved, parts, uploadAttempts = sent }),
-                null, ruleVersion, _env));
+            await CancelReturnPlaceholderAsync(conn, tx, existing.id, existing.state, existing.state_reason,
+                rejected ? ReasonReturnConfirmRejectedSuperseded : ReasonReturnLinesRemoved, parts, sent, ruleVersion, ct);
             return;
         }
         await MarkManualActionAsync(conn, tx, existing.id, existing.state, existing.state_reason,
             ReasonVerifyChangedAfterSend, verificationState, dependencyState, dispatching: false, uploadAttempts: sent,
             ruleVersion, ct);
+    }
+
+    /// <summary>
+    /// 退货占位撤销（F1）：仅 Blocked 且调用方已确认零分片零 UPLOAD 尝试时置 Cancelled + reason、
+    /// version+1，并审计 task.return_placeholder.cancelled（含 priorState/priorReason，绝不删除确认证据）。
+    /// 返回是否实际改写（并发下已被他人处置则为 false）。
+    /// </summary>
+    private async Task<bool> CancelReturnPlaceholderAsync(SqlConnection conn, SqlTransaction tx, long taskId,
+        string priorState, string? priorReason, string reason, int parts, int uploadAttempts, string ruleVersion,
+        CancellationToken ct)
+    {
+        var updated = await conn.ExecuteAsync(new CommandDefinition(@"
+UPDATE dbo.upload_task SET state=N'Cancelled', state_reason=@reason, version=version+1
+WHERE id=@id AND state=N'Blocked'",
+            new { id = taskId, reason }, tx, cancellationToken: ct));
+        if (updated == 0) return false;
+        await _audit.AppendAsync(conn, tx, new AuditEntry("SYSTEM", "Worker", "task.return_placeholder.cancelled",
+            "upload_task", taskId.ToString(CultureInfo.InvariantCulture), reason, null,
+            JsonSerializer.Serialize(new { priorState, priorReason, reason, parts, uploadAttempts }),
+            null, ruleVersion, _env));
+        return true;
     }
 
     /// <summary>
@@ -961,6 +987,9 @@ WHERE id=@id",
     /// Task 6 确认事务内经工厂同行提升（R-M3-7）。仍是待确认占位（Blocked + RETURN_CONFIRM_REQUIRED、
     /// 无分片、无 UPLOAD 尝试）且新快照 id/摘要不同 → 就地刷新载荷/哈希/来源快照（同一行、同一事件键），
     /// 保证确认时发送最新退货行；已确认/已分片/已发送的任务一律不动。
+    /// 被拒绝占位（Blocked + RETURN_CONFIRM_REJECTED，R-M3-16）刷新语义不同：拒绝对旧来源版本终态，
+    /// 新快照/摘要不同即撤销为 Cancelled + RETURN_CONFIRM_REJECTED_SUPERSEDED（零分片零尝试前提），
+    /// 不重开、不新建任务/确认行，既有 return_confirmation(REJECTED) 作为证据保留。
     /// </summary>
     private async Task EnsureReturnPlaceholderTaskAsync(SqlConnection conn, SqlTransaction tx, SnapshotRow snap,
         string ruleVersion, string mappingDigest, IReadOnlyList<RetailLine> lines, CancellationToken ct)
@@ -996,9 +1025,17 @@ WHERE id=@id AND state=N'Cancelled'",
                       mv = Sha(mappingDigest), pj = payloadJson, ph = Sha(payloadJson) }, tx, cancellationToken: ct));
             return;
         }
+        if (existing.state == "Blocked"
+            && string.Equals(existing.state_reason, ReasonReturnConfirmRejected, StringComparison.Ordinal))
+        {
+            // F1/R-M3-16：拒绝只对「当时那个来源版本」终态。同一快照 = 幂等零写入；
+            // 新快照（id 或摘要不同）→ 占位撤销为 Cancelled，绝不留下携带过期载荷的永久 Blocked 任务。
+            await SupersedeRejectedReturnPlaceholderAsync(conn, tx, snap, ruleVersion, ct);
+            return;
+        }
         if (existing.state != "Blocked"
             || !string.Equals(existing.state_reason, ReasonReturnConfirmRequired, StringComparison.Ordinal))
-            return; // 已确认（Ready 及之后）或已被处置：占位载荷不可改写
+            return; // 已确认（Ready 及之后）或已被处置（含被拒绝占位，上方已按新快照撤销规则处理）：占位载荷不可改写
         var sent = await CountUploadAttemptsAsync(conn, tx, existing.id, ct);
         if (sent > 0) return;
         var parts = await conn.ExecuteScalarAsync<int>(new CommandDefinition(
@@ -1013,6 +1050,31 @@ UPDATE dbo.upload_task SET source_snapshot_id=@snap, source_hash=@sh, mapping_ve
 WHERE id=@id",
             new { id = existing.id, snap = snap.id, sh = snap.content_hash, mv = Sha(mappingDigest),
                   pj = payloadJson, ph = Sha(payloadJson) }, tx, cancellationToken: ct));
+    }
+
+    /// <summary>
+    /// 被拒绝占位（Blocked + RETURN_CONFIRM_REJECTED）在来源版本变化时撤销（F1/R-M3-16）：
+    /// 仅当快照 id/摘要与占位不同、且零分片零 UPLOAD 尝试时置 Cancelled + RETURN_CONFIRM_REJECTED_SUPERSEDED；
+    /// 同快照（幂等）、已确认/已发送的票一律不动，也不新建任务或确认行。
+    /// 返回是否实际撤销。
+    /// </summary>
+    private async Task<bool> SupersedeRejectedReturnPlaceholderAsync(SqlConnection conn, SqlTransaction tx,
+        SnapshotRow snap, string ruleVersion, CancellationToken ct)
+    {
+        var existing = await LoadTaskAsync(conn, tx, snap.org_id, TaskEventKey(snap, TaskTypeReturn), ct);
+        if (existing is null || existing.state != "Blocked"
+            || !string.Equals(existing.state_reason, ReasonReturnConfirmRejected, StringComparison.Ordinal))
+            return false;
+        if (existing.source_snapshot_id == snap.id
+            && string.Equals(existing.source_hash, snap.content_hash, StringComparison.Ordinal))
+            return false; // 同一来源版本：拒绝对该版本终态，零写入
+        var sent = await CountUploadAttemptsAsync(conn, tx, existing.id, ct);
+        if (sent > 0) return false; // 已发送/有尝试：绝不取消
+        var parts = await conn.ExecuteScalarAsync<int>(new CommandDefinition(
+            "SELECT COUNT(*) FROM dbo.upload_part WHERE task_id=@id", new { id = existing.id }, tx, cancellationToken: ct));
+        if (parts > 0) return false;
+        return await CancelReturnPlaceholderAsync(conn, tx, existing.id, existing.state, existing.state_reason,
+            ReasonReturnConfirmRejectedSuperseded, parts, sent, ruleVersion, ct);
     }
 
     private async Task<CurrentRow?> ReadCurrentAsync(SqlConnection conn, long orgId, string eventKey,

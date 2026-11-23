@@ -17,11 +17,12 @@ public sealed record RetailLine(long SourceLineId, string SourceLineKey, string 
 
 /// <summary>
 /// 零售任务上下文（SALE-05）。TaskType ∈ {RETAIL_321, CONSUMER_RETURN_116, PURCHASE_RETURN_202}。
+/// <see cref="SnapshotId"/> 可空：夹具播种的 202 无 KSOA 快照，落库保持 NULL（绝不写 0 假装有来源）。
 /// MappingDigest 为调用方排序拼接后的映射 id/version 串（工厂再摘要化写入 mapping_version_snapshot，与 M2 同法）。
 /// <see cref="PredecessorEventByCodeId"/>（可选，init）：116/202 的 codeId→前序 code_event id（116=SALE，202=PURCHASE_IN），
 /// 由 Task 6 构造；321 为 null。退货事件与 predecessor_task_id 均由此派生，不额外增加方法参数。
 /// </summary>
-public sealed record RetailTaskContext(long OrgId, string Env, long SnapshotId, string DocKey, DateTime? BusinessDateTimeUtc,
+public sealed record RetailTaskContext(long OrgId, string Env, long? SnapshotId, string DocKey, DateTime? BusinessDateTimeUtc,
     string SourceHash, string MappingDigest, string RuleVersion, IReadOnlyList<RetailLine> Lines, string TaskType)
 {
     /// <summary>退货前序事件（codeId → predecessor code_event.id）；321 保持 null。</summary>

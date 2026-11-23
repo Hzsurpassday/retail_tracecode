@@ -9,14 +9,18 @@ public sealed record ReturnCandidate(long CodeId, long? SourceLineId, long? Pred
 
 /// <summary>
 /// 退货前序规则（RET-01/02/04 的纯函数部分，无 IO，可在单测内穷举）：
-/// 每个退货码必须能唯一确定一条「尚未退回的最近 SALE 事件」作为前序。
+/// 每个退货码必须能唯一确定一条「尚未退回的 SALE 事件」作为前序。
 /// <list type="bullet">
 /// <item>无任何 SALE 事件 → <c>PREDECESSOR_MISSING</c>（未在该店销售过，不得退货上报）；</item>
 /// <item>全部 SALE 事件已被退回（某 CONSUMER_RETURN 的 predecessor_event_id 指向它）→ <c>ALREADY_RETURNED</c>（一码仅一退）；</item>
 /// <item>多于一条未退回 SALE 事件 → <c>PREDECESSOR_AMBIGUOUS</c>（操作员必须先在源系统澄清，绝不猜）；</item>
-/// <item>恰好一条未退回 → 该事件即前序（唯一时自然也是最近一次）。</item>
+/// <item>恰好一条未退回 → 该事件即前序。</item>
 /// </list>
 /// 输入按码分组时允许同一码出现多次（调用方按事件逐条给出），事件 id 会先去重。
+/// <para>
+/// <c>OccurredAt</c> 为<b>保留参数</b>（调用方展示/排序预留），本规则<b>不使用</b>：
+/// 多条未退回一律 <c>PREDECESSOR_AMBIGUOUS</c>，绝不按发生时间「挑最近一条」，避免把歧义静默变成猜测（决策 4）。
+/// </para>
 /// </summary>
 public static class ReturnRules
 {
@@ -24,7 +28,10 @@ public static class ReturnRules
     public const string ErrorAmbiguous = "PREDECESSOR_AMBIGUOUS";
     public const string ErrorAlreadyReturned = "ALREADY_RETURNED";
 
-    /// <summary>同一退货码是否已有前序的确定性判定；返回顺序跟随输入中码的首次出现顺序。</summary>
+    /// <summary>
+    /// 同一退货码是否已有前序的确定性判定；返回顺序跟随输入中码的首次出现顺序。
+    /// <c>sales[i].OccurredAt</c> 为保留字段（当前忽略），多未退回一律 AMBIGUOUS。
+    /// </summary>
     public static IReadOnlyList<ReturnCandidate> ResolvePredecessors(
         IReadOnlyList<(long CodeId, DateTime? OccurredAt, IReadOnlyList<long> SaleEventIds)> sales,
         IReadOnlyList<long> returnedEventIds)

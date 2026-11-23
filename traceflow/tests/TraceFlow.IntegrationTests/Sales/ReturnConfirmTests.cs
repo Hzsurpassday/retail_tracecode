@@ -359,6 +359,49 @@ SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'upload-dispatch' AND payloa
             "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'task.return.rejected'"));
     }
 
+    /// <summary>
+    /// F1/R-M3-16：拒绝对「当时那个来源版本」终态。同单新快照（摘要不同）到达 → 占位撤销为
+    /// Cancelled + RETURN_CONFIRM_REJECTED_SUPERSEDED、version+1、审计留 priorReason；
+    /// 既有 return_confirmation(REJECTED) 原样保留（不重开、不新建任务/确认行）。
+    /// </summary>
+    [Fact]
+    public async Task Rejected_placeholder_is_cancelled_when_source_snapshot_changes()
+    {
+        await using var c = await _fx.OpenAsync();
+        var code = Code(12);
+        var scenario = await SeedConfirmableAsync(c, "SALE-T6-S1", "RET-T6-S1", code);
+        await NewConfirmService().ConfirmAsync(scenario.ReturnTaskId,
+            new ReturnConfirmCommand(1, "REJECTED", new[] { scenario.SaleEventId }, Evidence, "idem-t6-s1", "tester"),
+            default);
+        Assert.Equal("RETURN_CONFIRM_REJECTED", await ScalarAsync<string>(c,
+            "SELECT state_reason FROM dbo.upload_task WHERE id=@id", new { id = scenario.ReturnTaskId }));
+
+        // 同一退货单的 v2 快照（摘要不同）：重跑核验 → 被拒绝占位不得继续携带过期载荷。
+        var ret2 = await SeedSaleAsync(c, "RET-T6-S1", 2, new LineSeed("1", "SP0001", -1, "CONSUMER_RETURN", code));
+        await VerifyAsync(ret2);
+
+        Assert.Equal("Cancelled", await ScalarAsync<string>(c, "SELECT state FROM dbo.upload_task WHERE id=@id",
+            new { id = scenario.ReturnTaskId }));
+        Assert.Equal("RETURN_CONFIRM_REJECTED_SUPERSEDED", await ScalarAsync<string>(c,
+            "SELECT state_reason FROM dbo.upload_task WHERE id=@id", new { id = scenario.ReturnTaskId }));
+        Assert.Equal(3, await ScalarAsync<int>(c, "SELECT version FROM dbo.upload_task WHERE id=@id",
+            new { id = scenario.ReturnTaskId }));
+        Assert.Equal(1, await ScalarAsync<int>(c,
+            "SELECT COUNT(*) FROM dbo.return_confirmation WHERE task_id=@id AND decision=N'REJECTED'",
+            new { id = scenario.ReturnTaskId }));
+        Assert.Equal(1, await ScalarAsync<int>(c, @"
+SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'task.return_placeholder.cancelled' AND object_id=@id",
+            new { id = scenario.ReturnTaskId.ToString(CultureInfo.InvariantCulture) }));
+        var supersededEvidence = await ScalarAsync<string>(c, @"
+SELECT after_digest FROM dbo.audit_log WHERE action=N'task.return_placeholder.cancelled' AND object_id=@id",
+            new { id = scenario.ReturnTaskId.ToString(CultureInfo.InvariantCulture) });
+        Assert.Contains("RETURN_CONFIRM_REJECTED", supersededEvidence); // priorReason 留证
+        Assert.Contains("RETURN_CONFIRM_REJECTED_SUPERSEDED", supersededEvidence);
+        // 不重开：同一事件键仍只有一行退货任务（不新建 REQUIRED 占位）。
+        Assert.Equal(1, await ScalarAsync<int>(c,
+            "SELECT COUNT(*) FROM dbo.upload_task WHERE task_type=N'CONSUMER_RETURN_116'"));
+    }
+
     [Fact]
     public async Task Repeat_same_confirmation_is_idempotent()
     {
@@ -381,6 +424,39 @@ SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'upload-dispatch' AND payloa
             "SELECT COUNT(*) FROM dbo.code_event WHERE event_type=N'CONSUMER_RETURN'"));
         Assert.Equal(1, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.idempotency_record"));
         Assert.Equal(1, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.return_confirmation"));
+    }
+
+    /// <summary>
+    /// F4：幂等键按任务隔离（storeKey = rc:+SHA256(IdemKey)，请求指纹含 taskId）。
+    /// 同一 IdemKey 换任务 → 409 IDEMPOTENCY_CONFLICT，且第二个任务零写入。
+    /// </summary>
+    [Fact]
+    public async Task Same_idempotency_key_for_different_task_is_409()
+    {
+        await using var c = await _fx.OpenAsync();
+        var first = await SeedConfirmableAsync(c, "SALE-T6-K1", "RET-T6-K1", Code(10));
+        var second = await SeedConfirmableAsync(c, "SALE-T6-K2", "RET-T6-K2", Code(11));
+        var svc = NewConfirmService();
+        await svc.ConfirmAsync(first.ReturnTaskId,
+            new ReturnConfirmCommand(1, "CONFIRMED", new[] { first.SaleEventId }, Evidence, "idem-t6-shared", "tester"),
+            default);
+
+        await Assert.ThrowsAsync<IdempotencyConflictException>(() => svc.ConfirmAsync(second.ReturnTaskId,
+            new ReturnConfirmCommand(1, "CONFIRMED", new[] { second.SaleEventId }, Evidence, "idem-t6-shared", "tester"),
+            default));
+
+        Assert.Equal("Blocked", await ScalarAsync<string>(c, "SELECT state FROM dbo.upload_task WHERE id=@id",
+            new { id = second.ReturnTaskId }));
+        Assert.Equal("RETURN_CONFIRM_REQUIRED", await ScalarAsync<string>(c,
+            "SELECT state_reason FROM dbo.upload_task WHERE id=@id", new { id = second.ReturnTaskId }));
+        Assert.Equal(1, await ScalarAsync<int>(c, "SELECT version FROM dbo.upload_task WHERE id=@id",
+            new { id = second.ReturnTaskId }));
+        Assert.Equal(0, await ScalarAsync<int>(c,
+            "SELECT COUNT(*) FROM dbo.code_claim WHERE upload_task_id=@id AND claim_state=N'ACTIVE'",
+            new { id = second.ReturnTaskId }));
+        Assert.Equal(0, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.return_confirmation WHERE task_id=@id",
+            new { id = second.ReturnTaskId }));
+        Assert.Equal(1, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.idempotency_record"));
     }
 
     [Fact]
@@ -506,6 +582,12 @@ SELECT COUNT(*) FROM dbo.code_event WHERE upload_task_id=@id AND event_type=N'PU
             "SELECT COUNT(*) FROM dbo.upload_part WHERE task_id=@id", new { id = taskId }));
         Assert.Equal("PURCHASE_IN", await ScalarAsync<string>(c,
             "SELECT relation_kind FROM dbo.return_confirmation WHERE task_id=@id", new { id = taskId }));
+        // F5：夹具 202 无来源快照 → 确认提升后仍保持 NULL（不得写成 0 冒充快照 id），事件同理。
+        Assert.Null(await ScalarAsync<long?>(c,
+            "SELECT source_snapshot_id FROM dbo.upload_task WHERE id=@id", new { id = taskId }));
+        Assert.Equal(0, await ScalarAsync<int>(c, @"
+SELECT COUNT(*) FROM dbo.code_event WHERE upload_task_id=@id AND source_snapshot_id IS NOT NULL",
+            new { id = taskId }));
     }
 
     /// <summary>
