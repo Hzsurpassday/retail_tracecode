@@ -16,15 +16,15 @@ public sealed record RetailLine(long SourceLineId, string SourceLineKey, string 
     decimal Quantity, string? Unit, string? BatchNo, IReadOnlyList<(long CodeId, string CodeNormalized)> Codes);
 
 /// <summary>
-/// 零售任务上下文（SALE-05）。TaskType ∈ {RETAIL_321, CONSUMER_RETURN_116}。
+/// 零售任务上下文（SALE-05）。TaskType ∈ {RETAIL_321, CONSUMER_RETURN_116, PURCHASE_RETURN_202}。
 /// MappingDigest 为调用方排序拼接后的映射 id/version 串（工厂再摘要化写入 mapping_version_snapshot，与 M2 同法）。
-/// <see cref="PredecessorEventByCodeId"/>（可选，init）：116 的 codeId→前序 SALE code_event id，由 Task 6 构造；
-/// 321 为 null。退货事件与 predecessor_task_id 均由此派生，不额外增加方法参数。
+/// <see cref="PredecessorEventByCodeId"/>（可选，init）：116/202 的 codeId→前序 code_event id（116=SALE，202=PURCHASE_IN），
+/// 由 Task 6 构造；321 为 null。退货事件与 predecessor_task_id 均由此派生，不额外增加方法参数。
 /// </summary>
 public sealed record RetailTaskContext(long OrgId, string Env, long SnapshotId, string DocKey, DateTime? BusinessDateTimeUtc,
     string SourceHash, string MappingDigest, string RuleVersion, IReadOnlyList<RetailLine> Lines, string TaskType)
 {
-    /// <summary>116 前序事件（codeId → predecessor code_event.id）；321 保持 null。</summary>
+    /// <summary>退货前序事件（codeId → predecessor code_event.id）；321 保持 null。</summary>
     public IReadOnlyDictionary<long, long>? PredecessorEventByCodeId { get; init; }
 }
 
@@ -36,7 +36,7 @@ public sealed record RetailTaskResult(long TaskId, IReadOnlyList<long> PartIds, 
 
 /// <summary>
 /// 零售任务工厂（SALE-05/IDEM-03/DEF-01）：事件键为单据级 <c>KSOA:{docKey}:{taskType}</c>，同事务创建
-/// upload_task + 多分片 + 每分片 outbox + 逐码 T2 占用（RETAIL:321 / RETURN:116）+ code_event。
+/// upload_task + 多分片 + 每分片 outbox + 逐码 T2 占用（RETAIL:321 / RETURN:116 / RETURN:202）+ code_event。
 /// 分片按行顺序装填且单行不可拆（行码数 &gt; upload.part.maxCodes → 422 PART_TOO_LARGE）；
 /// bill_code = BillCodeGenerator(contract, taskId, partIndex)（P1/P2 后缀），Cancelled 复活不换单号。
 /// Blocked + RETURN_CONFIRM_REQUIRED（116 人工确认）走同一绑定写路径，但任务保持 Blocked，
@@ -47,6 +47,8 @@ public sealed class RetailTaskFactory
 {
     public const string Retail321 = "RETAIL_321";
     public const string ConsumerReturn116 = "CONSUMER_RETURN_116";
+    /// <summary>采购退货 202（R-M3-4：无 KSOA 采集，只做服务/测试支持）。</summary>
+    public const string PurchaseReturn202 = "PURCHASE_RETURN_202";
     private const string CancelledState = "Cancelled";
     private const string BlockedState = "Blocked";
     private const string ReturnConfirmRequired = "RETURN_CONFIRM_REQUIRED";
@@ -64,7 +66,7 @@ public sealed class RetailTaskFactory
     {
         if (ctx.Lines.Count == 0)
             throw new AllocationValidationException("EMPTY_LINES", "任务至少须包含一条通过核验的销售行");
-        if (ctx.TaskType is not (Retail321 or ConsumerReturn116))
+        if (ctx.TaskType is not (Retail321 or ConsumerReturn116 or PurchaseReturn202))
             throw new AllocationValidationException("TASK_TYPE_INVALID", $"不支持的零售任务类型 {ctx.TaskType}");
         if (ctx.Lines.Sum(l => l.Codes.Count) == 0)
             throw new AllocationValidationException("EMPTY_CODES", "任务至少须包含一个通过核验的追溯码");
@@ -311,13 +313,13 @@ WHERE claim_state=N'ACTIVE' AND event_scope=@scope AND org_id=@orgId AND env=@en
     }
 
     /// <summary>
-    /// 116 前序映射校验：每个码必须给出前序事件，且该 code_event 必须存在、code_id 与码一致。
-    /// 任一缺失/错配 → PREDECESSOR_INVALID（在任何写入前抛出）。
+    /// 退货前序映射校验：每个码必须给出前序事件，且该 code_event 必须存在、code_id 与码一致。
+    /// 任一缺失/错配 → PREDECESSOR_INVALID（在任何写入前抛出）。321 无前序要求。
     /// </summary>
     private static async Task ValidatePredecessorsAsync(SqlConnection conn, SqlTransaction tx,
         RetailTaskContext ctx, CancellationToken ct)
     {
-        if (ctx.TaskType != ConsumerReturn116) return;
+        if (ctx.TaskType == Retail321) return;
         var map = ctx.PredecessorEventByCodeId;
         var codeIds = ctx.Lines.SelectMany(l => l.Codes.Select(c => c.CodeId)).Distinct().ToList();
         if (map is null || codeIds.Any(id => !map.ContainsKey(id)))
@@ -341,12 +343,16 @@ SELECT id, code_id FROM dbo.code_event WHERE org_id=@orgId AND env=@env AND id I
         }
     }
 
-    /// <summary>321 → 每码 SALE/OUT；116 → 每码 CONSUMER_RETURN/IN（predecessor_event_id 由调用方映射，缺省 NULL）。</summary>
+    /// <summary>321 → 每码 SALE/OUT；116 → CONSUMER_RETURN/IN；202 → PURCHASE_RETURN/OUT（predecessor_event_id 由调用方映射）。</summary>
     private static async Task InsertEventsAsync(SqlConnection conn, SqlTransaction tx, RetailTaskContext ctx, long taskId,
         CancellationToken ct)
     {
-        var eventType = ctx.TaskType == Retail321 ? "SALE" : "CONSUMER_RETURN";
-        var direction = ctx.TaskType == Retail321 ? "OUT" : "IN";
+        var (eventType, direction) = ctx.TaskType switch
+        {
+            Retail321 => ("SALE", "OUT"),
+            ConsumerReturn116 => ("CONSUMER_RETURN", "IN"),
+            _ => ("PURCHASE_RETURN", "OUT"),
+        };
         foreach (var line in ctx.Lines)
             foreach (var code in line.Codes)
             {
@@ -366,11 +372,11 @@ VALUES(@orgId,@env,@codeId,@eventType,@direction,@snap,@lineId,@taskId,@predeces
             }
     }
 
-    /// <summary>116 前序任务：前序事件所属任务唯一时回填 predecessor_task_id，否则留 NULL（不伪造血缘）。</summary>
+    /// <summary>退货前序任务：前序事件所属任务唯一时回填 predecessor_task_id，否则留 NULL（不伪造血缘）。</summary>
     private static async Task<long?> ResolvePredecessorTaskAsync(SqlConnection conn, SqlTransaction tx,
         RetailTaskContext ctx, CancellationToken ct)
     {
-        if (ctx.TaskType != ConsumerReturn116 || ctx.PredecessorEventByCodeId is null || ctx.PredecessorEventByCodeId.Count == 0)
+        if (ctx.TaskType == Retail321 || ctx.PredecessorEventByCodeId is null || ctx.PredecessorEventByCodeId.Count == 0)
             return null;
         var ids = ctx.PredecessorEventByCodeId.Values.Distinct().ToList();
         var taskIds = (await conn.QueryAsync<long?>(new CommandDefinition(@"
@@ -383,7 +389,12 @@ SELECT upload_task_id FROM dbo.code_event WHERE id IN @ids AND upload_task_id IS
         return taskIds.Count == 1 ? taskIds[0] : null;
     }
 
-    private static string ClaimScope(string taskType) => taskType == Retail321 ? "RETAIL:321" : "RETURN:116";
+    private static string ClaimScope(string taskType) => taskType switch
+    {
+        Retail321 => "RETAIL:321",
+        PurchaseReturn202 => "RETURN:202",
+        _ => "RETURN:116",
+    };
 
     private static string DocPayloadJson(string eventKey, RetailTaskContext ctx, IReadOnlyList<string> predecessorBillCodes)
     {

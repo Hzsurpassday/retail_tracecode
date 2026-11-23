@@ -227,20 +227,6 @@ WHERE t.org_id=@orgId AND t.env=@env AND t.state=N'Blocked' AND t.state_reason=@
             : null;
         var dependencyState = dependencyMissing ? "WAIT" : "NONE";
 
-        var resultJson = JsonSerializer.Serialize(new
-        {
-            state,
-            reason,
-            failCode = failed?.Reason,
-            eventKey,
-            ruleVersion = settings.RuleVersion,
-            saleLineKeys = rules.SaleLines.Select(l => l.SourceLineKey).ToArray(),
-            returnLineKeys = rules.ReturnLines.Select(l => l.SourceLineKey).ToArray(),
-            codes = conclusions.Select(c => new { code = c.Code, lineKey = c.Entry.SourceLineKey, result = c.Result, reason = c.Reason }),
-            deferredCodes = deferred,
-            platformCalls,
-            dependencyState,
-        });
         var codeSetHash = SourceHasher.CodeSetHash(rules.SaleLines.Select(l => l.CodeNormalized!).ToList());
 
         // ---- 阶段 C：单事务落库（verification + verification_code + 任务）----
@@ -258,6 +244,30 @@ WHERE t.org_id=@orgId AND t.env=@env AND t.state=N'Blocked' AND t.state_reason=@
         var saleLines = BuildRetailLines(rules.SaleLines, rows, codeIds);
         var returnLines = BuildRetailLines(rules.ReturnLines, rows, codeIds);
         var mappingDigest = MappingDigest(rows);
+        // 退货前序候选（RET-02/RET-04）：逐码解析唯一未退货 SALE 事件并回填来源行；
+        // 写入口只供展示，确认时由 ReturnConfirmService 锁定后重新解析（客户端提交值不可信）。
+        var returnCandidates = await LoadReturnCandidatesAsync(conn, tx, snap, returnLines, ct);
+        var resultJson = JsonSerializer.Serialize(new
+        {
+            state,
+            reason,
+            failCode = failed?.Reason,
+            eventKey,
+            ruleVersion = settings.RuleVersion,
+            saleLineKeys = rules.SaleLines.Select(l => l.SourceLineKey).ToArray(),
+            returnLineKeys = rules.ReturnLines.Select(l => l.SourceLineKey).ToArray(),
+            codes = conclusions.Select(c => new { code = c.Code, lineKey = c.Entry.SourceLineKey, result = c.Result, reason = c.Reason }),
+            deferredCodes = deferred,
+            platformCalls,
+            dependencyState,
+            returnCandidates = returnCandidates.Select(c => new
+            {
+                codeId = c.CodeId,
+                sourceLineId = c.SourceLineId,
+                predecessorEventId = c.PredecessorEventId,
+                error = c.Error,
+            }).ToArray(),
+        });
 
         long? taskId = null;
         // 只有确有销售行才创建 321；销售桶为空（退货单/全 EXEMPT）必须把上一版本遗留的活动 321 变为不可发送（F1）。
@@ -613,6 +623,61 @@ WHERE e.org_id=@orgId AND e.env=@env AND e.event_type=N'PURCHASE_IN' AND t.state
             .Select(r => $"product:{r.product_source_id}:{r.mapping_version}")
             .Distinct(StringComparer.Ordinal)
             .OrderBy(s => s, StringComparer.Ordinal));
+
+    /// <summary>
+    /// 退货前序候选：逐退货码取 SALE 事件（按发生时间升序）与已退货前序集合（CONSUMER_RETURN.predecessor_event_id），
+    /// 交由 <see cref="ReturnRules.ResolvePredecessors"/> 判定 MISSING/AMBIGUOUS/ALREADY_RETURNED 或唯一前序；
+    /// SourceLineId 由调用方按码回填（规则层不依赖行结构）。
+    /// </summary>
+    private async Task<IReadOnlyList<ReturnCandidate>> LoadReturnCandidatesAsync(SqlConnection conn,
+        SqlTransaction tx, SnapshotRow snap, IReadOnlyList<RetailLine> returnLines, CancellationToken ct)
+    {
+        if (returnLines.Count == 0) return Array.Empty<ReturnCandidate>();
+        var lineIdByCode = new Dictionary<long, long>();
+        foreach (var line in returnLines)
+            foreach (var code in line.Codes)
+                lineIdByCode.TryAdd(code.CodeId, line.SourceLineId);
+        var codeIds = lineIdByCode.Keys.ToList();
+
+        var events = new Dictionary<long, List<(long Id, DateTime At)>>();
+        var returned = new List<long>();
+        for (var start = 0; start < codeIds.Count; start += CodeChunk)
+        {
+            var chunk = codeIds.Skip(start).Take(CodeChunk).ToList();
+            var rows = await conn.QueryAsync<PredecessorEventRow>(new CommandDefinition(@"
+SELECT code_id, id, occurred_at FROM dbo.code_event
+WHERE org_id=@orgId AND env=@env AND event_type=N'SALE' AND code_id IN @ids
+ORDER BY occurred_at, id",
+                new { orgId = snap.org_id, env = _env, ids = chunk }, tx, cancellationToken: ct));
+            foreach (var row in rows)
+            {
+                if (!events.TryGetValue(row.code_id, out var list))
+                {
+                    list = new List<(long, DateTime)>();
+                    events[row.code_id] = list;
+                }
+                list.Add((row.id, row.occurred_at));
+            }
+            returned.AddRange(await conn.QueryAsync<long>(new CommandDefinition(@"
+SELECT predecessor_event_id FROM dbo.code_event
+WHERE org_id=@orgId AND env=@env AND event_type=N'CONSUMER_RETURN' AND predecessor_event_id IS NOT NULL
+  AND code_id IN @ids",
+                new { orgId = snap.org_id, env = _env, ids = chunk }, tx, cancellationToken: ct)));
+        }
+
+        var input = new List<(long CodeId, DateTime? OccurredAt, IReadOnlyList<long> SaleEventIds)>(codeIds.Count);
+        foreach (var codeId in codeIds)
+        {
+            var list = events.TryGetValue(codeId, out var found) ? found : new List<(long Id, DateTime At)>();
+            input.Add((codeId, list.Count == 0 ? null : list.Max(x => x.At), list.Select(x => x.Id).ToList()));
+        }
+        return ReturnRules.ResolvePredecessors(input, returned)
+            .Select(c => c with
+            {
+                SourceLineId = lineIdByCode.TryGetValue(c.CodeId, out var lineId) ? lineId : null,
+            })
+            .ToList();
+    }
 
     private static string TaskEventKey(SnapshotRow snap, string taskType)
         => $"KSOA:{snap.source_document_key}:{taskType}";
@@ -1095,6 +1160,13 @@ WHERE org_id=@orgId AND env=@env AND event_key=@key",
         public string source_hash { get; set; } = "";
         public string rule_version { get; set; } = "";
         public string? result_json { get; set; }
+    }
+
+    private sealed class PredecessorEventRow
+    {
+        public long code_id { get; set; }
+        public long id { get; set; }
+        public DateTime occurred_at { get; set; }
     }
 
     private sealed class TaskRow
