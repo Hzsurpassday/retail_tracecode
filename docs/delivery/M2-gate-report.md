@@ -70,7 +70,7 @@ dotnet test traceflow/tests/TraceFlow.UnitTests -c Release --no-build
 已通过! - 失败: 0，通过: 168，已跳过: 0，总计: 168，持续时间: 181 ms - TraceFlow.UnitTests.dll (net8.0)
 ```
 
-**结果：168/168 通过**（M1 为 136，M2 净增 32）。M2 相关新增/扩充单元类（逐类用例数经 grep 核对）：TopResponseParserTests 13、RateBackoffTests 2、ChannelPauseTests 1、SourceValueObjectTests 扩充（含 Daily_window/Gap_backfill/Code_set_hash 等 M2 值对象用例）。
+**结果：168/168 通过**（M1 为 136，M2 净增 32）。M2 相关新增/扩充单元类（逐类用例数经 `dotnet test --list-tests` 实测核对，Theory 按 `InlineData` 展开后的用例数计；全部单元类合计 168，与上条汇总一致）：TopResponseParserTests 13、RateBackoffTests 2 methods / 6 cases（1 Theory×5 + 1 Fact）、TopGatewayTests 5（源码在 `traceflow/tests/TraceFlow.UnitTests/Top/TopGatewayTests.cs`）、SourceValueObjectTests 扩充至 25 用例（含 Daily_window/Gap_backfill/Code_set_hash 等 M2 值对象用例）。
 
 ### 3. 集成测试（授权降级，默认 collation）
 
@@ -87,7 +87,7 @@ dotnet test traceflow/tests/TraceFlow.IntegrationTests -c Release --no-build
 ```
 
 **结果：287/287 通过（SQL Server 2019 15.0.2000.5，授权降级；2008 R2 待补验）。** M1 为 180，M2 净增 107。
-M2 新增/扩充集成类（逐类用例数经 grep 核对，测试名与 matrix.md 一致）：AllocationServiceTests 11、AllocationConfirmTests 7、ClaimAndCancelTests 6、InboundMatchTests 11、InboundTaskFactoryTests 4、BillContractTests 3、UpstreamDownloadTests 10、EnterpriseSyncTests 7、InboundApiTests 8、M2ApiGateTests 4、M2CarryforwardApiTests 7、SettingsScopeApiTests 7、RateBudgetTests 5、TopClientServiceTests 4、Migration0008Tests 5；TopGatewayTests 5 与 SettingsFailClosedTests 3 为存量类在 M2 口径下的复跑。
+M2 新增/扩充集成类（逐类用例数经 `dotnet test --list-tests` 实测核对，测试名与 matrix.md 一致）：AllocationServiceTests 11、AllocationConfirmTests 7、ClaimAndCancelTests 6、InboundMatchTests 12、InboundTaskFactoryTests 4、BillContractTests 3、UpstreamDownloadTests 10、EnterpriseSyncTests 7、InboundApiTests 8、M2ApiGateTests 4、M2CarryforwardApiTests 7、SettingsScopeApiTests 7、RateBudgetTests 5、TopClientServiceTests 4、ChannelPauseTests 1（`TraceFlow.IntegrationTests/Top/ChannelPauseTests.cs`）、Migration0008Tests 5；SettingsFailClosedTests 3 为存量类在 M2 口径下的复跑。
 每个测试类经 `Sql2008Fixture` 自建 `TraceFlow_Test_<guid>` 临时库并在 Dispose 时 DROP（见 ③ 末尾残留核查）。
 
 ### 4. 集成测试（授权降级，BIN2 变体）
@@ -97,10 +97,10 @@ M2 新增/扩充集成类（逐类用例数经 grep 核对，测试名与 matrix
 真实输出：
 
 ```
-已通过! - 失败: 0，通过: 287，已跳过: 0，总计: 287，持续时间: 1 m 27 s - TraceFlow.IntegrationTests.dll (net8.0)
+已通过! - 失败: 0，通过: 287，已跳过: 0，总计: 287，持续时间: 1 m 11 s - TraceFlow.IntegrationTests.dll (net8.0)
 ```
 
-**结果：287/287 通过，与默认 collation 变体用例数一致，两变体均全绿**（码/外部 ID 的 BIN2 语义在 M2 的分配占用、上游单据 identity、企业改名版本化用例上同样成立）。
+**结果：287/287 通过，与默认 collation 变体用例数一致，两变体均全绿**（码/外部 ID 的 BIN2 语义在 M2 的分配占用、上游单据 identity、企业改名版本化用例上同样成立）。默认 collation 轮尾部为其自身运行的记录（287/287 全部通过，数字正确）；上一版两轮粘贴的耗时同为 1 m 27 s 系同一机器连续运行的巧合，本轮仅将 BIN2 轮按重新实测的尾部校正为 1 m 11 s，其余数字未动。
 
 ### 5. 前端构建
 
@@ -164,7 +164,7 @@ version|name|checksum|applied_at|success
 8|0008_m2_upstream_allocation.sql|F3DC59F6F51AAAB2F07AA1B09C46A36B59896EEDC51794163784F5CA166C6EF0|2026-11-23 14:36:26.020|1
 ```
 
-checksum 为迁移文件字节 SHA-256（MigrationRunner 计算）。**与 M1 报告快照的差异说明**：0001–0007 的 checksum 与 M1 报告完全一致（0002–0005 的 EOF 换行变更已在 M1 说明并入库）；0008 为 M2 新增增量迁移，其 checksum 为首次登记。二次运行幂等跳过与 checksum 不一致即停由 `MigratorTests.Second_run_is_idempotent_skip`、`Checksum_mismatch_stops_and_does_not_partially_apply` 覆盖（本次 287/287 中通过）。
+checksum 为迁移文件字节 SHA-256（MigrationRunner 计算）。**时区说明**：`applied_at` 由 `MigrationRunner` 以 `SYSUTCDATETIME()` 写入（UTC，见 `traceflow/db/tools/TraceFlow.DbMigrator/MigrationRunner.cs`），而上表对照的 `sys.databases.create_date`（22:36:06）为服务器本地时间（UTC+8），故 14:36 与 22:36 相差 8 小时属预期时区偏移，不是账本被篡改。**与 M1 报告快照的差异说明**：0001–0007 的 checksum 与 M1 报告完全一致（0002–0005 的 EOF 换行变更已在 M1 说明并入库）；0008 为 M2 新增增量迁移，其 checksum 为首次登记。二次运行幂等跳过与 checksum 不一致即停由 `MigratorTests.Second_run_is_idempotent_skip`、`Checksum_mismatch_stops_and_does_not_partially_apply` 覆盖（本次 287/287 中通过）。
 
 4. 残留与保留核查（真实查询）：
    - `SELECT name, create_date FROM sys.databases WHERE name LIKE 'TraceFlow%'` → `TraceFlow_Dev`（11:29:06）、`TraceFlow_M2Gate`（22:36:06）、`TraceFlow_M2Manual`（21:35:21），另有 **29 个 `TraceFlow_Test_<guid>`**，其 `create_date` **全部为 2026-11-23 17:37:39**。

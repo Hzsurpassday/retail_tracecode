@@ -314,10 +314,13 @@ components:
                 properties:
                   budgetKey: { type: string, description: 'appkey:total / method:{m} / ent:{ref}:method:{m}' }
                   dayCount: { type: integer }
+                  dayWindowStart: { type: string, format: date-time, nullable: true, description: '日窗口起点（UTC）；仅当该窗口仍活跃时返回，否则 null 且 dayCount 出网为 0（读时评估，库内计数不清零）' }
                   dayLimit: { type: integer, nullable: true, description: null=本地不设帽（G-TOP 未取证不虚构限值） }
                   minuteCount: { type: integer }
+                  minuteWindowStart: { type: string, format: date-time, nullable: true, description: '分钟窗口起点（UTC）；窗口不活跃时为 null' }
                   minuteLimit: { type: integer, nullable: true }
                   secondCount: { type: integer }
+                  secondWindowStart: { type: string, format: date-time, nullable: true, description: '秒窗口起点（UTC）；窗口不活跃时为 null' }
                   secondLimit: { type: integer, nullable: true }
                   nextAllowedAtUtc: { type: string, format: date-time, nullable: true }
             pauses:
