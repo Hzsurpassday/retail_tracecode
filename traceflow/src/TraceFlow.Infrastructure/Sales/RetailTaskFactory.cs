@@ -1,0 +1,343 @@
+using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using Dapper;
+using Microsoft.Data.SqlClient;
+using TraceFlow.Application.Abstractions;
+using TraceFlow.Domain.Billing;
+using TraceFlow.Domain.Sources;
+using TraceFlow.Infrastructure.Settings;
+
+namespace TraceFlow.Infrastructure.Sales;
+
+/// <summary>零售单据行：码集合为核验后的规范化码（CodeId 为 trace_code 主键）。</summary>
+public sealed record RetailLine(long SourceLineId, string SourceLineKey, string ProductSourceId, string PlatformDrugId,
+    decimal Quantity, string? Unit, string? BatchNo, IReadOnlyList<(long CodeId, string CodeNormalized)> Codes);
+
+/// <summary>
+/// 零售任务上下文（SALE-05）。TaskType ∈ {RETAIL_321, CONSUMER_RETURN_116}。
+/// MappingDigest 为调用方排序拼接后的映射 id/version 串（工厂再摘要化写入 mapping_version_snapshot，与 M2 同法）。
+/// <see cref="PredecessorEventByCodeId"/>（可选，init）：116 的 codeId→前序 SALE code_event id，由 Task 6 构造；
+/// 321 为 null。退货事件与 predecessor_task_id 均由此派生，不额外增加方法参数。
+/// </summary>
+public sealed record RetailTaskContext(long OrgId, string Env, long SnapshotId, string DocKey, DateTime? BusinessDateTimeUtc,
+    string SourceHash, string MappingDigest, string RuleVersion, IReadOnlyList<RetailLine> Lines, string TaskType)
+{
+    /// <summary>116 前序事件（codeId → predecessor code_event.id）；321 保持 null。</summary>
+    public IReadOnlyDictionary<long, long>? PredecessorEventByCodeId { get; init; }
+}
+
+/// <summary>PartIds 按 part_index 升序；Reused=true 表示复用既有任务（未新建/未复活）。</summary>
+public sealed record RetailTaskResult(long TaskId, IReadOnlyList<long> PartIds, bool Reused);
+
+/// <summary>
+/// 零售任务工厂（SALE-05/IDEM-03/DEF-01）：事件键为单据级 <c>KSOA:{docKey}:{taskType}</c>，同事务创建
+/// upload_task + 多分片 + 每分片 outbox + 逐码 T2 占用（RETAIL:321 / RETURN:116）+ code_event。
+/// 分片按行顺序装填且单行不可拆（行码数 &gt; upload.part.maxCodes → 422 PART_TOO_LARGE）；
+/// bill_code = BillCodeGenerator(contract, taskId, partIndex)（P1/P2 后缀），Cancelled 复活不换单号。
+/// 调用方负责事务边界与提交；本类只抛出异常，不做回滚。
+/// </summary>
+public sealed class RetailTaskFactory
+{
+    public const string Retail321 = "RETAIL_321";
+    public const string ConsumerReturn116 = "CONSUMER_RETURN_116";
+    private const string CancelledState = "Cancelled";
+
+    private readonly SettingsService _settings;
+    private readonly IJobQueue _queue;
+    public RetailTaskFactory(SettingsService settings, IJobQueue queue)
+    {
+        _settings = settings;
+        _queue = queue;
+    }
+
+    public async Task<RetailTaskResult> CreateAsync(SqlConnection conn, SqlTransaction tx, RetailTaskContext ctx, CancellationToken ct)
+    {
+        if (ctx.Lines.Count == 0)
+            throw new AllocationValidationException("EMPTY_LINES", "任务至少须包含一条通过核验的销售行");
+        if (ctx.TaskType is not (Retail321 or ConsumerReturn116))
+            throw new AllocationValidationException("TASK_TYPE_INVALID", $"不支持的零售任务类型 {ctx.TaskType}");
+        if (ctx.Lines.Sum(l => l.Codes.Count) == 0)
+            throw new AllocationValidationException("EMPTY_CODES", "任务至少须包含一个通过核验的追溯码");
+
+        var eventKey = $"KSOA:{ctx.DocKey}:{ctx.TaskType}";
+        var maxCodes = await _settings.GetPartMaxCodesAsync(ct);
+        var buckets = Split(ctx.Lines, maxCodes);
+        var predecessorTaskId = await ResolvePredecessorTaskAsync(conn, tx, ctx, ct);
+        var predecessorBillCodes = predecessorTaskId is null
+            ? Array.Empty<string>()
+            : (await conn.QueryAsync<string>(new CommandDefinition(
+                "SELECT bill_code FROM dbo.upload_part WHERE task_id=@id ORDER BY part_index",
+                new { id = predecessorTaskId.Value }, tx, cancellationToken: ct))).ToArray();
+
+        var payloadJson = DocPayloadJson(eventKey, ctx, predecessorBillCodes);
+        var payloadHash = Sha(payloadJson);
+        var mappingSnapshot = Sha(ctx.MappingDigest);
+
+        var existing = await conn.QuerySingleOrDefaultAsync<ExistingRow>(new CommandDefinition(@"
+SELECT id,state FROM dbo.upload_task WITH (UPDLOCK, HOLDLOCK) WHERE org_id=@orgId AND env=@env AND event_key=@key",
+            new { orgId = ctx.OrgId, env = ctx.Env, key = eventKey }, tx, cancellationToken: ct));
+        if (existing is not null && existing.state != CancelledState)
+        {
+            var reusedPartIds = (await conn.QueryAsync<long>(new CommandDefinition(
+                "SELECT id FROM dbo.upload_part WHERE task_id=@id ORDER BY part_index",
+                new { id = existing.id }, tx, cancellationToken: ct))).ToList();
+            return new RetailTaskResult(existing.id, reusedPartIds, true);
+        }
+
+        var reactivating = existing is not null;
+        long taskId;
+        if (existing is not null)
+        {
+            var sent = await conn.ExecuteScalarAsync<int>(new CommandDefinition(
+                "SELECT COUNT(*) FROM dbo.upload_attempt WHERE task_id=@id AND attempt_kind=N'UPLOAD'",
+                new { id = existing.id }, tx, cancellationToken: ct));
+            if (sent > 0)
+                throw new AllocationConflictException("REACTIVATE_REFUSED", "Cancelled 任务已有 UPLOAD 尝试，禁止同行复活");
+            taskId = existing.id;
+            await conn.ExecuteAsync(new CommandDefinition(@"
+UPDATE dbo.upload_task SET state=N'Ready', state_reason=N'Cancelled 任务复活（从未发送）',
+       source_snapshot_id=@snap, source_hash=@sh, payload_json=@pj, payload_hash=@ph, mapping_version_snapshot=@mv,
+       source_integrity=N'COMPLETE', match_state=N'COMPLETE', verification_state=N'PASSED', dependency_state=N'NONE',
+       predecessor_task_id=@pred, version=version+1
+WHERE id=@id",
+                new { id = taskId, snap = ctx.SnapshotId, sh = ctx.SourceHash, pj = payloadJson, ph = payloadHash,
+                      mv = mappingSnapshot, pred = predecessorTaskId }, tx, cancellationToken: ct));
+        }
+        else
+        {
+            taskId = await conn.ExecuteScalarAsync<long>(new CommandDefinition(@"
+INSERT INTO dbo.upload_task(org_id,env,event_key,task_type,source_snapshot_id,source_hash,mapping_version_snapshot,
+    payload_json,payload_hash,state,source_integrity,match_state,verification_state,dependency_state,predecessor_task_id)
+OUTPUT INSERTED.id
+VALUES(@orgId,@env,@key,@taskType,@snap,@sh,@mv,@pj,@ph,N'Ready',N'COMPLETE',N'COMPLETE',N'PASSED',N'NONE',@pred)",
+                new { orgId = ctx.OrgId, env = ctx.Env, key = eventKey, taskType = ctx.TaskType, snap = ctx.SnapshotId,
+                      sh = ctx.SourceHash, mv = mappingSnapshot, pj = payloadJson, ph = payloadHash, pred = predecessorTaskId },
+                tx, cancellationToken: ct));
+        }
+
+        var partIds = await UpsertPartsAsync(conn, tx, ctx, eventKey, taskId, buckets, maxCodes, reactivating, predecessorBillCodes, ct);
+        await InsertClaimsAsync(conn, tx, ctx, taskId, ClaimScope(ctx.TaskType), ct);
+        await InsertEventsAsync(conn, tx, ctx, taskId, ct);
+        return new RetailTaskResult(taskId, partIds, false);
+    }
+
+    /// <summary>行码数上限内按行顺序装填；单行码数超限即 422 PART_TOO_LARGE（单行不可跨分片）。</summary>
+    private static List<List<RetailLine>> Split(IReadOnlyList<RetailLine> lines, int maxCodes)
+    {
+        var buckets = new List<List<RetailLine>>();
+        var current = new List<RetailLine>();
+        var count = 0;
+        foreach (var line in lines)
+        {
+            if (line.Codes.Count == 0) continue; // 无码行不进载荷（核验已保证 REQUIRED 行有码）
+            if (line.Codes.Count > maxCodes)
+                throw new AllocationValidationException("PART_TOO_LARGE",
+                    $"来源行 {line.SourceLineKey} 含 {line.Codes.Count} 个码，超过分片上限 {maxCodes}（单行不可拆）");
+            if (count > 0 && count + line.Codes.Count > maxCodes)
+            {
+                buckets.Add(current);
+                current = new List<RetailLine>();
+                count = 0;
+            }
+            current.Add(line);
+            count += line.Codes.Count;
+        }
+        if (current.Count > 0) buckets.Add(current);
+        return buckets;
+    }
+
+    /// <summary>
+    /// 逐分片落库：复活时复用既有 part_index → bill_code（不换单号），分片数变少的多余分片行政性取消；
+    /// 每个分片一条 upload-dispatch（intent part:{partId}，trigger sale-verify），CANCELLED 队列行复位。
+    /// </summary>
+    private async Task<IReadOnlyList<long>> UpsertPartsAsync(SqlConnection conn, SqlTransaction tx, RetailTaskContext ctx,
+        string eventKey, long taskId, IReadOnlyList<List<RetailLine>> buckets, int maxCodes, bool reactivating,
+        IReadOnlyList<string> predecessorBillCodes, CancellationToken ct)
+    {
+        var existingParts = reactivating
+            ? (await conn.QueryAsync<PartRow>(new CommandDefinition(
+                "SELECT id, part_index, bill_code FROM dbo.upload_part WHERE task_id=@id ORDER BY part_index",
+                new { id = taskId }, tx, cancellationToken: ct))).ToList()
+            : new List<PartRow>();
+        var contract = existingParts.Count < buckets.Count ? await _settings.GetBillContractAsync(ct) : null;
+        var splitRule = $"maxCodes:{maxCodes}";
+        var partIds = new List<long>(buckets.Count);
+        for (var index = 0; index < buckets.Count; index++)
+        {
+            var partJson = PartPayloadJson(eventKey, ctx, buckets[index], index, predecessorBillCodes);
+            var partHash = Sha(partJson);
+            var codeSetHash = SourceHasher.CodeSetHash(
+                buckets[index].SelectMany(l => l.Codes.Select(c => c.CodeNormalized)).ToList());
+            long partId;
+            if (index < existingParts.Count)
+            {
+                partId = existingParts[index].id;
+                await conn.ExecuteAsync(new CommandDefinition(@"
+UPDATE dbo.upload_part SET payload_json=@pj, payload_hash=@ph, code_set_hash=@csh, split_rule_version=@srv, state=N'Ready'
+WHERE id=@id",
+                    new { id = partId, pj = partJson, ph = partHash, csh = codeSetHash, srv = splitRule },
+                    tx, cancellationToken: ct));
+            }
+            else
+            {
+                var billCode = BillCodeGenerator.Generate(contract!, taskId, index); // 超长抛 InvalidOperationException，禁截断
+                partId = await conn.ExecuteScalarAsync<long>(new CommandDefinition(@"
+INSERT INTO dbo.upload_part(task_id,org_id,env,part_index,bill_code,payload_json,payload_hash,code_set_hash,split_rule_version,state)
+OUTPUT INSERTED.id
+VALUES(@taskId,@orgId,@env,@idx,@bill,@pj,@ph,@csh,@srv,N'Ready')",
+                    new { taskId, orgId = ctx.OrgId, env = ctx.Env, idx = index, bill = billCode, pj = partJson,
+                          ph = partHash, csh = codeSetHash, srv = splitRule }, tx, cancellationToken: ct));
+            }
+            partIds.Add(partId);
+            var jobId = await _queue.EnqueueAsync(conn, tx, ctx.OrgId, ctx.Env, "upload-dispatch", $"part:{partId}",
+                JsonSerializer.Serialize(new { orgId = ctx.OrgId, env = ctx.Env, taskId, partId, trigger = "sale-verify" }),
+                DateTime.UtcNow, ct);
+            await conn.ExecuteAsync(new CommandDefinition(@"
+UPDATE dbo.outbox_job SET job_state=N'PENDING', attempt_count=0, next_run_at=SYSUTCDATETIME(),
+       finished_at=NULL, last_error=NULL, lease_owner=NULL, lease_until=NULL
+WHERE id=@id AND job_state=N'CANCELLED'", new { id = jobId }, tx, cancellationToken: ct));
+        }
+        // 复活后分片数减少：多余旧分片不再承载任何码，行政性取消（含其未执行的发送作业），避免过期码集被发送。
+        for (var index = buckets.Count; index < existingParts.Count; index++)
+        {
+            await conn.ExecuteAsync(new CommandDefinition(
+                "UPDATE dbo.upload_part SET state=N'Cancelled' WHERE id=@id AND state<>N'Cancelled'",
+                new { id = existingParts[index].id }, tx, cancellationToken: ct));
+            await conn.ExecuteAsync(new CommandDefinition(@"
+UPDATE dbo.outbox_job SET job_state=N'CANCELLED', finished_at=SYSUTCDATETIME()
+WHERE org_id=@orgId AND env=@env AND job_kind=N'upload-dispatch' AND intent_key=@intent AND job_state IN (N'PENDING',N'FAILED')",
+                new { orgId = ctx.OrgId, env = ctx.Env, intent = $"part:{existingParts[index].id}" }, tx, cancellationToken: ct));
+        }
+        return partIds;
+    }
+
+    /// <summary>T2 占用：每码一条 ACTIVE（scope 与 M2 的 PURCHASE_IN 分开）；同任务已持有的占用不重复插入，其余冲突 2601/2627 → CODE_CONTENDED。</summary>
+    private static async Task InsertClaimsAsync(SqlConnection conn, SqlTransaction tx, RetailTaskContext ctx, long taskId,
+        string scope, CancellationToken ct)
+    {
+        foreach (var line in ctx.Lines)
+            foreach (var code in line.Codes)
+            {
+                try
+                {
+                    await conn.ExecuteAsync(new CommandDefinition(@"
+IF NOT EXISTS (SELECT 1 FROM dbo.code_claim
+               WHERE org_id=@orgId AND env=@env AND code_id=@codeId AND event_scope=@scope
+                 AND claim_state=N'ACTIVE' AND upload_task_id=@taskId)
+INSERT INTO dbo.code_claim(org_id,env,code_id,event_scope,upload_task_id,allocation_id,claim_state)
+VALUES(@orgId,@env,@codeId,@scope,@taskId,NULL,N'ACTIVE')",
+                        new { orgId = ctx.OrgId, env = ctx.Env, codeId = code.CodeId, scope, taskId },
+                        tx, cancellationToken: ct));
+                }
+                catch (SqlException ex) when (ex.Number is 2601 or 2627)
+                {
+                    // 唯一索引 UX_claim_active 争用：由调用方回滚整个事务（无半成品任务）。
+                    throw new AllocationValidationException("CODE_CONTENDED",
+                        $"码 {code.CodeNormalized} 在 {scope} 范围已被其他有效任务占用");
+                }
+            }
+    }
+
+    /// <summary>321 → 每码 SALE/OUT；116 → 每码 CONSUMER_RETURN/IN（predecessor_event_id 由调用方映射，缺省 NULL）。</summary>
+    private static async Task InsertEventsAsync(SqlConnection conn, SqlTransaction tx, RetailTaskContext ctx, long taskId,
+        CancellationToken ct)
+    {
+        var eventType = ctx.TaskType == Retail321 ? "SALE" : "CONSUMER_RETURN";
+        var direction = ctx.TaskType == Retail321 ? "OUT" : "IN";
+        foreach (var line in ctx.Lines)
+            foreach (var code in line.Codes)
+            {
+                long? predecessor = ctx.PredecessorEventByCodeId is not null
+                    && ctx.PredecessorEventByCodeId.TryGetValue(code.CodeId, out var pred)
+                    ? pred
+                    : null;
+                await conn.ExecuteAsync(new CommandDefinition(@"
+IF NOT EXISTS (SELECT 1 FROM dbo.code_event
+               WHERE org_id=@orgId AND env=@env AND code_id=@codeId AND event_type=@eventType AND source_line_id=@lineId)
+INSERT INTO dbo.code_event(org_id,env,code_id,event_type,direction,source_snapshot_id,source_line_id,
+    upload_task_id,predecessor_event_id,business_datetime)
+VALUES(@orgId,@env,@codeId,@eventType,@direction,@snap,@lineId,@taskId,@predecessor,@biz)",
+                    new { orgId = ctx.OrgId, env = ctx.Env, codeId = code.CodeId, eventType, direction,
+                          snap = ctx.SnapshotId, lineId = line.SourceLineId, taskId, predecessor = predecessor,
+                          biz = ctx.BusinessDateTimeUtc }, tx, cancellationToken: ct));
+            }
+    }
+
+    /// <summary>116 前序任务：前序事件所属任务唯一时回填 predecessor_task_id，否则留 NULL（不伪造血缘）。</summary>
+    private static async Task<long?> ResolvePredecessorTaskAsync(SqlConnection conn, SqlTransaction tx,
+        RetailTaskContext ctx, CancellationToken ct)
+    {
+        if (ctx.TaskType != ConsumerReturn116 || ctx.PredecessorEventByCodeId is null || ctx.PredecessorEventByCodeId.Count == 0)
+            return null;
+        var ids = ctx.PredecessorEventByCodeId.Values.Distinct().ToList();
+        var taskIds = (await conn.QueryAsync<long?>(new CommandDefinition(@"
+SELECT upload_task_id FROM dbo.code_event WHERE id IN @ids AND upload_task_id IS NOT NULL",
+            new { ids }, tx, cancellationToken: ct)))
+            .Where(id => id.HasValue)
+            .Select(id => id!.Value)
+            .Distinct()
+            .ToList();
+        return taskIds.Count == 1 ? taskIds[0] : null;
+    }
+
+    private static string ClaimScope(string taskType) => taskType == Retail321 ? "RETAIL:321" : "RETURN:116";
+
+    private static string DocPayloadJson(string eventKey, RetailTaskContext ctx, IReadOnlyList<string> predecessorBillCodes)
+    {
+        var payload = new Dictionary<string, object?>
+        {
+            ["eventKey"] = eventKey,
+            ["taskType"] = ctx.TaskType,
+            ["businessDateTimeUtc"] = ctx.BusinessDateTimeUtc,
+            ["ruleVersion"] = ctx.RuleVersion,
+            ["lines"] = ctx.Lines.Select(LineProjection).ToArray(),
+        };
+        // 116：平台载荷需携带原销售单号（RET-04）；321 不含该字段（全单不可变载荷与 brief 形状一致）。
+        if (predecessorBillCodes.Count > 0) payload["predecessorBillCodes"] = predecessorBillCodes;
+        return JsonSerializer.Serialize(payload);
+    }
+
+    private static string PartPayloadJson(string eventKey, RetailTaskContext ctx, IReadOnlyList<RetailLine> lines,
+        int partIndex, IReadOnlyList<string> predecessorBillCodes)
+    {
+        var payload = new Dictionary<string, object?>
+        {
+            ["eventKey"] = eventKey,
+            ["taskType"] = ctx.TaskType,
+            ["partIndex"] = partIndex,
+            ["businessDateTimeUtc"] = ctx.BusinessDateTimeUtc,
+            ["ruleVersion"] = ctx.RuleVersion,
+            ["lines"] = lines.Select(LineProjection).ToArray(),
+        };
+        if (predecessorBillCodes.Count > 0) payload["predecessorBillCodes"] = predecessorBillCodes;
+        return JsonSerializer.Serialize(payload);
+    }
+
+    private static object LineProjection(RetailLine line) => new
+    {
+        sourceLineKey = line.SourceLineKey,
+        productSourceId = line.ProductSourceId,
+        platformDrugId = line.PlatformDrugId,
+        quantity = line.Quantity.ToString("0.000000", CultureInfo.InvariantCulture),
+        unit = line.Unit,
+        batchNo = line.BatchNo,
+        codes = line.Codes.Select(c => c.CodeNormalized).ToArray(),
+    };
+
+    private static string Sha(string s) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(s)));
+
+    private sealed class ExistingRow
+    {
+        public long id { get; set; }
+        public string state { get; set; } = "";
+    }
+
+    private sealed class PartRow
+    {
+        public long id { get; set; }
+        public int part_index { get; set; }
+        public string bill_code { get; set; } = "";
+    }
+}
