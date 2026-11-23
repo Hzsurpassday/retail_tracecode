@@ -139,14 +139,22 @@ ORDER BY p.rn2", args, cancellationToken: ctx.RequestAborted))).ToList();
         }).RequireAuthorization();
 
         // ---------------------------------------------------------------- 上传任务钻取
-        app.MapGet("/api/v1/upload-tasks/{id:long}", async (HttpContext ctx, long id, SettingsService settings) =>
+        app.MapGet("/api/v1/upload-tasks/{id:long}", async (HttpContext ctx, long id,
+            [FromQuery(Name = "env")] string? envFilter, SettingsService settings) =>
         {
+            // 与列表同一口径：env 可选，非法值 400；任务须属于「活动机构 + 目标环境」，范围外一律 404。
+            var targetEnv = ResolveEnv(envFilter, env);
+            if (targetEnv is null) return Err(ctx, 400, "VALIDATION", "env 只能为 LIVE 或 MOCK");
+
             await using var conn = new SqlConnection(connectionString);
             await conn.OpenAsync(ctx.RequestAborted);
+            var orgId = await conn.ExecuteScalarAsync<long>(new CommandDefinition(
+                "SELECT id FROM dbo.organization WHERE is_active=1", cancellationToken: ctx.RequestAborted));
             var task = await conn.QuerySingleOrDefaultAsync<UploadTaskRow>(new CommandDefinition(@"
 SELECT id, event_key, task_type, env, source_snapshot_id, predecessor_task_id, state, state_reason,
        version, created_at, verification_state, dependency_state, match_state, source_integrity, payload_hash
-FROM dbo.upload_task WHERE id=@id", new { id }, cancellationToken: ctx.RequestAborted));
+FROM dbo.upload_task WHERE id=@id AND org_id=@orgId AND env=@env",
+                new { id, orgId, env = targetEnv }, cancellationToken: ctx.RequestAborted));
             if (task is null)
                 return Err(ctx, 404, "NOT_FOUND", "上传任务不存在");
             var parts = (await conn.QueryAsync<UploadPartRow>(new CommandDefinition(@"
@@ -249,7 +257,7 @@ WHERE object_type=N'upload_task' AND object_id=@objectId AND env=@env ORDER BY o
                     return ErrTuple(ctx, 422, "VALIDATION", "请求体必填");
                 var cmd = new ManualVerifyCommand(req.Decision ?? "", req.Evidence?.PlatformBillCode,
                     req.Evidence?.ContractEvidence, req.ExpectedVersion);
-                var result = await svc.ManualVerifyAsync(conn, tx, id, cmd, ctx.User.Identity!.Name!,
+                var result = await svc.ManualVerifyAsync(conn, tx, id, env, cmd, ctx.User.Identity!.Name!,
                     ctx.TraceIdentifier, ct);
                 return (200, JsonSerializer.Serialize(new { data = new
                 {
@@ -274,7 +282,7 @@ WHERE object_type=N'upload_task' AND object_id=@objectId AND env=@env ORDER BY o
                 {
                     return ErrTuple(ctx, 400, "BAD_REQUEST", "请求体不是合法 JSON");
                 }
-                var result = await svc.ControlledRetryAsync(conn, tx, id, req?.ExpectedVersion,
+                var result = await svc.ControlledRetryAsync(conn, tx, id, env, req?.ExpectedVersion,
                     ctx.User.Identity!.Name!, ctx.TraceIdentifier, ct);
                 return (200, JsonSerializer.Serialize(new { data = new
                 {

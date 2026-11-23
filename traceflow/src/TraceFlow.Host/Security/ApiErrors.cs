@@ -35,7 +35,13 @@ public static class ApiErrors
         IReadOnlyList<object> fieldErrors = Array.Empty<object>();
         if (ex is AllocationConflictException ace) code = ace.ErrorCode;
         if (ex is AllocationValidationException ave) { code = ave.ErrorCode; fieldErrors = ave.FieldErrors ?? Array.Empty<object>(); }
+        // 限流：retryAfter（秒）来自异常，无可用值（≤0）时为 null；有值才写 Retry-After 响应头。
+        int? retryAfter = ex is TopRateLimitedException rateLimited && rateLimited.Wait > TimeSpan.Zero
+            ? (int)Math.Ceiling(rateLimited.Wait.TotalSeconds)
+            : null;
         ctx.Response.StatusCode = status;
+        if (retryAfter is int seconds)
+            ctx.Response.Headers["Retry-After"] = seconds.ToString(System.Globalization.CultureInfo.InvariantCulture);
         // 日志记录完整异常（服务端），响应只给安全信息；禁连接串/堆栈（NFR-05）
         ctx.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("ApiErrors")
             .LogError(ex, "request failed {RequestId}", ctx.TraceIdentifier);
@@ -50,6 +56,6 @@ public static class ApiErrors
             Microsoft.AspNetCore.Antiforgery.AntiforgeryValidationException => "CSRF 令牌缺失或无效",
             BadHttpRequestException or System.Text.Json.JsonException => "请求参数或格式无效",
             _ => "服务内部错误",
-        }, fieldErrors, retryable, requestId = ctx.TraceIdentifier });
+        }, fieldErrors, retryable, retryAfter, requestId = ctx.TraceIdentifier });
     }
 }

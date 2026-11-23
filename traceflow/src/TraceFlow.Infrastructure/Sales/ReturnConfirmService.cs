@@ -252,11 +252,16 @@ WHERE id=@id AND state=N'Blocked'",
         return value;
     }
 
+    /// <summary>
+    /// 任务必须存在且属于退货类型：不存在（含跨环境 id）→ 404 <see cref="ResourceNotFoundException"/>；
+    /// 存在但类型不支持 → 422 NOT_RETURNABLE（未知资源与业务不可退货必须区分，避免把 404 说成 422）。
+    /// </summary>
     private static void EnsureReturnTask(TaskRow? task)
     {
-        if (task is null
-            || task.task_type is not (RetailTaskFactory.ConsumerReturn116 or RetailTaskFactory.PurchaseReturn202))
-            throw new AllocationValidationException(ErrorNotReturnable, "退货任务不存在或类型不支持");
+        if (task is null)
+            throw new ResourceNotFoundException("退货任务不存在");
+        if (task.task_type is not (RetailTaskFactory.ConsumerReturn116 or RetailTaskFactory.PurchaseReturn202))
+            throw new AllocationValidationException(ErrorNotReturnable, "退货任务类型不支持");
     }
 
     private static void EnsureConfirmableState(TaskRow task)

@@ -256,6 +256,34 @@ VALUES(@taskId,@orgId,@env,0,@bill,N'{}',@hash,@hash,N'Succeeded')",
         Assert.Equal(HttpStatusCode.NotFound, (await client.GetAsync("/api/v1/pos-sales/999999")).StatusCode);
     }
 
+    /// <summary>详情与列表同一 env 口径：非法值 400；快照不属于该环境视图 → 404；未核验快照两视图都可见。</summary>
+    [Fact]
+    public async Task Sale_detail_is_env_scoped_like_the_list()
+    {
+        var mock = await SeedSaleAsync("E1", 51, new DateTime(2026, 11, 20, 6, 0, 0, DateTimeKind.Utc));
+        await SeedVerificationAsync(mock, "MOCK", withTask: true);
+        var live = await SeedSaleAsync("E2", 52, new DateTime(2026, 11, 21, 6, 0, 0, DateTimeKind.Utc));
+        await SeedVerificationAsync(live, "LIVE", withTask: false);
+        var unverified = await SeedSaleAsync("E3", 53, new DateTime(2026, 11, 22, 6, 0, 0, DateTimeKind.Utc));
+
+        var client = await LoginAsync("sales-admin", AdminPassword);
+        Assert.Equal(HttpStatusCode.OK, (await client.GetAsync($"/api/v1/pos-sales/{mock.SnapshotId}")).StatusCode);
+        Assert.Equal(HttpStatusCode.OK,
+            (await client.GetAsync($"/api/v1/pos-sales/{mock.SnapshotId}?env=MOCK")).StatusCode);
+        var cross = await client.GetAsync($"/api/v1/pos-sales/{mock.SnapshotId}?env=LIVE");
+        Assert.Equal(HttpStatusCode.NotFound, cross.StatusCode);
+        Assert.Contains("NOT_FOUND", await cross.Content.ReadAsStringAsync());
+        Assert.Equal(HttpStatusCode.OK,
+            (await client.GetAsync($"/api/v1/pos-sales/{live.SnapshotId}?env=LIVE")).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound,
+            (await client.GetAsync($"/api/v1/pos-sales/{live.SnapshotId}")).StatusCode);
+        // R-M3-17：未核验快照无 env 归属，两个环境视图都能钻取。
+        Assert.Equal(HttpStatusCode.OK,
+            (await client.GetAsync($"/api/v1/pos-sales/{unverified.SnapshotId}?env=LIVE")).StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest,
+            (await client.GetAsync($"/api/v1/pos-sales/{mock.SnapshotId}?env=PROD")).StatusCode);
+    }
+
     // ---------------------------------------------------------------- 退货确认
 
     private sealed record ReturnScenario(long SaleTaskId, long SaleEventId, string SaleBillCode, long ReturnTaskId,
@@ -392,6 +420,89 @@ UPDATE dbo.source_line SET event_kind=N'CONSUMER_RETURN', quantity_original=-1, 
         Assert.Equal(1, await c.ExecuteScalarAsync<int>(
             "SELECT COUNT(*) FROM dbo.audit_log WHERE object_type=N'upload_task' AND object_id=@id AND action=N'task.return.confirmed'",
             new { id = scenario.ReturnTaskId.ToString() }));
+    }
+
+    /// <summary>
+    /// 未知退货任务 404（不是 422）：任务不存在/跨环境 → NOT_FOUND；
+    /// 任务存在但载荷缺 lines → 仍为 422 NOT_RETURNABLE（既有语义保持）。
+    /// </summary>
+    [Fact]
+    public async Task Unknown_return_task_is_404_not_422()
+    {
+        var client = await LoginAsync("sales-admin", AdminPassword);
+        NewIdemKey(client);
+        var resp = await client.PostAsJsonAsync("/api/v1/returns/999999/confirm", new
+        {
+            expectedVersion = 1,
+            decision = "CONFIRMED",
+            predecessorEventIds = Array.Empty<long>(),
+            evidence = new { reason = "原码退回" },
+            idemKey = Guid.NewGuid().ToString(),
+        });
+        Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
+        Assert.Contains("NOT_FOUND", await resp.Content.ReadAsStringAsync());
+        // 拒绝即零写入：无审计、无幂等记录。
+        await using var c = await _fx.OpenAsync();
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.audit_log WHERE action IN (N'task.return.confirmed',N'task.return.rejected')"));
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.idempotency_record"));
+    }
+
+    [Fact]
+    public async Task Return_task_without_payload_lines_is_422_NOT_RETURNABLE()
+    {
+        const string key = "KSOA:RET-NOLINES:CONSUMER_RETURN_116";
+        long taskId;
+        await using (var c = await _fx.OpenAsync())
+        {
+            var (orgId, _) = await TestSeed.EnsureAsync(c);
+            taskId = await c.ExecuteScalarAsync<long>(@"
+INSERT INTO dbo.upload_task(org_id,env,event_key,task_type,source_hash,payload_json,payload_hash,state,state_reason,
+    source_integrity,match_state,verification_state,dependency_state)
+OUTPUT INSERTED.id
+VALUES(@orgId,N'MOCK',@key,N'CONSUMER_RETURN_116',@hash,@payload,@hash,N'Blocked',
+    N'RETURN_CONFIRM_REQUIRED',N'COMPLETE',N'COMPLETE',N'PASSED',N'NONE')",
+                new { orgId, key, hash = Sha("return-no-lines"), payload = "{\"ruleVersion\":\"M3-1\"}" });
+        }
+        var client = await LoginAsync("sales-admin", AdminPassword);
+        NewIdemKey(client);
+        var resp = await client.PostAsJsonAsync($"/api/v1/returns/{taskId}/confirm", new
+        {
+            expectedVersion = 1,
+            decision = "CONFIRMED",
+            predecessorEventIds = Array.Empty<long>(),
+            evidence = new { reason = "原码退回" },
+            idemKey = Guid.NewGuid().ToString(),
+        });
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
+        Assert.Contains("NOT_RETURNABLE", await resp.Content.ReadAsStringAsync());
+        await using var c2 = await _fx.OpenAsync();
+        Assert.Equal("Blocked", await c2.ExecuteScalarAsync<string>(
+            "SELECT state FROM dbo.upload_task WHERE id=@id", new { id = taskId }));
+    }
+
+    /// <summary>
+    /// 退货候选展示字段（单号/时间/码）：由前序事件码、发生时间与来源单据键联查补齐；
+    /// 候选数量与核验结论一致（绝不因联查缺行丢候选）。
+    /// </summary>
+    [Fact]
+    public async Task Returns_list_candidates_carry_doc_key_time_and_code()
+    {
+        var scenario = await SeedConfirmableReturnAsync("C1", 41);
+        var client = await LoginAsync("sales-admin", AdminPassword);
+        var resp = await client.GetAsync("/api/v1/returns");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        var items = doc.RootElement.GetProperty("data").GetProperty("items").EnumerateArray().ToList();
+        var item = Assert.Single(items, i => i.GetProperty("id").GetString() == scenario.ReturnTaskId.ToString());
+        var candidates = item.GetProperty("predecessorCandidates").EnumerateArray().ToList();
+        var candidate = Assert.Single(candidates);
+        Assert.Equal(Code(41), candidate.GetProperty("code").GetString());
+        Assert.Equal(JsonValueKind.String, candidate.GetProperty("occurredAt").ValueKind);
+        var docKey = candidate.GetProperty("docKey").GetString();
+        Assert.False(string.IsNullOrWhiteSpace(docKey));
+        Assert.Equal(JsonValueKind.String, candidate.GetProperty("predecessorEventId").ValueKind);
+        Assert.Equal(JsonValueKind.Null, candidate.GetProperty("error").ValueKind);
     }
 
     private sealed record SessionResp(SessionData Data);

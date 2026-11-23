@@ -5,12 +5,17 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Dapper;
+using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using TraceFlow.Application.Abstractions;
 using TraceFlow.Application.Security;
+using TraceFlow.Host.Security;
 using TraceFlow.IntegrationTests.Sources;
 
 namespace TraceFlow.IntegrationTests.Api;
@@ -157,6 +162,29 @@ VALUES(@taskId,@partId,@codeId,@result,@reason,@attemptId)",
         return codeId;
     }
 
+    /// <summary>追加分片（MOCK）：referenceAt 由 first_sent_at 决定（无 UPLOAD 尝试时）。</summary>
+    private async Task<long> AddPartAsync(Seed seed, int partIndex, string state, DateTime? firstSentAt)
+    {
+        await using var c = await _fx.OpenAsync();
+        return await c.ExecuteScalarAsync<long>(@"
+INSERT INTO dbo.upload_part(task_id,org_id,env,part_index,bill_code,payload_json,payload_hash,code_set_hash,state,
+    first_sent_at)
+OUTPUT inserted.id
+VALUES(@taskId,@orgId,N'MOCK',@partIndex,@bill,N'{}',@hash,@hash,@state,@sent)",
+            new { seed.TaskId, seed.OrgId, partIndex, bill = "TFU" + Guid.NewGuid().ToString("N")[..10],
+                  hash = Sha("part-" + partIndex + "-" + seed.TaskId), state, sent = firstSentAt });
+    }
+
+    /// <summary>受控重试合同门禁开关（每个测试独立库，直接写设置行）。</summary>
+    private async Task EnableRetryPathCertifiedAsync()
+    {
+        await using var c = await _fx.OpenAsync();
+        await c.ExecuteAsync(@"
+IF NOT EXISTS (SELECT 1 FROM dbo.app_setting WHERE setting_key=N'top.retryPathCertified')
+    INSERT INTO dbo.app_setting(setting_key,value_json,updated_by) VALUES(N'top.retryPathCertified',N'true',N'test');
+ELSE UPDATE dbo.app_setting SET value_json=N'true', updated_by=N'test' WHERE setting_key=N'top.retryPathCertified'");
+    }
+
     // ---------------------------------------------------------------- 登录
 
     private async Task<HttpClient> LoginAsync(string username, string password)
@@ -269,6 +297,34 @@ VALUES(@taskId,@partId,@codeId,@result,@reason,@attemptId)",
         Assert.DoesNotContain("SHOULD-NOT-LEAK", text);
         Assert.DoesNotContain("payload_json", text);
         Assert.DoesNotContain("appSecret", text);
+    }
+
+    /// <summary>详情与列表同一环境口径：可选 env（非法值 400），跨环境 id 一律 404，绝不跨环境读。</summary>
+    [Fact]
+    public async Task Upload_detail_is_env_scoped()
+    {
+        var mock = await SeedUploadAsync("E1", 1100, successCodes: 1);
+        var live = await SeedUploadAsync("E2", 1200, env: "LIVE", successCodes: 1);
+        var client = await LoginAsync("upload-admin", AdminPassword);
+
+        var defaultResp = await client.GetAsync($"/api/v1/upload-tasks/{mock.TaskId}");
+        Assert.Equal(HttpStatusCode.OK, defaultResp.StatusCode);
+        using (var doc = JsonDocument.Parse(await defaultResp.Content.ReadAsStringAsync()))
+            Assert.Equal("MOCK", doc.RootElement.GetProperty("data").GetProperty("task").GetProperty("env").GetString());
+        Assert.Equal(HttpStatusCode.OK,
+            (await client.GetAsync($"/api/v1/upload-tasks/{mock.TaskId}?env=MOCK")).StatusCode);
+        // MOCK 任务用 env=LIVE 查 → 404（范围外一律 NOT_FOUND）。
+        var cross = await client.GetAsync($"/api/v1/upload-tasks/{mock.TaskId}?env=LIVE");
+        Assert.Equal(HttpStatusCode.NotFound, cross.StatusCode);
+        Assert.Contains("NOT_FOUND", await cross.Content.ReadAsStringAsync());
+        // LIVE 任务：默认（MOCK）→ 404；env=LIVE → 200。
+        Assert.Equal(HttpStatusCode.NotFound,
+            (await client.GetAsync($"/api/v1/upload-tasks/{live.TaskId}")).StatusCode);
+        Assert.Equal(HttpStatusCode.OK,
+            (await client.GetAsync($"/api/v1/upload-tasks/{live.TaskId}?env=LIVE")).StatusCode);
+        // 非法 env → 400 VALIDATION。
+        Assert.Equal(HttpStatusCode.BadRequest,
+            (await client.GetAsync($"/api/v1/upload-tasks/{mock.TaskId}?env=PROD")).StatusCode);
     }
 
     [Fact]
@@ -389,6 +445,97 @@ VALUES(@taskId,@partId,@codeId,@result,@reason,@attemptId)",
             "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'task.upload.manual_verified'"));
     }
 
+    /// <summary>
+    /// NOT_ACCEPTED 一致性窗口以「最晚发送」为基准：两次发送间隔大于窗口时，
+    /// 最早发送虽已出窗、最晚发送仍在窗口内 → 必须拒绝（用最早发送会在最新发送尚未稳定受理时误判）。
+    /// </summary>
+    [Fact]
+    public async Task Manual_verify_NOT_ACCEPTED_uses_latest_send_for_consistency_window()
+    {
+        // 分片 0：首次发送在 1000s 前（已出窗）；分片 1：首次发送在 5s 前（仍在默认 600s 窗口内）。
+        var seed = await SeedUploadAsync("M4", 1050, taskState: "ManualAction", partState: "ManualAction",
+            firstSentAt: DateTime.UtcNow.AddSeconds(-1000));
+        var secondPartId = await AddPartAsync(seed, 1, "ManualAction", DateTime.UtcNow.AddSeconds(-5));
+        var client = await LoginAsync("upload-admin", AdminPassword);
+        NewIdemKey(client);
+        var resp = await client.PostAsJsonAsync($"/api/v1/upload-tasks/{seed.TaskId}/manual-verify", new
+        {
+            decision = "NOT_ACCEPTED",
+            evidence = new { contractEvidence = new { contractNo = "C-2", signedAt = "2026-11-20" } },
+        });
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
+        Assert.Contains("CONSISTENCY_WINDOW_NOT_MET", await resp.Content.ReadAsStringAsync());
+        await using var c = await _fx.OpenAsync();
+        // 拒绝即零写入：两个分片仍 ManualAction，无审计、无幂等记录。
+        Assert.Equal(2, await c.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.upload_part WHERE task_id=@id AND state=N'ManualAction'",
+            new { id = seed.TaskId }));
+        Assert.Equal("ManualAction", await c.ExecuteScalarAsync<string>(
+            "SELECT state FROM dbo.upload_task WHERE id=@id", new { id = seed.TaskId }));
+        Assert.Equal(1, await c.ExecuteScalarAsync<int>(
+            "SELECT version FROM dbo.upload_task WHERE id=@id", new { id = seed.TaskId }));
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'task.upload.manual_verified'"));
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.idempotency_record"));
+        Assert.NotEqual(0, secondPartId);
+    }
+
+    /// <summary>跨环境写：LIVE 任务在 MOCK 宿主调 manual-verify → 404，且任务/分片状态与版本零变化。</summary>
+    [Fact]
+    public async Task Manual_verify_is_env_scoped_with_zero_write_across_env()
+    {
+        var live = await SeedUploadAsync("M5", 1150, env: "LIVE", taskState: "ManualAction",
+            partState: "ManualAction", firstSentAt: DateTime.UtcNow.AddHours(-2));
+        var client = await LoginAsync("upload-admin", AdminPassword);
+        NewIdemKey(client);
+        var resp = await client.PostAsJsonAsync($"/api/v1/upload-tasks/{live.TaskId}/manual-verify", new
+        {
+            decision = "ACCEPTED",
+            evidence = new { platformBillCode = live.BillCode },
+        });
+        Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
+        Assert.Contains("NOT_FOUND", await resp.Content.ReadAsStringAsync());
+        await using var c = await _fx.OpenAsync();
+        Assert.Equal("ManualAction", await c.ExecuteScalarAsync<string>(
+            "SELECT state FROM dbo.upload_part WHERE id=@id", new { id = live.PartId }));
+        Assert.Equal("ManualAction", await c.ExecuteScalarAsync<string>(
+            "SELECT state FROM dbo.upload_task WHERE id=@id", new { id = live.TaskId }));
+        Assert.Equal(1, await c.ExecuteScalarAsync<int>(
+            "SELECT version FROM dbo.upload_task WHERE id=@id", new { id = live.TaskId }));
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'task.upload.manual_verified'"));
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.idempotency_record"));
+    }
+
+    /// <summary>跨环境写：LIVE 任务在 MOCK 宿主调 controlled-retry → 404，分片/作业/版本零变化。</summary>
+    [Fact]
+    public async Task Controlled_retry_is_env_scoped_with_zero_write_across_env()
+    {
+        await EnableRetryPathCertifiedAsync();
+        var live = await SeedUploadAsync("R0", 1250, env: "LIVE", taskState: "Failed", partState: "Failed",
+            failedCodes: 1, withJob: true, jobState: "PENDING", jobAttempts: 1);
+        var client = await LoginAsync("upload-admin", AdminPassword);
+        NewIdemKey(client);
+        var resp = await client.PostAsJsonAsync($"/api/v1/upload-tasks/{live.TaskId}/controlled-retry",
+            new { expectedVersion = 1 });
+        Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
+        Assert.Contains("NOT_FOUND", await resp.Content.ReadAsStringAsync());
+        await using var c = await _fx.OpenAsync();
+        Assert.Equal("Failed", await c.ExecuteScalarAsync<string>(
+            "SELECT state FROM dbo.upload_part WHERE id=@id", new { id = live.PartId }));
+        Assert.Equal("Failed", await c.ExecuteScalarAsync<string>(
+            "SELECT state FROM dbo.upload_task WHERE id=@id", new { id = live.TaskId }));
+        Assert.Equal(1, await c.ExecuteScalarAsync<int>(
+            "SELECT version FROM dbo.upload_task WHERE id=@id", new { id = live.TaskId }));
+        Assert.Equal("PENDING", await c.ExecuteScalarAsync<string>(
+            "SELECT job_state FROM dbo.outbox_job WHERE id=@id", new { id = live.JobId }));
+        Assert.Equal(1, await c.ExecuteScalarAsync<int>(
+            "SELECT attempt_count FROM dbo.outbox_job WHERE id=@id", new { id = live.JobId }));
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'task.upload.controlled_retry'"));
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.idempotency_record"));
+    }
+
     // ---------------------------------------------------------------- 受控重试
 
     [Fact]
@@ -458,6 +605,106 @@ ELSE UPDATE dbo.app_setting SET value_json=N'true', updated_by=N'test' WHERE set
         }
     }
 
+    /// <summary>受控重试绝不抢占在途发送：RUNNING（租约未过期）作业保持原样，jobsReset 只统计实际复位行数。</summary>
+    [Fact]
+    public async Task Controlled_retry_does_not_reset_running_dispatch_job()
+    {
+        await EnableRetryPathCertifiedAsync();
+        var seed = await SeedUploadAsync("R3", 1300, taskState: "Failed", partState: "Failed", failedCodes: 1,
+            withJob: true, jobState: "RUNNING", jobAttempts: 1);
+        await using (var c = await _fx.OpenAsync())
+            await c.ExecuteAsync(@"
+UPDATE dbo.outbox_job
+SET lease_owner=N'worker-1', lease_until=DATEADD(minute,5,SYSUTCDATETIME()), finished_at=NULL
+WHERE id=@id", new { id = seed.JobId });
+
+        var client = await LoginAsync("upload-admin", AdminPassword);
+        NewIdemKey(client);
+        var resp = await client.PostAsJsonAsync($"/api/v1/upload-tasks/{seed.TaskId}/controlled-retry",
+            new { expectedVersion = 1 });
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        using (var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync()))
+            Assert.Equal(0, doc.RootElement.GetProperty("data").GetProperty("jobsReset").GetInt32());
+
+        await using (var c = await _fx.OpenAsync())
+        {
+            Assert.Equal("RUNNING", await c.ExecuteScalarAsync<string>(
+                "SELECT job_state FROM dbo.outbox_job WHERE id=@id", new { id = seed.JobId }));
+            Assert.Equal(1, await c.ExecuteScalarAsync<int>(
+                "SELECT attempt_count FROM dbo.outbox_job WHERE id=@id", new { id = seed.JobId }));
+            Assert.Equal("worker-1", await c.ExecuteScalarAsync<string>(
+                "SELECT lease_owner FROM dbo.outbox_job WHERE id=@id", new { id = seed.JobId }));
+        }
+    }
+
+    /// <summary>PENDING 作业照常复位（分片 RetryWait 后必须有人认领发送）。</summary>
+    [Fact]
+    public async Task Controlled_retry_resets_pending_dispatch_job()
+    {
+        await EnableRetryPathCertifiedAsync();
+        var seed = await SeedUploadAsync("R4", 1400, taskState: "Failed", partState: "Failed", failedCodes: 1,
+            withJob: true, jobState: "PENDING", jobAttempts: 2);
+        var client = await LoginAsync("upload-admin", AdminPassword);
+        NewIdemKey(client);
+        var resp = await client.PostAsJsonAsync($"/api/v1/upload-tasks/{seed.TaskId}/controlled-retry",
+            new { expectedVersion = 1 });
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        using (var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync()))
+            Assert.Equal(1, doc.RootElement.GetProperty("data").GetProperty("jobsReset").GetInt32());
+
+        await using var c = await _fx.OpenAsync();
+        Assert.Equal("PENDING", await c.ExecuteScalarAsync<string>(
+            "SELECT job_state FROM dbo.outbox_job WHERE id=@id", new { id = seed.JobId }));
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>(
+            "SELECT attempt_count FROM dbo.outbox_job WHERE id=@id", new { id = seed.JobId }));
+        Assert.Null(await c.ExecuteScalarAsync<DateTime?>(
+            "SELECT finished_at FROM dbo.outbox_job WHERE id=@id", new { id = seed.JobId }));
+    }
+
+    // ---------------------------------------------------------------- 429 限流契约
+
+    /// <summary>
+    /// 全局限流映射：429 + code=TOP_RATE_LIMITED + retryable=true，响应体带 retryAfter（秒），
+    /// 有可用值时同时写 Retry-After 响应头；无可用值（≤0）时 retryAfter=null 且不写头。
+    /// 经 ApiErrors.HandleAsync 直驱错误管道（HTTP 层无法在测试宿主里稳定触发真实 TOP 限流）。
+    /// </summary>
+    [Fact]
+    public async Task Rate_limited_errors_expose_retry_after()
+    {
+        await AssertRateLimitedAsync(new TopRateLimitedException(TimeSpan.FromSeconds(30)), 30);
+        await AssertRateLimitedAsync(new TopRateLimitedException(TimeSpan.Zero), null);
+        await AssertRateLimitedAsync(new TopRateLimitedException(TimeSpan.FromMilliseconds(1500)), 2);
+    }
+
+    private static async Task AssertRateLimitedAsync(TopRateLimitedException error, int? expectedSeconds)
+    {
+        var services = new ServiceCollection().AddLogging().BuildServiceProvider();
+        var ctx = new DefaultHttpContext { RequestServices = services };
+        ctx.Response.Body = new MemoryStream();
+        ctx.Features.Set<IExceptionHandlerFeature>(new ExceptionHandlerFeature { Error = error });
+
+        await ApiErrors.HandleAsync(ctx);
+
+        Assert.Equal(StatusCodes.Status429TooManyRequests, ctx.Response.StatusCode);
+        var header = ctx.Response.Headers["Retry-After"].ToString();
+        ctx.Response.Body.Position = 0;
+        using var doc = JsonDocument.Parse(await new StreamReader(ctx.Response.Body).ReadToEndAsync());
+        var root = doc.RootElement;
+        Assert.Equal("TOP_RATE_LIMITED", root.GetProperty("code").GetString());
+        Assert.True(root.GetProperty("retryable").GetBoolean());
+        var retryAfter = root.GetProperty("retryAfter");
+        if (expectedSeconds is int seconds)
+        {
+            Assert.Equal(seconds, retryAfter.GetInt32());
+            Assert.Equal(seconds.ToString(), header);
+        }
+        else
+        {
+            Assert.Equal(JsonValueKind.Null, retryAfter.ValueKind);
+            Assert.Equal("", header);
+        }
+    }
+
     [Fact]
     public async Task Upload_actions_require_dedicated_permissions()
     {
@@ -473,6 +720,18 @@ ELSE UPDATE dbo.app_setting SET value_json=N'true', updated_by=N'test' WHERE set
         NewIdemKey(client);
         var retry = await client.PostAsJsonAsync($"/api/v1/upload-tasks/{seed.TaskId}/controlled-retry", new { });
         Assert.Equal(HttpStatusCode.Forbidden, retry.StatusCode);
+
+        // 403 是零写入：权限门在事务/幂等执行器之前，任务状态与版本不变、无审计、无幂等记录。
+        await using var c = await _fx.OpenAsync();
+        Assert.Equal("Failed", await c.ExecuteScalarAsync<string>(
+            "SELECT state FROM dbo.upload_task WHERE id=@id", new { id = seed.TaskId }));
+        Assert.Equal(1, await c.ExecuteScalarAsync<int>(
+            "SELECT version FROM dbo.upload_task WHERE id=@id", new { id = seed.TaskId }));
+        Assert.Equal("Failed", await c.ExecuteScalarAsync<string>(
+            "SELECT state FROM dbo.upload_part WHERE id=@id", new { id = seed.PartId }));
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.audit_log WHERE action IN (N'task.upload.manual_verified',N'task.upload.controlled_retry')"));
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.idempotency_record"));
     }
 
     private sealed record SessionResp(SessionData Data);

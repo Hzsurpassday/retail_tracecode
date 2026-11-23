@@ -207,12 +207,16 @@ export default function UploadCenterPage() {
           </div>
         </>
       )}
-      {openId !== null && <UploadDrawer taskId={openId} onClose={closeDrawer} onChanged={() => void load()} />}
+      {openId !== null && (
+        <UploadDrawer taskId={openId} envFilter={envFilter} onClose={closeDrawer} onChanged={() => void load()} />
+      )}
     </section>
   );
 }
 
-function UploadDrawer({ taskId, onClose, onChanged }: { taskId: string; onClose: () => void; onChanged: () => void }) {
+function UploadDrawer({ taskId, envFilter, onClose, onChanged }: {
+  taskId: string; envFilter: string; onClose: () => void; onChanged: () => void;
+}) {
   const [detail, setDetail] = useState<UploadDetail | null>(null);
   const [error, setError] = useState('');
   const [status, setStatus] = useState('');
@@ -224,7 +228,11 @@ function UploadDrawer({ taskId, onClose, onChanged }: { taskId: string; onClose:
     let active = true;
     (async () => {
       try {
-        const d = await api<UploadDetail>(`/api/v1/upload-tasks/${taskId}`);
+        // 详情与列表同一环境口径：设置环境筛选时必须带 env，否则跨环境 id 会 404（或读错环境）。
+        const detailUrl = envFilter
+          ? `/api/v1/upload-tasks/${taskId}?env=${encodeURIComponent(envFilter)}`
+          : `/api/v1/upload-tasks/${taskId}`;
+        const d = await api<UploadDetail>(detailUrl);
         if (active) {
           setDetail(d); setError('');
           setRetryBlocked(d.retryPathCertified ? '' : RETRY_BLOCK_REASON);
@@ -234,7 +242,7 @@ function UploadDrawer({ taskId, onClose, onChanged }: { taskId: string; onClose:
       }
     })();
     return () => { active = false; };
-  }, [taskId, reloadKey]);
+  }, [taskId, envFilter, reloadKey]);
 
   const task = detail?.task ?? null;
   const successCodes = detail?.codeResults.filter((c) => c.result === 'SUCCESS').length ?? 0;

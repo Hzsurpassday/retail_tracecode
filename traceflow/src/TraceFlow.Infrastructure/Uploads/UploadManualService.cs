@@ -32,8 +32,10 @@ public sealed record ControlledRetryResult(long TaskId, string State, int Versio
 /// 且提供合同证据，经 QueryConfirmedNotAccepted → RetryWait 并复位发送作业（否则 RetryWait 永远不会被再发送）。</item>
 /// <item><b>controlled-retry</b>：先读 <see cref="SettingsService.GetRetryPathCertifiedAsync"/>，false 在零写入前抛
 /// <see cref="RetryPathNotCertifiedException"/>；true 时仅 Failed 分片 ControlledRetryApproved → RetryWait，
-/// 复位 <c>upload-dispatch</c> 作业（PENDING/attempt_count=0/next_run_at=now/清租约），绝不改写 upload_attempt 历史。</item>
+/// 复位 <c>upload-dispatch</c> 作业（PENDING/attempt_count=0/next_run_at=now/清租约；在执行中的 RUNNING 作业不动），
+/// 绝不改写 upload_attempt 历史。</item>
 /// </list>
+/// 两个入口都按「活动机构 + 宿主环境」定界任务（跨环境 id → <see cref="ResourceNotFoundException"/> 404，零写入）。
 /// 所有写入都在调用方事务内完成（端点经 IdempotencyExecutor），审计与业务同事务；不触网。
 /// </summary>
 public sealed class UploadManualService
@@ -68,7 +70,7 @@ public sealed class UploadManualService
     // ------------------------------------------------------------------ manual-verify
 
     public async Task<ManualVerifyResult> ManualVerifyAsync(SqlConnection conn, SqlTransaction tx, long taskId,
-        ManualVerifyCommand cmd, string actor, string requestId, CancellationToken ct)
+        string env, ManualVerifyCommand cmd, string actor, string requestId, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(cmd);
         var decision = (cmd.Decision ?? "").Trim().ToUpperInvariant();
@@ -76,7 +78,10 @@ public sealed class UploadManualService
             throw new AllocationValidationException("VALIDATION", "decision 只能为 ACCEPTED、PROCESSING 或 NOT_ACCEPTED");
 
         // 所有校验都在首个写入之前完成：拒绝路径事务回滚，幂等记录也不会落库（拒绝即零写入）。
-        var task = await LoadTaskAsync(conn, tx, taskId, ct);
+        // 环境/机构在事务内解析，任务加载带 org_id+env 谓词：跨环境 id 一律按不存在处理（404，零写入）。
+        var orgId = await ResolveActiveOrgAsync(conn, tx, ct);
+        var scope = NormalizeEnv(env);
+        var task = await LoadTaskAsync(conn, tx, taskId, orgId, scope, ct);
         if (task is null)
             throw new ResourceNotFoundException("上传任务不存在");
         if (!string.Equals(task.state, nameof(UploadState.ManualAction), StringComparison.Ordinal))
@@ -99,12 +104,13 @@ public sealed class UploadManualService
                     "NOT_ACCEPTED 需要非空 contractEvidence（合同/平台协作证据）");
             var policy = await _settings.GetQueryPolicyAsync(ct);
             var window = TimeSpan.FromSeconds(Math.Max(0, policy.ConsistencyWindowSeconds));
-            // 平台侧受理存在一致性延迟：以任务内最早一次发送时间为基准，窗口未过不得判定「平台未受理」。
-            var earliest = parts.Min(p => p.referenceAt);
-            var notBefore = earliest + window;
+            // 平台侧受理存在一致性延迟：以任务内**最晚**一次发送时间为基准。窗口保护的是
+            // 「最近一次发送尚未被平台稳定受理」的情况；用最早发送会在最新发送仍在窗口内时过早判定未受理。
+            var latest = parts.Max(p => p.referenceAt);
+            var notBefore = latest + window;
             if (DateTime.UtcNow < notBefore)
                 throw new AllocationValidationException(ErrorConsistencyWindow,
-                    $"受理一致性窗口未到期（最早发送 {earliest:O} + {window.TotalSeconds:F0}s），不得判定平台未受理");
+                    $"受理一致性窗口未到期（最晚发送 {latest:O} + {window.TotalSeconds:F0}s），不得判定平台未受理");
             evt = UploadEvent.QueryConfirmedNotAccepted;
             evidenceJson = BuildEvidence(decision, null, cmd.ContractEvidence);
             targets = parts.Where(p => p.state == nameof(UploadState.ManualAction)).ToList();
@@ -155,14 +161,16 @@ public sealed class UploadManualService
     // ------------------------------------------------------------------ controlled-retry
 
     public async Task<ControlledRetryResult> ControlledRetryAsync(SqlConnection conn, SqlTransaction tx, long taskId,
-        int? expectedVersion, string actor, string requestId, CancellationToken ct)
+        string env, int? expectedVersion, string actor, string requestId, CancellationToken ct)
     {
         // 合同门禁在读任务/写任何行之前判定（fail-closed）：false → 422 且事务内零写入。
         if (!await _settings.GetRetryPathCertifiedAsync(ct))
             throw new RetryPathNotCertifiedException(
                 "受控重试通道未取证（top.retryPathCertified=false），禁止重发；请等待回查或联系平台");
 
-        var task = await LoadTaskAsync(conn, tx, taskId, ct);
+        var orgId = await ResolveActiveOrgAsync(conn, tx, ct);
+        var scope = NormalizeEnv(env);
+        var task = await LoadTaskAsync(conn, tx, taskId, orgId, scope, ct);
         if (task is null)
             throw new ResourceNotFoundException("上传任务不存在");
         if (!string.Equals(task.state, nameof(UploadState.Failed), StringComparison.Ordinal))
@@ -217,7 +225,9 @@ UPDATE dbo.upload_part SET state=@next, next_query_at=@nextQueryAt WHERE id=@id 
 
     /// <summary>
     /// 复位分片发送作业：存在则 PENDING/attempt_count=0/next_run_at=now/清租约与收尾字段；
-    /// 不存在则新建（同事务，同意图幂等）。取消态作业不复位（行政取消优先）。
+    /// 不存在则新建（同事务，同意图幂等）。只复位 PENDING/FAILED/DONE 或租约已过期的 RUNNING
+    /// （后者等价于「租约已过期的 LEASED」，与 JobQueue 回收规则一致）；正在执行的 RUNNING（租约未过期）
+    /// 绝不改写——重试不得抢占在途发送。取消态作业同样不复位（行政取消优先）。
     /// </summary>
     private async Task<int> ResetDispatchJobsAsync(SqlConnection conn, SqlTransaction tx, TaskRow task,
         IReadOnlyList<long> partIds, string trigger, CancellationToken ct)
@@ -236,17 +246,29 @@ UPDATE dbo.upload_part SET state=@next, next_query_at=@nextQueryAt WHERE id=@id 
 UPDATE dbo.outbox_job
 SET job_state=N'PENDING', attempt_count=0, next_run_at=SYSUTCDATETIME(),
     lease_owner=NULL, lease_until=NULL, finished_at=NULL, last_error=NULL
-WHERE id=@id AND job_state <> N'CANCELLED'", new { id = jobId }, tx, cancellationToken: ct));
+WHERE id=@id
+  AND (job_state IN (N'PENDING',N'FAILED',N'DONE')
+       OR (job_state=N'RUNNING' AND lease_until < SYSUTCDATETIME()))", new { id = jobId }, tx,
+                cancellationToken: ct));
         }
         return reset;
     }
 
-    private static async Task<TaskRow?> LoadTaskAsync(SqlConnection conn, SqlTransaction tx, long taskId,
-        CancellationToken ct)
+    /// <summary>活动机构（单机构部署）：与列表端点同一解析口径。</summary>
+    private static async Task<long> ResolveActiveOrgAsync(SqlConnection conn, SqlTransaction tx, CancellationToken ct)
+        => await conn.ExecuteScalarAsync<long>(new CommandDefinition(
+            "SELECT id FROM dbo.organization WHERE is_active=1", transaction: tx, cancellationToken: ct));
+
+    private static string NormalizeEnv(string env) => (env ?? "").Trim().ToUpperInvariant();
+
+    /// <summary>任务加载按 id + 机构 + 环境定界：范围外（含跨环境 id）返回 null → 404，绝不读写他环境任务。</summary>
+    private static async Task<TaskRow?> LoadTaskAsync(SqlConnection conn, SqlTransaction tx, long taskId, long orgId,
+        string env, CancellationToken ct)
         => await conn.QuerySingleOrDefaultAsync<TaskRow>(new CommandDefinition(@"
 SELECT t.id, t.org_id AS orgId, t.env, t.state, t.version, t.task_type AS taskType
 FROM dbo.upload_task t WITH (UPDLOCK, HOLDLOCK)
-WHERE t.id=@id", new { id = taskId }, tx, cancellationToken: ct));
+WHERE t.id=@id AND t.org_id=@orgId AND t.env=@env", new { id = taskId, orgId, env }, tx,
+            cancellationToken: ct));
 
     /// <summary>
     /// 分片与「最后一次发送参考时间」：无 last_sent_at 列，取 UPLOAD 尝试的 MAX(started_at)，

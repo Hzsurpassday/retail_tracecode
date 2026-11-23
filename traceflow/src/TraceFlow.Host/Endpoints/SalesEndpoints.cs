@@ -74,7 +74,7 @@ WHERE s.rn=1";
             args.Add("hi", p * size);
             var rows = await conn.QueryAsync<SaleListRow>(new CommandDefinition($@"
 SELECT snapshotId,docKey,version,businessDatetimeUtc,completeness,lineCount,codeCount,
-       verificationState,taskId,taskState,createdAt FROM (
+       verificationState,verificationEnv,taskId,taskState,createdAt FROM (
     SELECT ROW_NUMBER() OVER (ORDER BY s.id DESC) AS rn2,
            s.id AS snapshotId, s.source_document_key AS docKey, s.version,
            s.business_datetime AS businessDatetimeUtc, s.completeness_status AS completeness,
@@ -82,32 +82,45 @@ SELECT snapshotId,docKey,version,businessDatetimeUtc,completeness,lineCount,code
             WHERE l.snapshot_id=s.id AND l.event_kind=N'SALE') AS lineCount,
            (SELECT COUNT(*) FROM dbo.source_line l
             WHERE l.snapshot_id=s.id AND l.event_kind=N'SALE' AND l.trace_code_normalized IS NOT NULL) AS codeCount,
-           v.state AS verificationState, t.id AS taskId, t.state AS taskState, s.observed_at AS createdAt
+           v.state AS verificationState, v.env AS verificationEnv, t.id AS taskId, t.state AS taskState,
+           s.observed_at AS createdAt
     {baseSql}
 ) x WHERE rn2 BETWEEN @lo AND @hi ORDER BY rn2", args, cancellationToken: ctx.RequestAborted));
             // API-01：外部 ID 一律 JSON 字符串；响应只含白名单字段（raw_header/raw_line/payload 永不外泄）。
+            // env 回显行自身的核验归属（R-M3-17：未核验快照无 env 属性、两个环境视图都可见，此时才回退查询环境）。
             var items = rows.Select(r => new
             {
                 snapshotId = r.snapshotId.ToString(CultureInfo.InvariantCulture),
                 r.docKey, r.version, businessDatetimeUtc = r.businessDatetimeUtc,
                 completeness = r.completeness, lineCount = r.lineCount, codeCount = r.codeCount,
-                env = targetEnv, r.verificationState,
+                env = r.verificationEnv ?? targetEnv, r.verificationState,
                 taskId = r.taskId?.ToString(CultureInfo.InvariantCulture), r.taskState,
             }).ToList();
             return Results.Ok(new { data = new { items, page = p, pageSize = size, total }, requestId = ctx.TraceIdentifier });
         }).RequireAuthorization();
 
         // ---------------------------------------------------------------- 销售快照钻取
-        app.MapGet("/api/v1/pos-sales/{id:long}", async (HttpContext ctx, long id) =>
+        app.MapGet("/api/v1/pos-sales/{id:long}", async (HttpContext ctx, long id,
+            [FromQuery(Name = "env")] string? envFilter) =>
         {
+            // 解析规则与列表一致：env 可选，非法值 400；快照不属于该环境视图（范围外）→ 404。
+            var targetEnv = ResolveEnv(envFilter, env);
+            if (targetEnv is null) return Err(ctx, 400, "VALIDATION", "env 只能为 LIVE 或 MOCK");
+
             await using var conn = new SqlConnection(connectionString);
             await conn.OpenAsync(ctx.RequestAborted);
             var orgId = await conn.ExecuteScalarAsync<long>(new CommandDefinition(
                 "SELECT id FROM dbo.organization WHERE is_active=1", cancellationToken: ctx.RequestAborted));
+            // 与列表同一可见性口径：该环境有当前核验，或快照尚无任何当前核验（R-M3-17：未核验快照两视图都可见）。
             var snap = await conn.QuerySingleOrDefaultAsync<SnapRow>(new CommandDefinition(@"
 SELECT id, source_document_key, version, business_datetime, completeness_status, content_hash, observed_at
-FROM dbo.source_snapshot WHERE id=@id AND org_id=@orgId AND document_type=N'SALE'",
-                new { id, orgId }, cancellationToken: ctx.RequestAborted));
+FROM dbo.source_snapshot s
+WHERE s.id=@id AND s.org_id=@orgId AND s.document_type=N'SALE'
+  AND (EXISTS (SELECT 1 FROM dbo.verification ve
+               WHERE ve.source_snapshot_id=s.id AND ve.org_id=@orgId AND ve.env=@env AND ve.is_current=1)
+       OR NOT EXISTS (SELECT 1 FROM dbo.verification ve
+                      WHERE ve.source_snapshot_id=s.id AND ve.org_id=@orgId AND ve.is_current=1))",
+                new { id, orgId, env = targetEnv }, cancellationToken: ctx.RequestAborted));
             if (snap is null)
                 return Err(ctx, 404, "NOT_FOUND", "销售快照不存在");
             var lines = (await conn.QueryAsync<SaleLineRow>(new CommandDefinition(@"
@@ -118,7 +131,7 @@ FROM dbo.source_line l WHERE l.snapshot_id=@id ORDER BY l.id",
             var verification = await conn.QuerySingleOrDefaultAsync<VerificationRow>(new CommandDefinition(@"
 SELECT id, state, rule_version, result_json, verified_at, is_current, upload_task_id
 FROM dbo.verification WHERE org_id=@orgId AND env=@env AND source_snapshot_id=@id AND is_current=1",
-                new { orgId, env, id }, cancellationToken: ctx.RequestAborted));
+                new { orgId, env = targetEnv, id }, cancellationToken: ctx.RequestAborted));
             var codes = verification is null
                 ? new List<VerificationCodeRow>()
                 : (await conn.QueryAsync<VerificationCodeRow>(new CommandDefinition(@"
@@ -308,7 +321,12 @@ FROM (
         return true;
     }
 
-    /// <summary>批量读取退货任务的当前核验结论里的前序候选（每快照一次查询，C# 解析 JSON）。</summary>
+    /// <summary>
+    /// 批量读取退货任务的当前核验结论里的前序候选（每快照一次查询，C# 解析 JSON），并补齐展示字段：
+    /// code（trace_code.code_normalized）、occurredAt（code_event.occurred_at）、docKey（前序事件来源单据键，
+    /// 经 code_event.source_snapshot_id → source_snapshot，退化到 source_line.snapshot_id 链）。
+    /// 任一联查缺行只把该字段置 null，绝不丢候选（候选列表与核验结论一一对应）。
+    /// </summary>
     private static async Task<Dictionary<long, List<object>>> LoadReturnCandidatesAsync(SqlConnection conn,
         long orgId, string env, IReadOnlyList<ReturnListRow> rows, CancellationToken ct)
     {
@@ -320,7 +338,7 @@ FROM (
 SELECT source_snapshot_id, result_json FROM dbo.verification
 WHERE org_id=@orgId AND env=@env AND is_current=1 AND source_snapshot_id IN @ids",
             new { orgId, env, ids = snapshotIds }, cancellationToken: ct))).ToList();
-        var candidatesBySnapshot = new Dictionary<long, List<object>>();
+        var candidatesBySnapshot = new Dictionary<long, List<CandidateRef>>();
         foreach (var v in verifications)
         {
             if (string.IsNullOrWhiteSpace(v.result_json)) continue;
@@ -329,16 +347,11 @@ WHERE org_id=@orgId AND env=@env AND is_current=1 AND source_snapshot_id IN @ids
                 using var doc = JsonDocument.Parse(v.result_json);
                 if (!doc.RootElement.TryGetProperty("returnCandidates", out var list)
                     || list.ValueKind != JsonValueKind.Array) continue;
-                var parsed = new List<object>();
+                var parsed = new List<CandidateRef>();
                 foreach (var item in list.EnumerateArray())
                 {
-                    parsed.Add(new
-                    {
-                        codeId = Str(item, "codeId"),
-                        sourceLineId = Str(item, "sourceLineId"),
-                        predecessorEventId = Str(item, "predecessorEventId"),
-                        error = Str(item, "error"),
-                    });
+                    parsed.Add(new CandidateRef(Str(item, "codeId"), Str(item, "sourceLineId"),
+                        Str(item, "predecessorEventId"), Str(item, "error")));
                 }
                 candidatesBySnapshot[v.source_snapshot_id] = parsed;
             }
@@ -347,8 +360,36 @@ WHERE org_id=@orgId AND env=@env AND is_current=1 AND source_snapshot_id IN @ids
                 // 历史 result_json 非法不影响列表读取（候选留空）。
             }
         }
+        if (candidatesBySnapshot.Count == 0) return result;
+
+        var all = candidatesBySnapshot.Values.SelectMany(list => list).ToList();
+        var codeTexts = await LoadCodeTextsAsync(conn, all.Select(c => c.CodeId), ct);
+        var predecessorFacts = await LoadPredecessorFactsAsync(conn, all.Select(c => c.PredecessorEventId), ct);
+
+        var enriched = new Dictionary<long, List<object>>(candidatesBySnapshot.Count);
+        foreach (var (snapshotId, parsed) in candidatesBySnapshot)
+        {
+            var items = new List<object>(parsed.Count);
+            foreach (var c in parsed)
+            {
+                var codeId = ParseId(c.CodeId);
+                var eventId = ParseId(c.PredecessorEventId);
+                var fact = eventId is long key && predecessorFacts.TryGetValue(key, out var found) ? found : null;
+                items.Add(new
+                {
+                    codeId = c.CodeId,
+                    sourceLineId = c.SourceLineId,
+                    predecessorEventId = c.PredecessorEventId,
+                    error = c.Error,
+                    code = codeId is long id && codeTexts.TryGetValue(id, out var text) ? text : null,
+                    occurredAt = fact?.OccurredAt,
+                    docKey = fact?.DocKey,
+                });
+            }
+            enriched[snapshotId] = items;
+        }
         foreach (var row in rows)
-            if (row.sourceSnapshotId is long snap && candidatesBySnapshot.TryGetValue(snap, out var found))
+            if (row.sourceSnapshotId is long snap && enriched.TryGetValue(snap, out var found))
                 result[row.id] = found;
         return result;
 
@@ -363,6 +404,57 @@ WHERE org_id=@orgId AND env=@env AND is_current=1 AND source_snapshot_id IN @ids
             };
         }
     }
+
+    /// <summary>候选展示字段的联查批量大小（避免单条语句参数超限）。</summary>
+    private const int CandidateBatchSize = 500;
+
+    /// <summary>码文本（按 codeId）；缺行不返回，只让对应候选的 code 置 null。</summary>
+    private static async Task<Dictionary<long, string>> LoadCodeTextsAsync(SqlConnection conn,
+        IEnumerable<string?> codeIdTexts, CancellationToken ct)
+    {
+        var ids = codeIdTexts.Select(ParseId).Where(id => id is not null).Select(id => id!.Value)
+            .Distinct().ToList();
+        var map = new Dictionary<long, string>();
+        for (var start = 0; start < ids.Count; start += CandidateBatchSize)
+        {
+            var chunk = ids.Skip(start).Take(CandidateBatchSize).ToList();
+            var rows = await conn.QueryAsync<CandidateCodeRow>(new CommandDefinition(
+                "SELECT id, code_normalized FROM dbo.trace_code WHERE id IN @ids",
+                new { ids = chunk }, cancellationToken: ct));
+            foreach (var row in rows) map[row.id] = row.code_normalized;
+        }
+        return map;
+    }
+
+    /// <summary>
+    /// 前序事件事实：occurredAt 取 code_event.occurred_at；docKey 取事件来源单据键——
+    /// 事件自带 source_snapshot_id 时直连 source_snapshot，否则（外部证据事件/来源行事件）经
+    /// source_line 的 snapshot 链回查；两处都缺行 → null（候选保留，仅字段为空）。
+    /// </summary>
+    private static async Task<Dictionary<long, CandidatePredecessorFact>> LoadPredecessorFactsAsync(
+        SqlConnection conn, IEnumerable<string?> eventIdTexts, CancellationToken ct)
+    {
+        var ids = eventIdTexts.Select(ParseId).Where(id => id is not null).Select(id => id!.Value)
+            .Distinct().ToList();
+        var map = new Dictionary<long, CandidatePredecessorFact>();
+        for (var start = 0; start < ids.Count; start += CandidateBatchSize)
+        {
+            var chunk = ids.Skip(start).Take(CandidateBatchSize).ToList();
+            var rows = await conn.QueryAsync<CandidatePredecessorFactRow>(new CommandDefinition(@"
+SELECT e.id, e.occurred_at AS occurredAt,
+       COALESCE(snap.source_document_key, line_snap.source_document_key) AS docKey
+FROM dbo.code_event e
+LEFT JOIN dbo.source_snapshot snap ON snap.id=e.source_snapshot_id
+LEFT JOIN dbo.source_line l ON l.id=e.source_line_id
+LEFT JOIN dbo.source_snapshot line_snap ON line_snap.id=l.snapshot_id
+WHERE e.id IN @ids", new { ids = chunk }, cancellationToken: ct));
+            foreach (var row in rows) map[row.id] = new CandidatePredecessorFact(row.occurredAt, row.docKey);
+        }
+        return map;
+    }
+
+    private static long? ParseId(string? raw)
+        => long.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value) ? value : null;
 
     /// <summary>result_json 里的展示摘要（reason/failCode）；解析失败返回空，不影响钻取。</summary>
     private static (string? Reason, string? FailCode) ParseVerificationSummary(string? resultJson)
@@ -421,6 +513,7 @@ WHERE org_id=@orgId AND env=@env AND is_current=1 AND source_snapshot_id IN @ids
         public int lineCount { get; set; }
         public int codeCount { get; set; }
         public string? verificationState { get; set; }
+        public string? verificationEnv { get; set; }
         public long? taskId { get; set; }
         public string? taskState { get; set; }
         public DateTime? createdAt { get; set; }
@@ -509,5 +602,24 @@ WHERE org_id=@orgId AND env=@env AND is_current=1 AND source_snapshot_id IN @ids
     {
         public long source_snapshot_id { get; set; }
         public string? result_json { get; set; }
+    }
+
+    /// <summary>核验 result_json.returnCandidates 的原始（未富化）字段。</summary>
+    private sealed record CandidateRef(string? CodeId, string? SourceLineId, string? PredecessorEventId, string? Error);
+
+    /// <summary>前序事件的展示事实：发生时间与来源单据键（缺行时 DocKey 为 null）。</summary>
+    private sealed record CandidatePredecessorFact(DateTime OccurredAt, string? DocKey);
+
+    private sealed class CandidateCodeRow
+    {
+        public long id { get; set; }
+        public string code_normalized { get; set; } = "";
+    }
+
+    private sealed class CandidatePredecessorFactRow
+    {
+        public long id { get; set; }
+        public DateTime occurredAt { get; set; }
+        public string? docKey { get; set; }
     }
 }

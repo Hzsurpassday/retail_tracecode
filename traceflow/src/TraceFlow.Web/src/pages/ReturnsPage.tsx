@@ -6,6 +6,12 @@ interface ListPage<T> { items: T[]; page: number; pageSize: number; total: numbe
 
 interface ReturnCandidate {
   codeId: string | null; sourceLineId: string | null; predecessorEventId: string | null; error: string | null;
+  /** 前序销售单据键（来源快照单号）；缺行时为 null。 */
+  docKey: string | null;
+  /** 前序销售事件发生时间（ISO）；缺行时为 null。 */
+  occurredAt: string | null;
+  /** 退货码（规范化）；缺行时为 null。 */
+  code: string | null;
 }
 interface ReturnItem {
   id: string; eventKey: string; taskType: string; state: string; stateReason: string | null; version: number;
@@ -144,7 +150,7 @@ export default function ReturnsPage() {
                   <td>
                     {r.predecessorCandidates.length === 0 ? '—' : (
                       <span title={r.predecessorCandidates.map((c) =>
-                        `码 ${c.codeId ?? '?'}：${c.predecessorEventId ? `前序事件 ${c.predecessorEventId}` : candidateErrorZh(c.error)}`).join('\n')}>
+                        `码 ${c.code ?? c.codeId ?? '?'}：${c.predecessorEventId ? `前序事件 ${c.predecessorEventId}` : candidateErrorZh(c.error)}`).join('\n')}>
                         {r.predecessorCandidates.length} 个码
                         {r.predecessorCandidates.some((c) => c.error)
                           ? `（${r.predecessorCandidates.filter((c) => c.error).length} 个有异常）` : ''}
@@ -170,12 +176,13 @@ export default function ReturnsPage() {
                   <div>任务 #{r.id} · {TASK_TYPE_ZH[r.taskType] ?? r.taskType} · 版本 {r.version}</div>
                   {r.predecessorCandidates.length === 0 ? <p>无前序候选。</p> : (
                     <table border={1} cellPadding={4} style={{ borderCollapse: 'collapse', width: '100%' }}>
-                      <thead><tr><th>退货码 id</th><th>来源行 id</th><th>前序销售事件</th><th>判定</th></tr></thead>
+                      <thead><tr><th>单号</th><th>时间</th><th>码</th><th>错误</th></tr></thead>
                       <tbody>
                         {r.predecessorCandidates.map((c, i) => (
-                          <tr key={i}>
-                            <td>{c.codeId ?? '—'}</td><td>{c.sourceLineId ?? '—'}</td>
-                            <td>{c.predecessorEventId ?? '—'}</td>
+                          <tr key={i} title={`前序事件 ${c.predecessorEventId ?? '—'} · 来源行 ${c.sourceLineId ?? '—'}`}>
+                            <td>{c.docKey ?? '—'}</td>
+                            <td>{fmtShanghai(c.occurredAt)}</td>
+                            <td style={{ fontFamily: 'monospace' }}>{c.code ?? c.codeId ?? '—'}</td>
                             <td style={{ color: c.error ? '#a00' : undefined }}>{candidateErrorZh(c.error)}</td>
                           </tr>
                         ))}
