@@ -505,6 +505,70 @@ VALUES(@orgId,N'MOCK',@key,N'CONSUMER_RETURN_116',@hash,@payload,@hash,N'Blocked
         Assert.Equal(JsonValueKind.Null, candidate.GetProperty("error").ValueKind);
     }
 
+    /// <summary>
+    /// 退货页签改为服务端过滤（UI-06/07）：stateReason 支持逗号分隔多值（动态 IN），
+    /// 每个页签查询只返回对应原因的任务；非法原因 → 422 VALIDATION（不是静默空列表）。
+    /// </summary>
+    [Fact]
+    public async Task Returns_list_filters_by_state_reason_server_side()
+    {
+        // 三种页签状态各一条，外加一条被撤销的驳回（Cancelled + *_SUPERSEDED）验证多值 IN 与 state 组合。
+        var pending = await SeedReturnTaskAsync("SR1", "Blocked", "RETURN_CONFIRM_REQUIRED");
+        var rejected = await SeedReturnTaskAsync("SR2", "Blocked", "RETURN_CONFIRM_REJECTED");
+        var rejectedSuperseded = await SeedReturnTaskAsync("SR3", "Cancelled", "RETURN_CONFIRM_REJECTED_SUPERSEDED");
+        var confirmed = await SeedReturnTaskAsync("SR4", "Ready", "RETURN_CONFIRMED");
+        var client = await LoginAsync("sales-admin", AdminPassword);
+
+        async Task<List<string>> IdsAsync(string query)
+        {
+            var resp = await client.GetAsync("/api/v1/returns?" + query);
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+            using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+            var data = doc.RootElement.GetProperty("data");
+            var items = data.GetProperty("items").EnumerateArray().ToList();
+            // total 必须与过滤后的行一致：过滤发生在服务端 SQL（不是返回全量后前端裁剪）。
+            Assert.Equal(items.Count, data.GetProperty("total").GetInt32());
+            return items.Select(i => i.GetProperty("id").GetString()!).ToList();
+        }
+
+        // 待确认页签：state=Blocked + 单一原因。
+        Assert.Equal(new[] { pending.ToString() },
+            await IdsAsync("state=Blocked&stateReason=RETURN_CONFIRM_REQUIRED"));
+        // 已驳回页签：state=Blocked + 两个原因的多值 IN（已撤销的驳回是 Cancelled，故不在本页签）。
+        Assert.Equal(new[] { rejected.ToString() },
+            await IdsAsync("state=Blocked&stateReason=RETURN_CONFIRM_REJECTED,RETURN_CONFIRM_REJECTED_SUPERSEDED"));
+        // 不带 state 时两个驳回原因都应命中：证明动态 IN 真的展开为多值而不是只取第一个。
+        var bothRejected = await IdsAsync("stateReason=RETURN_CONFIRM_REJECTED,RETURN_CONFIRM_REJECTED_SUPERSEDED");
+        Assert.Equal(
+            new[] { rejected.ToString(), rejectedSuperseded.ToString() }.OrderBy(x => x, StringComparer.Ordinal),
+            bothRejected.OrderBy(x => x, StringComparer.Ordinal));
+        // 已确认页签：只按原因过滤，不带 state。
+        Assert.Equal(new[] { confirmed.ToString() }, await IdsAsync("stateReason=RETURN_CONFIRMED"));
+
+        // 非法值（未知原因 / 大小写不符 / 多值中混入未知）一律 422，绝不静默返回空列表。
+        foreach (var bad in new[] { "BOGUS", "return_confirm_required", "RETURN_CONFIRM_REQUIRED,BOGUS", "," })
+        {
+            var resp = await client.GetAsync($"/api/v1/returns?stateReason={Uri.EscapeDataString(bad)}");
+            Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
+            Assert.Contains("VALIDATION", await resp.Content.ReadAsStringAsync());
+        }
+    }
+
+    /// <summary>直写退货占位任务（不走核验服务）：用于 stateReason 过滤断言。</summary>
+    private async Task<long> SeedReturnTaskAsync(string tag, string state, string stateReason)
+    {
+        await using var c = await _fx.OpenAsync();
+        var (orgId, _) = await TestSeed.EnsureAsync(c);
+        var key = $"KSOA:RET-{tag}:CONSUMER_RETURN_116";
+        return await c.ExecuteScalarAsync<long>(@"
+INSERT INTO dbo.upload_task(org_id,env,event_key,task_type,source_hash,payload_hash,state,state_reason,
+    source_integrity,match_state,verification_state,dependency_state)
+OUTPUT INSERTED.id
+VALUES(@orgId,N'MOCK',@key,N'CONSUMER_RETURN_116',@hash,@hash,@state,@stateReason,
+    N'COMPLETE',N'COMPLETE',N'PASSED',N'NONE')",
+            new { orgId, key, hash = Sha("return-" + tag), state, stateReason });
+    }
+
     private sealed record SessionResp(SessionData Data);
     private sealed record SessionData(bool Authenticated, string CsrfToken);
 }

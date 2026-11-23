@@ -61,8 +61,20 @@ const VERIFY_STATE_ZH: Record<string, string> = {
 const REASON_ZH: Record<string, string> = {
   PLATFORM_NOT_FOUND: '平台无此码', PLATFORM_REJECTED: '平台拒绝', VERIFY_CHANGED_AFTER_SEND: '发送后核验变更',
   VERIFY_CHANGED_WHILE_DISPATCHING: '发送中核验变更', NO_UPLOADABLE_LINES: '无可上传行',
-  RETURN_CONFIRM_REQUIRED: '待首次人工确认', RETURN_CONFIRMED: '已确认', SALE_LINES_REMOVED: '销售行已移除',
+  RETURN_CONFIRM_REQUIRED: '待首次人工确认', RETURN_CONFIRM_REJECTED: '人工确认已驳回',
+  RETURN_CONFIRM_REJECTED_SUPERSEDED: '驳回后被新快照撤销', RETURN_CONFIRMED: '已确认',
+  SALE_LINES_REMOVED: '销售行已移除', RETURN_LINES_REMOVED: '退货行已移除',
+  RULE_VERSION_CHANGED: '规则版本变更', WAIT_DEPENDENCY: '等待采购入库依赖',
+  PREDECESSOR_MISSING: '缺少前序销售事件', PREDECESSOR_AMBIGUOUS: '前序销售事件不唯一',
+  ALREADY_RETURNED: '该码已退货',
+  // 平台/投递侧状态原因：未知值保留原文（绝不臆造中文含义）。
+  PARTIAL_ACCEPTED: '部分受理', DELIVERY_FAILED: '投递失败', MANUAL_REQUIRED: '需人工处置',
+  PLATFORM_ACCEPTED: '平台已受理', ACCEPTANCE_UNKNOWN: '受理未知', RESULT_UNRESOLVED: '结果未决',
 };
+function reasonZh(reason: string | null): string {
+  if (!reason) return '—';
+  return REASON_ZH[reason] ?? reason;
+}
 const RETRY_BLOCK_REASON = '受控重试通道未取证（top.retryPathCertified=false），禁止重发；请等待回查或联系平台';
 function errMsg(e: unknown): string { return e instanceof ApiError ? `${e.code}: ${e.message}` : '网络错误'; }
 const SHANGHAI = new Intl.DateTimeFormat('en-US', {
@@ -161,7 +173,7 @@ export default function UploadCenterPage() {
           最终成功率 {summary.finalSuccessRate === null ? '—（尚无结算任务）' : `${(summary.finalSuccessRate * 100).toFixed(2)}%`}
         </p>
       )}
-      {data === null ? <p>加载中…</p> : data.items.length === 0 ? (
+      {data === null ? (error ? null : <p>加载中…</p>) : data.items.length === 0 ? (
         <p>暂无上传任务（可调整状态/类型/环境后重试）。</p>
       ) : (
         <>
@@ -179,7 +191,7 @@ export default function UploadCenterPage() {
                   <td>{TYPE_ZH[r.taskType] ?? r.taskType}</td>
                   <td>
                     {STATE_ZH[r.state] ?? r.state}
-                    {r.stateReason ? <div style={{ fontSize: 12, color: '#666' }}>{REASON_ZH[r.stateReason] ?? r.stateReason}</div> : null}
+                    {r.stateReason ? <div style={{ fontSize: 12, color: '#666' }}>{reasonZh(r.stateReason)}</div> : null}
                   </td>
                   <td title={`成功 ${r.succeededParts} / 失败 ${r.failedParts} / 部分 ${r.partialSuccessParts} / 处理中 ${r.processingParts} / 受理未知 ${r.acceptanceUnknownParts} / 结果未决 ${r.resultUnresolvedParts} / 人工 ${r.manualActionParts}`}>
                     {r.succeededParts}/{r.partCount} 成功
@@ -223,6 +235,8 @@ function UploadDrawer({ taskId, envFilter, onClose, onChanged }: {
   const [reloadKey, setReloadKey] = useState(0);
   const [retryBlocked, setRetryBlocked] = useState<string>('');
   const [busy, setBusy] = useState(false);
+  // 幂等键在抽屉打开时生成一次：同一抽屉内的重试提交复用同一 key，关闭重开才换新 key。
+  const [retryKey] = useState(() => crypto.randomUUID());
 
   useEffect(() => {
     let active = true;
@@ -254,7 +268,7 @@ function UploadDrawer({ taskId, envFilter, onClose, onChanged }: {
     setBusy(true); setError(''); setStatus('');
     try {
       const r = await api<{ state: string; version: number }>(`/api/v1/upload-tasks/${taskId}/controlled-retry`, {
-        method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() },
+        method: 'POST', headers: { 'Idempotency-Key': retryKey },
         body: JSON.stringify({ expectedVersion: task.version }),
       });
       setStatus(`受控重试已接受（任务状态 ${r.state}，版本 ${r.version}），后台执行中。`);
@@ -270,24 +284,24 @@ function UploadDrawer({ taskId, envFilter, onClose, onChanged }: {
 
   return (
     <div style={overlay}>
-      <div style={drawer}>
+      <div style={drawer} role="dialog" aria-modal="true" aria-label={`上传任务 #${taskId} 详情`}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <h3 style={{ margin: 0 }}>上传任务 #{taskId}</h3>
           <button onClick={onClose}>关闭</button>
         </div>
         {error && <p role="alert">{error}</p>}
         {status && <p role="status">{status}</p>}
-        {detail === null ? <p>加载中…</p> : (
+        {detail === null ? (error ? null : <p>加载中…</p>) : (
           <>
             <p>
               事件键 {detail.task.eventKey} · 类型 {TYPE_ZH[detail.task.taskType] ?? detail.task.taskType} · 环境 {detail.task.env}<br />
               状态 {STATE_ZH[detail.task.state] ?? detail.task.state}
-              {detail.task.stateReason ? `（${REASON_ZH[detail.task.stateReason] ?? detail.task.stateReason}）` : ''} · 版本 {detail.task.version}<br />
+              {detail.task.stateReason ? `（${reasonZh(detail.task.stateReason)}）` : ''} · 版本 {detail.task.version}<br />
               核验 {VERIFY_STATE_ZH[detail.task.verificationState] ?? detail.task.verificationState} · 依赖 {detail.task.dependencyState} · 匹配 {detail.task.matchState} ·
               来源完整性 {detail.task.sourceIntegrity} · 创建 {fmtShanghai(detail.task.createdAt)}
             </p>
             {detail.task.sourceSnapshotId && (
-              <p>来源销售快照：<Link to={`/sales?snapshotId=${detail.task.sourceSnapshotId}`}>#{detail.task.sourceSnapshotId}</Link></p>
+              <p>来源销售快照：<Link to={`/sales?snapshotId=${detail.task.sourceSnapshotId}&env=${encodeURIComponent(detail.task.env)}`}>#{detail.task.sourceSnapshotId}</Link></p>
             )}
             <h4>分片</h4>
             {detail.parts.length === 0 ? <p>无分片。</p> : (
@@ -330,7 +344,7 @@ function UploadDrawer({ taskId, envFilter, onClose, onChanged }: {
                     <tr key={c.resultId} style={{ background: c.result === 'UNKNOWN' ? '#fff3cd' : c.result === 'FAILED' ? '#f8d7da' : undefined }}>
                       <td style={{ fontFamily: 'monospace' }}>{c.codeNormalized}</td>
                       <td>{CODE_RESULT_ZH[c.result] ?? c.result}</td>
-                      <td>{c.reason ?? '—'}</td>
+                      <td>{reasonZh(c.reason)}</td>
                       <td>{fmtShanghai(c.recordedAt)}</td>
                     </tr>
                   ))}
@@ -373,10 +387,13 @@ function UploadDrawer({ taskId, envFilter, onClose, onChanged }: {
 
 function ManualVerifyForm({ detail, onDone }: { detail: UploadDetail; onDone: (msg: string) => void }) {
   const [decision, setDecision] = useState<'ACCEPTED' | 'PROCESSING' | 'NOT_ACCEPTED'>('ACCEPTED');
-  const [billCode, setBillCode] = useState(detail.parts[0]?.billCode ?? '');
+  // 默认不预选账单码：必须由操作员显式选择，避免把第一片静默当成平台受理单号。
+  const [billCode, setBillCode] = useState('');
   const [contract, setContract] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  // 幂等键在表单打开时生成一次：同一表单内的重试复用同一 key，关闭重开才换新 key。
+  const [idemKey] = useState(() => crypto.randomUUID());
 
   async function submit() {
     setError('');
@@ -385,7 +402,7 @@ function ManualVerifyForm({ detail, onDone }: { detail: UploadDetail; onDone: (m
     setBusy(true);
     try {
       const r = await api<{ state: string; version: number; decision: string }>(`/api/v1/upload-tasks/${detail.task.taskId}/manual-verify`, {
-        method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() },
+        method: 'POST', headers: { 'Idempotency-Key': idemKey },
         body: JSON.stringify({
           decision,
           evidence: {

@@ -97,14 +97,15 @@ export default function SalesPage() {
   const [page, setPage] = useState(1);
   const [data, setData] = useState<ListPage<SaleItem> | null>(null);
   const [error, setError] = useState('');
-  const [detailId, setDetailId] = useState<string | null>(null);
+  // 钻取目标带上可见性环境：详情与列表同一 env 口径，否则 LIVE 行在 MOCK 宿主下会 404。
+  const [detail, setDetail] = useState<{ id: string; env: string } | null>(null);
   const seqRef = useRef(0);
   const [searchParams] = useSearchParams();
 
-  // 上传中心回链：/sales?snapshotId=xxx 直接打开钻取对话框。
+  // 上传中心回链：/sales?snapshotId=xxx[&env=LIVE] 直接打开钻取对话框。
   useEffect(() => {
     const fromQuery = searchParams.get('snapshotId');
-    if (fromQuery) setDetailId(fromQuery);
+    if (fromQuery) setDetail({ id: fromQuery, env: searchParams.get('env') ?? '' });
     // 仅首次读入查询参数。
   }, []);
 
@@ -150,7 +151,7 @@ export default function SalesPage() {
         <button onClick={() => { setPage(1); void load(); }}>查询</button>
       </div>
       {error && <p role="alert">{error}</p>}
-      {data === null ? <p>加载中…</p> : data.items.length === 0 ? (
+      {data === null ? (error ? null : <p>加载中…</p>) : data.items.length === 0 ? (
         <p>暂无销售快照（可调整日期/环境后重试）。</p>
       ) : (
         <>
@@ -163,7 +164,8 @@ export default function SalesPage() {
             </thead>
             <tbody>
               {data.items.map((r) => (
-                <tr key={r.snapshotId} style={{ cursor: 'pointer' }} onClick={() => setDetailId(r.snapshotId)}>
+                <tr key={r.snapshotId} style={{ cursor: 'pointer' }}
+                  onClick={() => setDetail({ id: r.snapshotId, env: envFilter || r.env })}>
                   <td>{r.docKey}</td>
                   <td>{fmtShanghai(r.businessDatetimeUtc)}</td>
                   <td>{r.version}</td>
@@ -177,7 +179,7 @@ export default function SalesPage() {
                       </Link>
                       : '—'}
                   </td>
-                  <td><button onClick={(e) => { e.stopPropagation(); setDetailId(r.snapshotId); }}>钻取</button></td>
+                  <td><button onClick={(e) => { e.stopPropagation(); setDetail({ id: r.snapshotId, env: envFilter || r.env }); }}>钻取</button></td>
                 </tr>
               ))}
             </tbody>
@@ -189,12 +191,16 @@ export default function SalesPage() {
           </div>
         </>
       )}
-      {detailId !== null && <SaleDetailDialog snapshotId={detailId} onClose={() => setDetailId(null)} />}
+      {detail !== null && (
+        <SaleDetailDialog snapshotId={detail.id} env={detail.env} onClose={() => setDetail(null)} />
+      )}
     </section>
   );
 }
 
-function SaleDetailDialog({ snapshotId, onClose }: { snapshotId: string; onClose: () => void }) {
+function SaleDetailDialog({ snapshotId, env, onClose }: {
+  snapshotId: string; env: string; onClose: () => void;
+}) {
   const [detail, setDetail] = useState<SaleDetail | null>(null);
   const [error, setError] = useState('');
   const [reloadKey, setReloadKey] = useState(0);
@@ -203,14 +209,18 @@ function SaleDetailDialog({ snapshotId, onClose }: { snapshotId: string; onClose
     let active = true;
     (async () => {
       try {
-        const d = await api<SaleDetail>(`/api/v1/pos-sales/${snapshotId}`);
+        // 详情与列表同一环境口径：LIVE 行必须在 ?env=LIVE 下钻取，否则在 MOCK 宿主下 404。
+        const url = env
+          ? `/api/v1/pos-sales/${snapshotId}?env=${encodeURIComponent(env)}`
+          : `/api/v1/pos-sales/${snapshotId}`;
+        const d = await api<SaleDetail>(url);
         if (active) { setDetail(d); setError(''); }
       } catch (e) {
         if (active) setError(errMsg(e));
       }
     })();
     return () => { active = false; };
-  }, [snapshotId, reloadKey]);
+  }, [snapshotId, env, reloadKey]);
 
   const pass = detail?.codes.filter((c) => c.result === 'PASS').length ?? 0;
   const fail = detail?.codes.filter((c) => c.result === 'FAIL').length ?? 0;
@@ -218,10 +228,11 @@ function SaleDetailDialog({ snapshotId, onClose }: { snapshotId: string; onClose
 
   return (
     <div style={overlay}>
-      <div style={panel}>
+      <div style={panel} role="dialog" aria-modal="true"
+        aria-label={`销售快照钻取 · ${detail?.snapshot.docKey ?? snapshotId}`}>
         <h3>销售快照 · {detail?.snapshot.docKey ?? snapshotId}</h3>
         {error && <p role="alert">{error}</p>}
-        {detail === null ? <p>加载中…</p> : (
+        {detail === null ? (error ? null : <p>加载中…</p>) : (
           <>
             <p>
               版本 {detail.snapshot.version} · 业务时间 {fmtShanghai(detail.snapshot.businessDatetimeUtc)} ·

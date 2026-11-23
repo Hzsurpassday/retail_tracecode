@@ -195,13 +195,17 @@ SELECT id, part_index, bill_code, state FROM dbo.upload_part WHERE task_id=@task
         }).RequireAuthorization();
 
         // ---------------------------------------------------------------- 退货任务列表
-        app.MapGet("/api/v1/returns", async (HttpContext ctx, int? page, int? pageSize, string? state) =>
+        app.MapGet("/api/v1/returns", async (HttpContext ctx, int? page, int? pageSize, string? state,
+            string? stateReason) =>
         {
             if (!TryPaging(page, pageSize, out var p, out var size, out var pagingError))
                 return PagingError(ctx, pagingError!);
             if (!string.IsNullOrEmpty(state)
                 && !Enum.TryParse<UploadState>(state, ignoreCase: false, out _))
                 return Err(ctx, 422, "VALIDATION", "state 不是合法的上传状态");
+            // stateReason 与 state 同风格：可选、逗号分隔多值（动态 IN）；任一值非已知原因 → 422，且在读写前拒绝。
+            if (!TryParseStateReasons(stateReason, out var stateReasons))
+                return Err(ctx, 422, "VALIDATION", "stateReason 不是合法的状态原因");
 
             await using var conn = new SqlConnection(connectionString);
             await conn.OpenAsync(ctx.RequestAborted);
@@ -212,6 +216,12 @@ SELECT id, part_index, bill_code, state FROM dbo.upload_part WHERE task_id=@task
             args.Add("env", env);
             var filters = "";
             if (!string.IsNullOrEmpty(state)) { filters += " AND t.state=@state"; args.Add("state", state); }
+            if (stateReasons.Count > 0)
+            {
+                // 动态 IN（Dapper 展开为参数列表）：2008 R2 无表值参数，动态参数列表是唯一可行写法。
+                filters += " AND t.state_reason IN @stateReasons";
+                args.Add("stateReasons", stateReasons);
+            }
             var where = $@"FROM dbo.upload_task t
 WHERE t.org_id=@orgId AND t.env=@env
   AND t.task_type IN (N'CONSUMER_RETURN_116',N'PURCHASE_RETURN_202'){filters}";
@@ -296,6 +306,34 @@ FROM (
         if (string.IsNullOrWhiteSpace(requested)) return current;
         var value = requested.Trim().ToUpperInvariant();
         return value is "LIVE" or "MOCK" ? value : null;
+    }
+
+    /// <summary>
+    /// 退货任务已知的状态原因（<c>upload_task.state_reason</c>）：与 state 的白名单校验同风格，
+    /// 未知值一律 422（避免前端把拼写错误当成「无数据」静默展示）。
+    /// </summary>
+    private static readonly HashSet<string> ReturnStateReasons = new(StringComparer.Ordinal)
+    {
+        ReturnConfirmService.ReasonConfirmRequired,
+        ReturnConfirmService.ReasonRejected,
+        ReturnConfirmService.ReasonConfirmed,
+        SaleVerificationService.ReasonReturnConfirmRejectedSuperseded,
+        SaleVerificationService.ReasonReturnLinesRemoved,
+        SaleVerificationService.ReasonRuleVersionChanged,
+    };
+
+    /// <summary>解析 stateReason：逗号分隔多值，去空白/去重；空串表示不过滤；任一未知值 → false（422）。</summary>
+    private static bool TryParseStateReasons(string? raw, out List<string> reasons)
+    {
+        reasons = new List<string>();
+        if (string.IsNullOrWhiteSpace(raw)) return true;
+        foreach (var part in raw.Split(','))
+        {
+            var value = part.Trim();
+            if (value.Length == 0 || !ReturnStateReasons.Contains(value)) return false;
+            if (!reasons.Contains(value)) reasons.Add(value);
+        }
+        return reasons.Count > 0;
     }
 
     private static bool TryParseDateFrom(string? raw, out DateTime? value)

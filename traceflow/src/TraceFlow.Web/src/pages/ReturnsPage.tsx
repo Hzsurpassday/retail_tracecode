@@ -27,6 +27,13 @@ const TABS: { key: Tab; label: string }[] = [
   { key: 'confirmed', label: '已确认' },
   { key: 'rejected', label: '已驳回' },
 ];
+// 页签即服务端过滤条件（不再对「当前 20 行」做客户端筛选，待确认行不会藏在别的页里）。
+// 已确认页签只按原因收窄，不带 state=Blocked（确认后任务已离开 Blocked）。
+const TAB_FILTER: Record<Tab, { state?: string; stateReason: string }> = {
+  pending: { state: 'Blocked', stateReason: 'RETURN_CONFIRM_REQUIRED' },
+  rejected: { state: 'Blocked', stateReason: 'RETURN_CONFIRM_REJECTED,RETURN_CONFIRM_REJECTED_SUPERSEDED' },
+  confirmed: { stateReason: 'RETURN_CONFIRMED' },
+};
 const TASK_TYPE_ZH: Record<string, string> = {
   CONSUMER_RETURN_116: '消费者退货 116（原码退回）',
   PURCHASE_RETURN_202: '采购退货 202',
@@ -59,9 +66,6 @@ function fmtShanghai(d: string | null): string {
 function isPending(r: ReturnItem): boolean {
   return r.state === 'Blocked' && r.stateReason === 'RETURN_CONFIRM_REQUIRED';
 }
-function isRejected(r: ReturnItem): boolean {
-  return r.stateReason === 'RETURN_CONFIRM_REJECTED' || r.stateReason === 'RETURN_CONFIRM_REJECTED_SUPERSEDED';
-}
 function candidateErrorZh(error: string | null): string {
   if (!error) return '唯一前序（可确认）';
   return REASON_ZH[error] ?? error;
@@ -88,9 +92,10 @@ export default function ReturnsPage() {
   const load = useCallback(async () => {
     const seq = ++seqRef.current;
     const qs = new URLSearchParams({ page: String(page), pageSize: String(PAGE_SIZE) });
-    // 待确认/已驳回都只可能是 Blocked（原因由前端按 stateReason 细分为
-    // RETURN_CONFIRM_REQUIRED / RETURN_CONFIRM_REJECTED[_SUPERSEDED]）；已确认页不收窄状态。
-    if (tab !== 'confirmed') qs.set('state', 'Blocked');
+    // 页签在服务端过滤：待确认/已驳回只见 Blocked，已确认只按 RETURN_CONFIRMED 收窄。
+    const filter = TAB_FILTER[tab];
+    if (filter.state) qs.set('state', filter.state);
+    qs.set('stateReason', filter.stateReason);
     try {
       const res = await api<ListPage<ReturnItem>>(`/api/v1/returns?${qs.toString()}`);
       if (seq !== seqRef.current) return;
@@ -103,9 +108,7 @@ export default function ReturnsPage() {
 
   useEffect(() => { let active = true; (async () => { if (active) await load(); })(); return () => { active = false; }; }, [load]);
   const totalPages = data ? Math.max(1, Math.ceil(data.total / PAGE_SIZE)) : 1;
-  const all = data?.items ?? [];
-  const rows = all.filter((r) => (tab === 'pending' ? isPending(r) : tab === 'rejected' ? isRejected(r) : !isPending(r) && !isRejected(r)));
-  const count = (t: Tab): number => all.filter((r) => (t === 'pending' ? isPending(r) : t === 'rejected' ? isRejected(r) : !isPending(r) && !isRejected(r))).length;
+  const rows = data?.items ?? [];
 
   return (
     <section>
@@ -116,18 +119,16 @@ export default function ReturnsPage() {
       </p>
       <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
         {TABS.map((t) => (
-          <button key={t.key} onClick={() => { setTab(t.key); setPage(1); setStatus(''); }} disabled={tab === t.key}>
-            {t.label}（本页 {count(t.key)}）
+          <button key={t.key} onClick={() => { setData(null); setTab(t.key); setPage(1); setStatus(''); }} disabled={tab === t.key}>
+            {t.label}{tab === t.key && data ? `（共 ${data.total}）` : ''}
           </button>
         ))}
         <button onClick={() => { void load(); }}>刷新</button>
       </div>
       {error && <p role="alert">{error}</p>}
       {status && <p role="status">{status}</p>}
-      {data === null ? <p>加载中…</p> : all.length === 0 ? (
-        <p>暂无退货任务。</p>
-      ) : rows.length === 0 ? (
-        <p>当前页没有“{TABS.find((t) => t.key === tab)?.label}”状态的退货任务（页签筛选仅作用于当前页，可翻页查看）。</p>
+      {data === null ? (error ? null : <p>加载中…</p>) : rows.length === 0 ? (
+        <p>暂无“{TABS.find((t) => t.key === tab)?.label}”状态的退货任务。</p>
       ) : (
         <>
           <table border={1} cellPadding={4} style={{ borderCollapse: 'collapse', width: '100%' }}>
@@ -195,7 +196,7 @@ export default function ReturnsPage() {
           )}
           <div style={{ marginTop: 8, display: 'flex', gap: 8, alignItems: 'center' }}>
             <button disabled={page <= 1} onClick={() => setPage(page - 1)}>上一页</button>
-            <span>第 {data.page} / {totalPages} 页 · 共 {data.total} 条（页签按原因在前端过滤当前页）</span>
+            <span>第 {data.page} / {totalPages} 页 · 共 {data.total} 条</span>
             <button disabled={page >= totalPages} onClick={() => setPage(page + 1)}>下一页</button>
           </div>
         </>
@@ -268,7 +269,8 @@ function ReturnConfirmDialog({ item, onClose, onDone }: {
 
   return (
     <div style={overlay}>
-      <div style={panel}>
+      <div style={panel} role="dialog" aria-modal="true"
+        aria-label={`退货首次人工确认 · 任务 #${item.id}`}>
         <h3>退货首次人工确认 · 任务 #{item.id}</h3>
         <p>
           {TASK_TYPE_ZH[item.taskType] ?? item.taskType} · 当前版本 {item.version} · 状态 {STATE_ZH[item.state] ?? item.state}
