@@ -1,0 +1,17 @@
+[
+  {
+    "match": { "page_no": "1" },
+    "response": {
+      "alibaba_alihealth_drugtrace_top_query_listparts_response": {
+        "response_success": true,
+        "request_id": "fixture-parts-1",
+        "result": {
+          "total_pages": 1,
+          "parts": [
+            { "ref_ent_id": "REF-FIX-SUP", "ent_id": "ENT-FIX-SUP", "name": "fixture 供应商", "credit_code": "FIXCC001", "audit_status": "PASS", "role": "owner" }
+          ]
+        }
+      }
+    }
+  }
+]
