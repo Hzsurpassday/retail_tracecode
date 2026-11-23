@@ -31,3 +31,20 @@ public sealed class TopNotCertifiedException : Exception
 {
     public TopNotCertifiedException(string message) : base(message) { }
 }
+
+public sealed class AllocationConflictException : Exception
+{
+    public string ErrorCode { get; }
+    public AllocationConflictException(string errorCode, string message) : base(message) => ErrorCode = errorCode;
+}
+
+public sealed class AllocationValidationException : Exception
+{
+    public string ErrorCode { get; }
+    public IReadOnlyList<object>? FieldErrors { get; }
+    public AllocationValidationException(string errorCode, string message, IReadOnlyList<object>? fieldErrors = null) : base(message)
+    {
+        ErrorCode = errorCode;
+        FieldErrors = fieldErrors;
+    }
+}

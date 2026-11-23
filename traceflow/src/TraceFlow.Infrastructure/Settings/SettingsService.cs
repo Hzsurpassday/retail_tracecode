@@ -2,6 +2,7 @@ using System.Text.Json;
 using Dapper;
 using Microsoft.Data.SqlClient;
 using TraceFlow.Application.Abstractions;
+using TraceFlow.Domain.Billing;
 using TraceFlow.Domain.Sources;
 using TraceFlow.Domain.Versioning;
 using TraceFlow.Infrastructure.Security;
@@ -35,6 +36,8 @@ public sealed class SettingsService
         ["supplier.auditPassValues"] = new("supplier.auditPassValues", false, "[]", "stringArray", 0, 0),
         ["import.maxFileBytes"] = new("import.maxFileBytes", false, "20971520", "int", 1024, 104857600),
         ["import.maxRows"] = new("import.maxRows", false, "10000", "int", 1, 100000),
+        ["top.billPrefix"] = new("top.billPrefix", false, "\"TF\"", "string", 0, 0),
+        ["top.billMaxLength"] = new("top.billMaxLength", false, "32", "int", 8, 64),
         ["upstream.pollSeconds"] = new("upstream.pollSeconds", false, "300", "int", 30, 3600),
     };
 
@@ -149,6 +152,10 @@ WHERE setting_key=@k AND ver=@ver",
                 if (e.ValueKind != JsonValueKind.Array || e.EnumerateArray().Any(x => x.ValueKind != JsonValueKind.String))
                     throw new SettingValidationException($"配置 {def.Key} 须为字符串数组");
                 break;
+            case "string":
+                if (e.ValueKind != JsonValueKind.String || e.GetString()!.Length is < 1 or > 200)
+                    throw new SettingValidationException($"配置 {def.Key} 须为 1..200 字符字符串");
+                break;
         }
     }
 
@@ -185,6 +192,13 @@ WHERE setting_key=@k AND ver=@ver",
 
     public async Task<(long MaxFileBytes, int MaxRows)> GetImportBoundsAsync(CancellationToken ct)
         => (await GetIntAsync("import.maxFileBytes", ct), (int)await GetIntAsync("import.maxRows", ct));
+
+    public async Task<BillCodeContract> GetBillContractAsync(CancellationToken ct)
+    {
+        var raw = await GetRawAsync("top.billPrefix", ct) ?? Catalog["top.billPrefix"].DefaultJson;
+        var prefix = JsonSerializer.Deserialize<string>(raw) ?? "TF";
+        return new BillCodeContract(prefix, (int)await GetIntAsync("top.billMaxLength", ct));
+    }
 
     public async Task<int> GetUpstreamPollSecondsAsync(CancellationToken ct)
         => (int)await GetIntAsync("upstream.pollSeconds", ct);

@@ -18,6 +18,8 @@ public static class ApiErrors
             TopRateLimitedException => (429, "TOP_RATE_LIMITED", true),
             ChannelPausedException => (503, "TOP_CHANNEL_PAUSED", false),
             TopNotCertifiedException => (422, "TOP_NOT_CERTIFIED", false),
+            AllocationConflictException => (409, "ALLOCATION_CONFLICT", false),
+            AllocationValidationException => (422, "ALLOCATION_INVALID", false),
             FormatException => (422, "VALIDATION", false), // RowVer.FromHex 等格式校验（全局约束：FormatException→端点 422）
             Microsoft.AspNetCore.Antiforgery.AntiforgeryValidationException => (400, "CSRF_INVALID", false),
             BadHttpRequestException => (400, "BAD_REQUEST", false),
@@ -25,6 +27,11 @@ public static class ApiErrors
             System.Text.Json.JsonException => (400, "BAD_REQUEST", false),
             _ => (500, "INTERNAL", true),
         };
+        // 动态错误码：409/422 的 code 由异常自带，如 CODE_CONTENDED/CANCEL_REFUSED/ALLOCATION_EXISTS/BIG_CODE_BLOCKED
+        // 与 brief 的最小偏差：brief 的 `var fieldErrors = Array.Empty<object>()` 为 object[]，无法接收 IReadOnlyList<object>（CS0266）
+        IReadOnlyList<object> fieldErrors = Array.Empty<object>();
+        if (ex is AllocationConflictException ace) code = ace.ErrorCode;
+        if (ex is AllocationValidationException ave) { code = ave.ErrorCode; fieldErrors = ave.FieldErrors ?? Array.Empty<object>(); }
         ctx.Response.StatusCode = status;
         // 日志记录完整异常（服务端），响应只给安全信息；禁连接串/堆栈（NFR-05）
         ctx.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("ApiErrors")
@@ -34,10 +41,11 @@ public static class ApiErrors
             IdempotencyConflictException or SecretUndecryptableException
                 or AdapterNotCertifiedException or SettingValidationException
                 or SettingVersionException or ImportBoundsException or FormatException
-                or TopRateLimitedException or ChannelPausedException or TopNotCertifiedException => ex.Message,
+                or TopRateLimitedException or ChannelPausedException or TopNotCertifiedException
+                or AllocationConflictException or AllocationValidationException => ex.Message,
             Microsoft.AspNetCore.Antiforgery.AntiforgeryValidationException => "CSRF 令牌缺失或无效",
             BadHttpRequestException or System.Text.Json.JsonException => "请求参数或格式无效",
             _ => "服务内部错误",
-        }, fieldErrors = Array.Empty<object>(), retryable, requestId = ctx.TraceIdentifier });
+        }, fieldErrors, retryable, requestId = ctx.TraceIdentifier });
     }
 }

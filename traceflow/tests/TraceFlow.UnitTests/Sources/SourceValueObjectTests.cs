@@ -121,4 +121,25 @@ public class SourceValueObjectTests
         Assert.Equal(now.AddDays(-30), start);
         Assert.Equal(now, end);
     }
+
+    [Fact]
+    public void Code_set_hash_order_insensitive()
+    {
+        var a = SourceHasher.CodeSetHash(new[] { "81234567890123456789", "81234567890123456788" });
+        var b = SourceHasher.CodeSetHash(new[] { "81234567890123456788", "81234567890123456789" });
+        Assert.Equal(a, b);
+        Assert.Equal(64, a.Length);
+    }
+
+    [Fact]
+    public void Code_set_hash_delimiter_does_not_collide()
+    {
+        var a = SourceHasher.CodeSetHash(new[] { "A|B", "C" });
+        var b = SourceHasher.CodeSetHash(new[] { "A", "B|C" });
+        Assert.NotEqual(a, b);
+    }
+
+    [Fact]
+    public void Code_set_hash_empty_set_stable()
+        => Assert.Equal(SourceHasher.CodeSetHash(Array.Empty<string>()), SourceHasher.CodeSetHash(Array.Empty<string>()));
 }
