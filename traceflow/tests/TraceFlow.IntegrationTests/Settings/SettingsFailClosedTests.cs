@@ -13,7 +13,7 @@ public class SettingsFailClosedTests : IClassFixture<Sql2008Fixture>
     private readonly Sql2008Fixture _fx;
     public SettingsFailClosedTests(Sql2008Fixture fx) => _fx = fx;
 
-    private async Task SetPausedRawAsync(string valueJson)
+    private async Task SetPausedRawAsync(string? valueJson) // null → value_json 置 NULL（存在行但值缺失的情形）
     {
         await using var c = await _fx.OpenAsync();
         await c.ExecuteAsync(@"
@@ -40,5 +40,16 @@ ELSE UPDATE dbo.app_setting SET value_json=@v WHERE setting_key=N'sync.paused'",
         Assert.False(await svc.IsChannelPausedAsync(default));
         await SetPausedRawAsync("true");
         Assert.True(await svc.IsChannelPausedAsync(default));
+    }
+
+    [Fact]
+    public async Task Null_pause_value_fails_closed()
+    {
+        // R11a 仅豁免「确实没有设置行」；行存在而 value_json 为 NULL 属值缺失，保守视为暂停（fail-closed）。
+        await SetPausedRawAsync(null);
+        var svc = new SettingsService(_fx.ConnectionString, new DpapiProtector());
+        Assert.True(await svc.IsChannelPausedAsync(default));
+        await SetPausedRawAsync("false"); // 恢复常规值，避免污染同库后续断言
+        Assert.False(await svc.IsChannelPausedAsync(default));
     }
 }

@@ -139,6 +139,43 @@ VALUES(@orgId,@prodId,@drugId,N'MANUAL_CONFIRMED')", new { orgId, prodId, drugId
         Assert.Contains("STATE_NOT_RESOLVABLE", await resp.Content.ReadAsStringAsync());
     }
 
+    [Fact]
+    public async Task Resolve_onto_actively_mapped_drug_409()
+    {
+        // R11b 有效唯一竞态：改绑目标已被另一条 MANUAL_CONFIRMED 映射占用（UX_pmap_active_platform）→409；
+        // 断言取库内真值——被改绑映射保持原状、目标上不出现第二条有效映射（不只看状态码）。
+        await using var c = await _fx.OpenAsync();
+        var (orgId, sysId) = await OrgAsync(c);
+        await c.ExecuteAsync("INSERT INTO dbo.product(org_id,source_system_id,spid,name,trace_classification) VALUES(@orgId,@sysId,N'SPR4',N'药',N'REQUIRED'),(@orgId,@sysId,N'SPR4B',N'药',N'REQUIRED')", new { orgId, sysId });
+        var prodId = await c.ExecuteScalarAsync<long>("SELECT id FROM dbo.product WHERE org_id=@orgId AND spid=N'SPR4'", new { orgId });
+        var prodIdB = await c.ExecuteScalarAsync<long>("SELECT id FROM dbo.product WHERE org_id=@orgId AND spid=N'SPR4B'", new { orgId });
+        await c.ExecuteAsync("INSERT INTO dbo.platform_drug(platform_drug_id,source_kind) VALUES(N'DRUG-R4-A',N'fixture'),(N'DRUG-R4-B',N'fixture')");
+        var drugA = await c.ExecuteScalarAsync<long>("SELECT id FROM dbo.platform_drug WHERE platform_drug_id=N'DRUG-R4-A'");
+        var drugB = await c.ExecuteScalarAsync<long>("SELECT id FROM dbo.platform_drug WHERE platform_drug_id=N'DRUG-R4-B'");
+        var mapId = await c.ExecuteScalarAsync<long>(@"
+INSERT INTO dbo.product_mapping(org_id,product_id,platform_drug_id,state) OUTPUT INSERTED.id
+VALUES(@orgId,@prodId,@drugA,N'CONFLICT')", new { orgId, prodId, drugA });
+        var mapIdB = await c.ExecuteScalarAsync<long>(@"
+INSERT INTO dbo.product_mapping(org_id,product_id,platform_drug_id,state) OUTPUT INSERTED.id
+VALUES(@orgId,@prodIdB,@drugB,N'MANUAL_CONFIRMED')", new { orgId, prodIdB, drugB });
+        var ver = RowVer.ToHex((await c.ExecuteScalarAsync<byte[]>("SELECT ver FROM dbo.product_mapping WHERE id=@id", new { id = mapId }))!);
+        var client = await LoginAsync();
+        NewKey(client);
+        var resp = await client.PostAsJsonAsync($"/api/v1/product-mappings/{mapId}/resolve",
+            new { targetId = "DRUG-R4-B", expectedVersion = ver, reason = "改绑到已被占用的平台药" });
+        Assert.Equal(HttpStatusCode.Conflict, resp.StatusCode);
+        Assert.Contains("MAPPING_ACTIVE_CONFLICT", await resp.Content.ReadAsStringAsync());
+        Assert.Equal("CONFLICT", await c.ExecuteScalarAsync<string>("SELECT state FROM dbo.product_mapping WHERE id=@id", new { id = mapId }));
+        Assert.Equal(drugA, await c.ExecuteScalarAsync<long>("SELECT platform_drug_id FROM dbo.product_mapping WHERE id=@id", new { id = mapId }));
+        Assert.Equal(1, await c.ExecuteScalarAsync<int>(@"
+SELECT COUNT(*) FROM dbo.product_mapping
+WHERE org_id=@orgId AND platform_drug_id=@drugB AND state IN (N'AUTO_CONFIRMED',N'MANUAL_CONFIRMED')", new { orgId, drugB }));
+        Assert.Equal(mapIdB, await c.ExecuteScalarAsync<long>(@"
+SELECT id FROM dbo.product_mapping
+WHERE org_id=@orgId AND platform_drug_id=@drugB AND state IN (N'AUTO_CONFIRMED',N'MANUAL_CONFIRMED')", new { orgId, drugB }));
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.product_mapping_history WHERE mapping_id=@id", new { id = mapId }));
+    }
+
     private async Task<(long ProdId, long SnapId, long TaskId, string ProdVer)> SeedTaskAsync(SqlConnection c, string tag, bool sent)
     {
         var (orgId, sysId) = await OrgAsync(c);

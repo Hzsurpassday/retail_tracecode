@@ -186,11 +186,18 @@ WHERE setting_key=@k AND ver=@ver",
 
     public async Task<bool> IsChannelPausedAsync(CancellationToken ct)
     {
-        var raw = await GetRawAsync("sync.paused", ct);
-        if (raw is null) return false;
+        // R11a fail-closed：只有「确实没有设置行」才回落到 Catalog 默认 false（开）。
+        // 行存在即须按值判定——COUNT 与 MAX 同查以区分「无行」与「有行但值为 NULL」（单读 value_json 无法区分）。
+        await using var c = new SqlConnection(_cs);
+        await c.OpenAsync(ct);
+        var row = await c.QuerySingleAsync<PauseRow>(new CommandDefinition(
+            "SELECT COUNT(*) AS row_count, MAX(value_json) AS value_json FROM dbo.app_setting WHERE setting_key=@k",
+            new { k = "sync.paused" }, cancellationToken: ct));
+        if (row.row_count == 0) return false;
+        if (row.value_json is null) return true; // 行存在但值缺失 → 保守视为暂停
         try
         {
-            using var doc = JsonDocument.Parse(raw);
+            using var doc = JsonDocument.Parse(row.value_json);
             return doc.RootElement.ValueKind != JsonValueKind.False; // R11a：非布尔 false 一律视为暂停（fail-closed）
         }
         catch (JsonException)
@@ -270,5 +277,12 @@ WHERE setting_key=@k AND ver=@ver",
         public DateTime? updated_at { get; set; }
         public string? reason { get; set; }
         public byte[] ver { get; set; } = Array.Empty<byte>();
+    }
+
+    /// <summary>存在性+值分离读取：row_count 为 0 表示无设置行；有行而 value_json 为 NULL 表示值缺失。</summary>
+    private sealed class PauseRow
+    {
+        public int row_count { get; set; }
+        public string? value_json { get; set; }
     }
 }

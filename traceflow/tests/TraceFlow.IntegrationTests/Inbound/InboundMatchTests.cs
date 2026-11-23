@@ -1,6 +1,8 @@
 using System.Runtime.Versioning; // brief 缺失此 using（DpapiProtector 的 SupportedOSPlatform 标注所需）；与 InboundTaskFactoryTests 同模式
+using System.Text.Json;
 using Dapper;
 using Microsoft.Data.SqlClient;
+using TraceFlow.Application.Abstractions;
 using TraceFlow.Infrastructure.Codes;
 using TraceFlow.Infrastructure.Inbound;
 using TraceFlow.Infrastructure.Jobs;
@@ -43,6 +45,16 @@ FROM dbo.inbound_match WHERE source_snapshot_id=@id", new { id = snapshotId });
         public string? supplier_dwbh { get; set; }
         public int version { get; set; }
     }
+
+    private static Task<int> CountAllocationsAsync(SqlConnection c, long snapshotId, string state)
+        => c.ExecuteScalarAsync<int>(@"
+SELECT COUNT(*) FROM dbo.inbound_allocation
+WHERE state=@state AND source_line_id IN (SELECT id FROM dbo.source_line WHERE snapshot_id=@snap)",
+            new { state, snap = snapshotId });
+
+    private static Task<int> CountClaimsAsync(SqlConnection c, long taskId, string state)
+        => c.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.code_claim WHERE upload_task_id=@id AND claim_state=@state", new { id = taskId, state });
 
     private async Task<Seed> SeedBaseAsync(SqlConnection c, string tag, int codeBase)
     {
@@ -310,5 +322,96 @@ VALUES(@snapId,N'1',@spid,2,N'盒',N'B2026',@hash,N'PURCHASE_IN')", new { snapId
         await scheduler.TickAsync(new DateTime(2026, 11, 23, 3, 0, 0, DateTimeKind.Utc), default);
         Assert.True(await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.outbox_job WHERE org_id=@org AND job_kind=N'inbound-match' AND intent_key LIKE 'inbound:periodic:%'", new { org = orgId }) >= 1);
         Assert.Equal(0, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.outbox_job WHERE org_id=@org AND job_kind=N'source-sync'", new { org = orgId }));
+    }
+
+    /// <summary>
+    /// R11c 证据固化（Task 11 修复 2）：trace-policy 取消发送前任务后入队的 map: 重匹配不是空转——
+    /// CancelPreSend 已把匹配置 UNMATCHED、分配置 CANCELLED、占用释放，任务行仍保留（Cancelled）；
+    /// 重匹配必须绕开 R8a 的既有任务短路（该短路只对非 Cancelled 任务成立）并真正重算。
+    /// 断言全部落在「只有真正重算才会变」的持久状态上：任务复活为 Ready、RESERVED 分配 2→1、ACTIVE 占用重建、匹配 reason 清空。
+    /// </summary>
+    [Fact]
+    public async Task Map_rematch_bypasses_content_hash_noop_for_cancelled_task()
+    {
+        await using var c = await _fx.OpenAsync();
+        var s = await SeedBaseAsync(c, "M11", 10);
+        // 第二行：独立商品/映射/上游明细，重匹配前改为 EXEMPT（对应修复报告里探针的 RESERVED 2→1）
+        var spid2 = "SP-M11-B"; var drug2 = "DRUG-M11-B";
+        await c.ExecuteAsync(@"
+INSERT INTO dbo.product(org_id,source_system_id,spid,name,trace_classification) VALUES(@orgId,@sysId,@spid,N'药品',N'REQUIRED')",
+            new { orgId = s.OrgId, sysId = s.SysId, spid = spid2 });
+        var prod2 = await c.ExecuteScalarAsync<long>("SELECT id FROM dbo.product WHERE org_id=@orgId AND source_system_id=@sysId AND spid=@spid",
+            new { orgId = s.OrgId, sysId = s.SysId, spid = spid2 });
+        var drugId2 = await c.ExecuteScalarAsync<long>(
+            "INSERT INTO dbo.platform_drug(platform_drug_id,source_kind) OUTPUT INSERTED.id VALUES(@drug,N'fixture')", new { drug = drug2 });
+        await c.ExecuteAsync("INSERT INTO dbo.product_mapping(org_id,product_id,platform_drug_id,state) VALUES(@orgId,@prodId,@drugId,N'MANUAL_CONFIRMED')",
+            new { orgId = s.OrgId, prodId = prod2, drugId = drugId2 });
+        await c.ExecuteAsync(@"
+INSERT INTO dbo.source_line(snapshot_id,source_line_key,product_source_id,quantity_original,unit_original,batch_raw,line_hash,event_kind)
+VALUES(@snapId,N'2',@spid,2,N'盒',N'B2027',@hash,N'PURCHASE_IN')", new { snapId = s.SnapId, spid = spid2, hash = new string('0', 64) });
+        await AddBillAsync(c, s.OrgId, "PB-M11B", "UP-M11B", drug2, "B2027", 12);
+
+        var svc = NewService();
+        var first = await svc.RunAsync(s.OrgId, "MOCK", s.SnapId, default);
+        Assert.Equal(1, first.Complete);
+        Assert.Equal(1, first.TasksCreated);
+        var taskId = await c.ExecuteScalarAsync<long>("SELECT id FROM dbo.upload_task WHERE event_key=@k", new { k = "KSOA:PI-M11:PURCHASE_IN" });
+        var billCode = await c.ExecuteScalarAsync<string>("SELECT bill_code FROM dbo.upload_part WHERE task_id=@id", new { id = taskId });
+        Assert.Equal("Ready", await c.ExecuteScalarAsync<string>("SELECT state FROM dbo.upload_task WHERE id=@id", new { id = taskId }));
+        Assert.Equal(2, await CountAllocationsAsync(c, s.SnapId, "RESERVED"));
+        Assert.Equal(4, await CountClaimsAsync(c, taskId, "ACTIVE"));
+
+        // R11c 形态：分类变更前先取消发送前任务（auditEnv=LIVE），任务/分配/占用/匹配同事务回退
+        await using (var tx = (SqlTransaction)await c.BeginTransactionAsync())
+        {
+            Assert.True(await InboundCancelService.CancelPreSendAsync(c, tx, s.OrgId, "MOCK", s.SnapId,
+                "m11actor", "商品分类变更失效发送前任务", "LIVE", default));
+            await tx.CommitAsync();
+        }
+        Assert.Equal("Cancelled", await c.ExecuteScalarAsync<string>("SELECT state FROM dbo.upload_task WHERE id=@id", new { id = taskId }));
+        var cancelledTaskVersion = await c.ExecuteScalarAsync<int>("SELECT version FROM dbo.upload_task WHERE id=@id", new { id = taskId });
+        Assert.True(cancelledTaskVersion > 1); // 取消推进了任务版本
+        Assert.Equal(0, await CountAllocationsAsync(c, s.SnapId, "RESERVED"));
+        Assert.Equal(2, await CountAllocationsAsync(c, s.SnapId, "CANCELLED"));
+        Assert.Equal(0, await CountClaimsAsync(c, taskId, "ACTIVE"));
+        var cancelledMatch = await LoadMatchAsync(c, s.SnapId);
+        Assert.Equal("UNMATCHED", cancelledMatch.match_state);
+
+        await c.ExecuteAsync("UPDATE dbo.product SET trace_classification=N'EXEMPT' WHERE org_id=@orgId AND spid=@spid",
+            new { orgId = s.OrgId, spid = spid2 });
+
+        // map:{Guid:N} 触发形态（与 MasterEndpoints trace-policy 入队同形），经作业处理器执行
+        var intent = $"map:{Guid.NewGuid():N}";
+        var payload = JsonSerializer.Serialize(new { orgId = s.OrgId, env = "MOCK", snapshotId = (long?)null, trigger = "map" });
+        long jobId;
+        await using (var tx = (SqlTransaction)await c.BeginTransactionAsync())
+        {
+            jobId = await new JobQueue(_fx.ConnectionString, new AuditLog())
+                .EnqueueAsync(c, tx, s.OrgId, "MOCK", "inbound-match", intent, payload, DateTime.UtcNow, default);
+            await tx.CommitAsync();
+        }
+        Assert.Equal(1, await c.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.outbox_job WHERE id=@id AND job_kind=N'inbound-match' AND intent_key LIKE N'map:%'", new { id = jobId }));
+        await new InboundMatchJobHandler(svc).HandleAsync(
+            new ClaimedJob(jobId, "inbound-match", intent, payload, 1, DateTime.UtcNow.AddMinutes(5), 0), default);
+
+        // 任务行政性复活（R7a）：同一行、bill_code 不变、版本继续推进
+        Assert.Equal("Ready", await c.ExecuteScalarAsync<string>("SELECT state FROM dbo.upload_task WHERE id=@id", new { id = taskId }));
+        Assert.True(await c.ExecuteScalarAsync<int>("SELECT version FROM dbo.upload_task WHERE id=@id", new { id = taskId }) > cancelledTaskVersion);
+        Assert.Equal(billCode, await c.ExecuteScalarAsync<string>("SELECT bill_code FROM dbo.upload_part WHERE task_id=@id", new { id = taskId }));
+        // 分配重算：仅仍为 REQUIRED 的第一行新建 RESERVED（2→1）；两条旧分配保持 CANCELLED，第二行不复活
+        Assert.Equal(1, await CountAllocationsAsync(c, s.SnapId, "RESERVED"));
+        Assert.Equal(2, await CountAllocationsAsync(c, s.SnapId, "CANCELLED"));
+        Assert.Equal(3, await c.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.inbound_allocation WHERE source_line_id IN (SELECT id FROM dbo.source_line WHERE snapshot_id=@snap)",
+            new { snap = s.SnapId }));
+        Assert.Equal(2, await CountClaimsAsync(c, taskId, "ACTIVE"));
+        // 匹配重算并落库：COMPLETE / 无 reason —— 若 R8a 短路误用于 Cancelled 任务，这里会停在「冻结」COMPLETE 且任务不复活
+        var after = await LoadMatchAsync(c, s.SnapId);
+        Assert.Equal("COMPLETE", after.match_state);
+        Assert.Null(after.reason);
+        Assert.NotNull(after.matched_at);
+        Assert.Equal(s.Dwbh, after.supplier_dwbh);
+        Assert.True(after.version > cancelledMatch.version);
     }
 }
