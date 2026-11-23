@@ -27,3 +27,7 @@ public sealed class ChannelPausedException : Exception
     public string ScopeKey { get; }
     public ChannelPausedException(string scopeKey, string message) : base(message) => ScopeKey = scopeKey;
 }
+public sealed class TopNotCertifiedException : Exception
+{
+    public TopNotCertifiedException(string message) : base(message) { }
+}

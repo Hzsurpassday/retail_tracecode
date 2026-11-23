@@ -41,6 +41,16 @@ builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Jo
 var sourceMode = builder.Configuration["TraceFlow:SourceMode"] ?? "fixture";
 builder.Services.AddSingleton<ISourceAdapter>(TraceFlow.Infrastructure.Sources.SourceAdapterFactory.Create(
     sourceMode, Path.Combine(AppContext.BaseDirectory, "fixtures", "ksoa")));
+var topMode = builder.Configuration["TraceFlow:TopMode"] ?? "fixture";
+builder.Services.AddSingleton<ITopGateway>(TraceFlow.Infrastructure.Top.TopGatewayFactory.Create(
+    topMode, Path.Combine(AppContext.BaseDirectory, "fixtures", "top")));
+builder.Services.AddSingleton<TraceFlow.Infrastructure.Top.RateBudgetService>();
+builder.Services.AddSingleton<TraceFlow.Infrastructure.Top.ChannelPauseService>();
+builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Top.TopClientService(
+    connectionString, sp.GetRequiredService<ITopGateway>(),
+    sp.GetRequiredService<TraceFlow.Infrastructure.Top.RateBudgetService>(),
+    sp.GetRequiredService<TraceFlow.Infrastructure.Top.ChannelPauseService>(),
+    sp.GetRequiredService<IAuditLog>()));
 builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Sources.SyncScheduler(
     connectionString, sp.GetRequiredService<IJobQueue>(),
     sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(), env));

@@ -28,6 +28,7 @@
 
   <ItemGroup>
     <None Include="..\..\..\docs\contracts\fixtures\ksoa\*.json" CopyToOutputDirectory="PreserveNewest" LinkBase="fixtures\ksoa" />
+    <None Include="..\..\..\docs\contracts\fixtures\top\*.json" CopyToOutputDirectory="PreserveNewest" LinkBase="fixtures\top" />
   </ItemGroup>
 
   <ItemGroup>

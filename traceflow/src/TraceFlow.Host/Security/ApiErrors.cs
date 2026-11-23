@@ -17,6 +17,7 @@ public static class ApiErrors
             ImportBoundsException => (422, "IMPORT_BOUNDS", false),
             TopRateLimitedException => (429, "TOP_RATE_LIMITED", true),
             ChannelPausedException => (503, "TOP_CHANNEL_PAUSED", false),
+            TopNotCertifiedException => (422, "TOP_NOT_CERTIFIED", false),
             FormatException => (422, "VALIDATION", false), // RowVer.FromHex 等格式校验（全局约束：FormatException→端点 422）
             Microsoft.AspNetCore.Antiforgery.AntiforgeryValidationException => (400, "CSRF_INVALID", false),
             BadHttpRequestException => (400, "BAD_REQUEST", false),
@@ -33,7 +34,7 @@ public static class ApiErrors
             IdempotencyConflictException or SecretUndecryptableException
                 or AdapterNotCertifiedException or SettingValidationException
                 or SettingVersionException or ImportBoundsException or FormatException
-                or TopRateLimitedException or ChannelPausedException => ex.Message,
+                or TopRateLimitedException or ChannelPausedException or TopNotCertifiedException => ex.Message,
             Microsoft.AspNetCore.Antiforgery.AntiforgeryValidationException => "CSRF 令牌缺失或无效",
             BadHttpRequestException or System.Text.Json.JsonException => "请求参数或格式无效",
             _ => "服务内部错误",
