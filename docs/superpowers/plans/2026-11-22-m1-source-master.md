@@ -7272,6 +7272,8 @@ git -c user.name=Hzsurpassday -c user.email=219255064+Hzsurpassday@users.noreply
 ---
 ### Task 14: 前端商品映射页 + 导入向导（UI-02/03、NFR-02）
 
+> **T14 评审修复（controller ruling，仓库 11d0201 为准）**：(1) ImportWizard 对 `jobId==="0"`（同哈希已 COMMITTED/FAILED 批次）短路轮询，直接 `showPreview(batchId)` 取详情进预览（复用 ToView 同一投影；commit 仍 STAGED 门控）——否则 FAILED 批次 ERROR 行永远无法预览；(2) ProductsPage load() 加 useRef 序号守卫，await 后成功/ catch 两分支先校验 seq 再写状态（active 标志只在 await 前检查，挡不住慢响应覆盖新筛选）。本任务代码块未含这两处修复。浏览器实测（含上述路径）为 T15 强制项。
+
 **Files:**
 - Create: `traceflow/src/TraceFlow.Web/src/m1types.ts`（M1 API 形状类型，Task 15 复用）
 - Create: `traceflow/src/TraceFlow.Web/src/pages/ProductsPage.tsx`
