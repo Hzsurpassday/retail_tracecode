@@ -12,6 +12,7 @@ public static class AdminInitializer
         var i = Array.IndexOf(args, "--init-admin");
         var username = i >= 0 && i + 1 < args.Length ? args[i + 1] : "";
         if (username.Length == 0) { Console.Error.WriteLine("用法: --init-admin <username>"); return 2; }
+        if (username.Length > 64) { Console.Error.WriteLine("用户名不得超过 64 位"); return 2; }
         Console.Write("密码（≥10位）: "); var p1 = ReadHidden();
         Console.Write("再次输入: "); var p2 = ReadHidden();
         if (p1 != p2 || p1.Length < 10) { Console.Error.WriteLine("两次不一致或长度不足"); return 2; }
@@ -20,9 +21,19 @@ public static class AdminInitializer
         await using var c = new SqlConnection(conn);
         await c.OpenAsync();
         await using var tx = (SqlTransaction)await c.BeginTransactionAsync();
-        var id = await c.ExecuteScalarAsync<long>(
-            "INSERT INTO dbo.app_user(username,display_name,password_hash) OUTPUT inserted.id VALUES(@u,@u,@h)",
-            new { u = username, h = hasher.HashPassword(username, p1) }, tx);
+        long id;
+        try
+        {
+            id = await c.ExecuteScalarAsync<long>(
+                "INSERT INTO dbo.app_user(username,display_name,password_hash) OUTPUT inserted.id VALUES(@u,@u,@h)",
+                new { u = username, h = hasher.HashPassword(username, p1) }, tx);
+        }
+        catch (SqlException ex) when (ex.Number is 2601 or 2627)
+        {
+            await tx.RollbackAsync();
+            Console.Error.WriteLine("用户名已存在");
+            return 2;
+        }
         foreach (var perm in new[] { PermissionCatalog.SystemManage, PermissionCatalog.TraceRead, PermissionCatalog.AuditRead })
             await c.ExecuteAsync("INSERT INTO dbo.user_permission(user_id,permission,granted_by) VALUES(@id,@p,N'init')", new { id, p = perm }, tx);
         await c.ExecuteAsync(@"INSERT INTO dbo.audit_log(actor,actor_kind,action,object_type,object_id,reason)

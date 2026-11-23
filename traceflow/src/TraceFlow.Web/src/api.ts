@@ -12,6 +12,9 @@ export class ApiError extends Error {
 }
 
 let csrfToken = '';
+let unauthorizedHandler: (() => void) | null = null;
+
+export function setUnauthorizedHandler(fn: () => void): void { unauthorizedHandler = fn; }
 
 export async function loadSession(): Promise<SessionData> {
   const resp = await fetch('/api/v1/auth/session', { credentials: 'include' });
@@ -26,9 +29,14 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   if (method !== 'GET' && method !== 'HEAD') headers.set('X-CSRF-TOKEN', csrfToken);
   if (init?.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
   const resp = await fetch(path, { ...init, headers, credentials: 'include' });
-  const json = await resp.json().catch(() => null);
+  if (resp.status === 401) unauthorizedHandler?.();
+  const json: unknown = await resp.json().catch(() => null);
   if (!resp.ok) {
-    throw new ApiError(resp.status, json?.code ?? 'HTTP_' + resp.status, json?.message ?? '请求失败', json?.retryable ?? false);
+    const e = json as { code?: string; message?: string; retryable?: boolean } | null;
+    throw new ApiError(resp.status, e?.code ?? 'HTTP_' + resp.status, e?.message ?? '请求失败', e?.retryable ?? false);
   }
-  return json.data as T;
+  if (json === null || typeof json !== 'object') {
+    throw new ApiError(resp.status, 'NON_JSON', '成功响应不是合法 JSON', false);
+  }
+  return (json as { data: T }).data;
 }

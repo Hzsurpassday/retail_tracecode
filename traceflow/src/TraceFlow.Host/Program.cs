@@ -13,8 +13,8 @@ builder.Host.UseWindowsService();
 if (args.Contains("--init-admin"))
     return await AdminInitializer.RunAsync(args, builder.Configuration);
 
-var connectionString = builder.Configuration.GetConnectionString("TraceFlow")
-    ?? throw new InvalidOperationException("缺少 ConnectionStrings:TraceFlow（部署配置提供，不入 Git）");
+var connectionString = builder.Configuration.GetConnectionString("TraceFlow");
+if (string.IsNullOrWhiteSpace(connectionString)) throw new InvalidOperationException("缺少 ConnectionStrings:TraceFlow（部署配置提供，不入 Git）");
 // 配置大小写不敏感，启动规范化为大写 LIVE/MOCK（非法值启动失败）；安全默认 MOCK，LIVE 须门禁后显式开启
 var env = (builder.Configuration["TraceFlow:Env"] ?? "Mock").ToUpperInvariant();
 if (env is not ("MOCK" or "LIVE"))
@@ -24,12 +24,30 @@ var webOnly = args.Contains("--web-only");
 
 builder.Services.AddSingleton(new DbOptions(connectionString));
 builder.Services.AddSingleton(new EnvOptions(env));
-builder.Services.AddSingleton<IJobQueue>(new JobQueue(connectionString));
+builder.Services.AddSingleton<IJobQueue>(sp => new JobQueue(connectionString, sp.GetRequiredService<IAuditLog>()));
 builder.Services.AddSingleton<ISendRecoveryService>(sp => new SendRecoveryService(connectionString, sp.GetRequiredService<IJobQueue>()));
 builder.Services.AddSingleton<IPermissionService>(new PermissionService(connectionString));
 builder.Services.AddSingleton<IAuditLog, AuditLog>();
 builder.Services.AddSingleton<ISecretProtector, DpapiProtector>();
 builder.Services.AddSingleton<IIdempotencyStore, IdempotencyStore>();
+builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Settings.SettingsService(
+    connectionString, sp.GetRequiredService<ISecretProtector>()));
+builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Master.ImportService(
+    connectionString, sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(),
+    sp.GetRequiredService<IJobQueue>(), sp.GetRequiredService<IAuditLog>()));
+builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Jobs.ImportStageJobHandler(connectionString));
+builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Jobs.MasterMatchJobHandler(
+    connectionString, sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(), sp.GetRequiredService<IAuditLog>()));
+var sourceMode = builder.Configuration["TraceFlow:SourceMode"] ?? "fixture";
+builder.Services.AddSingleton<ISourceAdapter>(TraceFlow.Infrastructure.Sources.SourceAdapterFactory.Create(
+    sourceMode, Path.Combine(AppContext.BaseDirectory, "fixtures", "ksoa")));
+builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Sources.SyncScheduler(
+    connectionString, sp.GetRequiredService<IJobQueue>(),
+    sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(), env));
+builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Sources.SourceSyncJobHandler(
+    connectionString, sp.GetRequiredService<ISourceAdapter>(),
+    sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(), sp.GetRequiredService<IAuditLog>()));
+builder.Services.AddSingleton(sp => new IdempotencyExecutor(connectionString, sp.GetRequiredService<IIdempotencyStore>()));
 builder.Services.AddSingleton<IAuthorizationHandler, PermissionHandler>();
 
 if (!workerOnly)
@@ -53,9 +71,13 @@ if (!workerOnly)
     builder.Services.AddAntiforgery(o => o.HeaderName = "X-CSRF-TOKEN");
 }
 if (!webOnly)
+{
     builder.Services.AddHostedService<WorkerHostedService>();
+    builder.Services.AddHostedService<SyncSchedulerHostedService>();
+}
 
 var app = builder.Build();
+await TraceFlow.Infrastructure.Bootstrap.OrgBootstrap.EnsureAsync(connectionString);
 app.UseExceptionHandler(errApp => errApp.Run(ApiErrors.HandleAsync));
 
 if (!workerOnly)
@@ -76,6 +98,10 @@ if (!workerOnly)
     });
     app.MapAuthEndpoints(connectionString);
     app.MapAdminEndpoints(connectionString);
+    app.MapSettingsEndpoints(connectionString);
+    app.MapImportEndpoints(connectionString, env);
+    app.MapMasterEndpoints(connectionString);
+    app.MapOpsEndpoints(connectionString, env);
     app.MapDashboardEndpoints(connectionString, env);
     app.MapHealthEndpoints(connectionString, env);
     app.MapFallbackToFile("index.html");

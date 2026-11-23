@@ -1,6 +1,6 @@
 # 数据字典（PRD §11.2 逻辑实体 → 物理表映射）
 
-物理表名与关键约束已逐一核对实际迁移脚本 `traceflow/db/migrations/0001_core.sql` … `0006_upload.sql`（HEAD 73f3d6f）。
+物理表名与关键约束已逐一核对实际迁移脚本 `traceflow/db/migrations/0001_core.sql` … `0006_upload.sql` + M1 增量 `0007_m1_source_master.sql`（HEAD 以实际 M1 末提交为准）。
 **核对结论：任务简报映射表中的全部物理表名与实际 DDL 一致，无需更正**（含 `sync_checkpoint` 与 `download_progress`，两者均真实存在：`sync_checkpoint` 在 0002，`download_progress` 在 0004）。
 关键约束列使用实际约束/索引名。通用规则（DB-01/02）：外部 ID/单号/码为 nvarchar + `Latin1_General_BIN2` 排序规则；内部 UTC `datetime2(3)`；并发版本 `rowversion`（序列化为字符串）；数量 `decimal(18,6)`；禁止 float 计量。
 
@@ -30,9 +30,26 @@
 | 物理表 | 迁移 | 用途与关键约束 |
 | --- | --- | --- |
 | app_setting | 0001 | 设置与加密凭据：`UQ_app_setting_key`；`CK_app_setting_secret`（is_secret=1 时只存 DPAPI 密文 secret_protected，不存明文 value_json，NFR-05） |
-| idempotency_record | 0001 | API 幂等（API-02）：`UQ_idempotency_key`(idem_key)；request_hash 绑定规范化请求；与业务同事务提交/回滚 |
+| idempotency_record | 0001（0007 变更） | API 幂等（API-02）：`UQ_idempotency_user_key`(idem_key, user_id)（0007 由 `UQ_idempotency_key`(idem_key) 改为用户作用域）；request_hash 绑定规范化请求（含查询串）；与业务同事务提交/回滚 |
 | ingest_exception | 0002 | 接入异常（SRC-02 plh 空等）：status CHECK OPEN/RESOLVED；`IX_ingest_exception_open`；解决留证据 |
 | schema_version | DbMigrator 运行时创建 | 迁移账本：version 主键、name、checksum(SHA-256 char(64))、applied_at、success；校验摘要不一致即停止（MigratorTests） |
+
+## 0007 迁移增量（M1，`0007_m1_source_master.sql`）
+
+不修改 0001–0006 任何字节（MigrationRunner 校验摘要）；0007 以 ALTER/CREATE 增量演进：
+
+| 对象 | 变更 | 用途/约束 |
+| --- | --- | --- |
+| source_line.code_format | nvarchar(16)→nvarchar(32) NOT NULL DEFAULT N'EMPTY' | CodeFormat 持久化 token（EMPTY/S8P20/UNSUP），M0 携带项 1 |
+| trace_code.format | nvarchar(16)→nvarchar(32) NOT NULL | 同上（无默认约束，直接 ALTER COLUMN） |
+| source_snapshot.stabilize_rounds | int NOT NULL DEFAULT 0 | 稳定期轮次计数（SYNC-02） |
+| source_snapshot.last_round_at | datetime2(3) NULL | 上一轮观测时间（轮间隔≥5s 判定） |
+| idempotency_record | UQ_idempotency_key→UQ_idempotency_user_key(idem_key, user_id) | 幂等键用户作用域（不同用户同键独立） |
+| product_mapping | UX_pmap_pair UNIQUE(product_id, platform_drug_id) | 映射对唯一（M1 每商品至多一条映射行，防多行竞态） |
+| supplier_mapping | UX_smap_pair UNIQUE(supplier_id, enterprise_version_id) | 同上 |
+| import_batch.staged_content | nvarchar(max) NULL | 暂存 CSV 原文，供 import-stage 作业重解析（MD-03） |
+
+CodeFormat token 映射由 `TraceFlow.Domain.Codes.CodeFormatStorage` 统一（禁 enum.ToString 落库）；rowversion 经 `TraceFlow.Domain.Versioning.RowVer.ToHex/FromHex`（16 位大写 hex）。
 
 ## 环境隔离（Live/Mock）
 

@@ -46,7 +46,11 @@ public sealed class Sql2008Fixture : IAsyncLifetime
                 Console.OutputEncoding = System.Text.Encoding.UTF8;
                 Console.WriteLine($"TRACEFLOW: 2008 R2 未验证 — 开发测试运行于 SQL Server {ver}（用户授权降级，交付前须真实 2008 R2 补验）");
             }
-            await master.ExecuteAsync($"CREATE DATABASE [{_dbName}]");
+            // BIN2 变体（M0 携带 7）：opt-in 机械拦截大小写接缝（env/状态字面量）。默认 CI 排序不变。
+            var bin2 = Environment.GetEnvironmentVariable("TRACEFLOW_TEST_DB_BIN2") == "1";
+            await master.ExecuteAsync(bin2
+                ? $"CREATE DATABASE [{_dbName}] COLLATE Latin1_General_BIN2"
+                : $"CREATE DATABASE [{_dbName}]");
         }
 
         builder.InitialCatalog = _dbName;
