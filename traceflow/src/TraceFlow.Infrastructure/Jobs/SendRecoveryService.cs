@@ -2,6 +2,7 @@ using Dapper;
 using Microsoft.Data.SqlClient;
 using TraceFlow.Application.Abstractions;
 using TraceFlow.Domain.Uploads;
+using TraceFlow.Infrastructure.Uploads;
 
 namespace TraceFlow.Infrastructure.Jobs;
 
@@ -34,6 +35,10 @@ WHERE p.state = N'Dispatching'
         {
             ct.ThrowIfCancellationRequested();
             await using var tx = (SqlTransaction)await conn.BeginTransactionAsync(ct);
+            // 加锁顺序与发送写回一致（任务 → 分片）：下方重算会更新任务行，先锁任务避免与并发发送形成反向顺序。
+            await conn.ExecuteScalarAsync<string?>(new CommandDefinition(
+                "SELECT state FROM dbo.upload_task WITH (UPDLOCK, HOLDLOCK) WHERE id=@id",
+                new { id = c.TaskId }, tx, cancellationToken: ct));
             // 版本守卫：仅当仍是 Dispatching 才推进（防止与新认领者竞争）
             var rows = await conn.ExecuteAsync(
                 "UPDATE dbo.upload_part SET state=@next WHERE id=@id AND state=N'Dispatching'",
@@ -50,6 +55,8 @@ WHERE job_kind=N'upload-dispatch' AND intent_key=@k AND job_state IN (N'RUNNING'
 INSERT INTO dbo.audit_log(actor,actor_kind,action,object_type,object_id,reason,env)
 VALUES(N'SYSTEM',N'Worker',N'send-recovery',N'upload_part',@obj,N'失租→受理未知，先回查',@env)",
                     new { obj = c.PartId.ToString(), env = c.Env }, tx);
+                // 恢复即结算：复用发送写回的同一聚合重算，使任务状态在恢复当刻即为真实聚合，而非滞留 Dispatching。
+                await UploadDispatchService.RecomputeTaskStateAsync(conn, tx, c.TaskId, ct);
                 recovered++;
             }
             await tx.CommitAsync(ct);

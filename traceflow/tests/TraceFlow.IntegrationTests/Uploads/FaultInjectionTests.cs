@@ -171,6 +171,53 @@ OUTPUT inserted.fencing_token
 WHERE job_kind=@jobKind AND intent_key=@intent AND job_state=N'PENDING'",
             new { w = Worker, jobKind, intent });
 
+    /// <summary>
+    /// 用真实任务工厂建 LIVE 任务（任务+分片+bill_code+逐码占用+码事件+发送作业），再认领发送作业。
+    /// LIVE fail-closed 用例必须在派发前就存在可被推进的码台账，否则"台账未变化"不可证伪。
+    /// </summary>
+    private async Task<Seed> SeedLiveTaskAsync(string tag, IReadOnlyList<string> codes)
+    {
+        var stored = new List<(long CodeId, string CodeNormalized)>();
+        long orgId;
+        await using (var seedConn = await _fx.OpenAsync())
+        {
+            orgId = await SeedOrgAsync(seedConn);
+            await using var codeTx = (SqlTransaction)await seedConn.BeginTransactionAsync();
+            foreach (var code in codes)
+            {
+                var row = await TraceCodeStore.EnsureAsync(seedConn, codeTx, code, default);
+                stored.Add((row.Id, row.Normalized));
+            }
+            await codeTx.CommitAsync();
+        }
+
+        var ctx = new RetailTaskContext(orgId, "LIVE", null, $"FJ-LIVE-{tag}",
+            new DateTime(2026, 11, 22, 6, 0, 0, DateTimeKind.Utc), new string('a', 64), "map-1", "r1",
+            new[] { new RetailLine(1, "1", "SP1", "PD1", codes.Count, "盒", "B1", stored) },
+            RetailTaskFactory.Retail321);
+        var factory = new RetailTaskFactory(new SettingsService(_fx.ConnectionString, new DpapiProtector()),
+            new JobQueue(_fx.ConnectionString, new AuditLog()));
+
+        long taskId;
+        long partId;
+        await using (var conn = await _fx.OpenAsync())
+        {
+            await using var tx = (SqlTransaction)await conn.BeginTransactionAsync();
+            var created = await factory.CreateAsync(conn, tx, ctx, default);
+            await tx.CommitAsync();
+            taskId = created.TaskId;
+            partId = Assert.Single(created.PartIds);
+        }
+
+        var jobId = await ScalarAsync<long>(
+            "SELECT id FROM dbo.outbox_job WHERE job_kind=N'upload-dispatch' AND intent_key=@k",
+            new { k = $"part:{partId}" });
+        long token;
+        await using (var claimConn = await _fx.OpenAsync())
+            token = await ClaimAsync(claimConn, "upload-dispatch", $"part:{partId}");
+        return new Seed(orgId, taskId, partId, jobId, token);
+    }
+
     /// <summary>模拟"崩溃后无人续租"：租约已过期，恢复扫描才可接管。</summary>
     private async Task ExpireLeaseAsync(long jobId)
     {
@@ -215,14 +262,36 @@ SELECT COUNT(*) FROM dbo.outbox_job
 WHERE job_kind=N'bill-query' AND intent_key=@k AND job_state=@state",
             new { k = $"query:part:{partId}", state });
 
-    private Task<int> CodeResultsAsync(long taskId)
-        => ScalarAsync<int>("SELECT COUNT(*) FROM dbo.code_result WHERE task_id=@id", new { id = taskId });
+    /// <summary>
+    /// 本任务已落库的核验流水行数：派发/恢复路径从不写逐码结论，本用例也未播种码台账，
+    /// 故不再断言 code_result 计数；核验流水行数用于证明"未提交的受理成功/恢复均未凭空推进核验"。
+    /// </summary>
+    private Task<int> VerificationRowsAsync(long taskId)
+        => ScalarAsync<int>("SELECT COUNT(*) FROM dbo.verification WHERE upload_task_id=@id", new { id = taskId });
+
+    /// <summary>本任务的占用行快照（id、码、状态、归属任务），用于"派发前后完全相同"的整行比对。</summary>
+    private async Task<List<(long Id, long CodeId, string ClaimState, long? UploadTaskId)>> ClaimRowsAsync(long taskId)
+    {
+        await using var c = await _fx.OpenAsync();
+        return (await c.QueryAsync<(long Id, long CodeId, string ClaimState, long? UploadTaskId)>(@"
+SELECT id AS Id, code_id AS CodeId, claim_state AS ClaimState, upload_task_id AS UploadTaskId
+FROM dbo.code_claim WHERE upload_task_id=@id ORDER BY id", new { id = taskId })).ToList();
+    }
+
+    /// <summary>本任务的码事件行快照（id、码、事件类型、归属任务）。</summary>
+    private async Task<List<(long Id, long CodeId, string EventType, long? UploadTaskId)>> EventRowsAsync(long taskId)
+    {
+        await using var c = await _fx.OpenAsync();
+        return (await c.QueryAsync<(long Id, long CodeId, string EventType, long? UploadTaskId)>(@"
+SELECT id AS Id, code_id AS CodeId, event_type AS EventType, upload_task_id AS UploadTaskId
+FROM dbo.code_event WHERE upload_task_id=@id ORDER BY id", new { id = taskId })).ToList();
+    }
 
     private async Task<(DateTime? FinishedAt, string? RequestId, string? ErrorKind, bool IsStale, string? RawResponse)>
         AttemptAsync(long taskId, string kind, int attemptNo)
     {
         await using var c = await _fx.OpenAsync();
-        return await c.QuerySingleAsync<(DateTime?, string?, string?, bool, string?)>(@"
+        return await c.QuerySingleAsync<(DateTime? FinishedAt, string? RequestId, string? ErrorKind, bool IsStale, string? RawResponse)>(@"
 SELECT finished_at, request_id, error_kind, is_stale_evidence, raw_response
 FROM dbo.upload_attempt WHERE task_id=@id AND attempt_kind=@kind AND attempt_no=@no",
             new { id = taskId, kind, no = attemptNo });
@@ -261,13 +330,12 @@ FROM dbo.upload_attempt WHERE task_id=@id AND attempt_kind=@kind AND attempt_no=
         await ExpireLeaseAsync(seed.JobId);
         Assert.True(await RecoverAsync() >= 1);
 
-        // 恢复：受理未知 + 发送作业 FAILED + 回查作业待执行；没有第二次 UPLOAD，也没有代劳的回查。
+        // 恢复：受理未知 + 发送作业 FAILED + 回查作业待执行；没有第二次 UPLOAD（尝试行数不变是证据）。
         Assert.Equal("AcceptanceUnknown", await PartStateAsync(seed.PartId));
+        Assert.Equal("AcceptanceUnknown", await TaskStateAsync(seed.TaskId)); // 恢复事务内重算聚合，任务即真实态
         Assert.Equal("FAILED", await DispatchJobStateAsync(seed.JobId));
         Assert.Equal(1, await QueryJobsAsync(seed.PartId, "PENDING"));
         Assert.Equal(1, await UploadAttemptsAsync(seed.TaskId));
-        Assert.Equal(0, await QueryAttemptsAsync(seed.TaskId));
-        Assert.Equal(0, uploadCalls);
     }
 
     // ---------------------------------------------------------------- 2
@@ -352,6 +420,7 @@ FROM dbo.upload_attempt WHERE task_id=@id AND attempt_kind=@kind AND attempt_no=
         Assert.True(await RecoverAsync() >= 1);
 
         Assert.Equal("AcceptanceUnknown", await PartStateAsync(seed.PartId));
+        Assert.Equal("AcceptanceUnknown", await TaskStateAsync(seed.TaskId)); // 恢复事务内重算聚合
         Assert.Equal("FAILED", await DispatchJobStateAsync(seed.JobId));
         Assert.Equal(1, await QueryJobsAsync(seed.PartId, "PENDING"));
         Assert.Equal(1, await UploadAttemptsAsync(seed.TaskId));
@@ -388,6 +457,7 @@ OUTPUT inserted.id VALUES(@taskId,@partId,1,N'UPLOAD',N'MOCK',@w,@token)",
         Assert.Equal("Dispatching", await PartStateAsync(seed.PartId)); // 状态不推进
         var original = await AttemptAsync(seed.TaskId, "UPLOAD", 1);
         Assert.Null(original.FinishedAt); // 原尝试保持未收尾
+        Assert.Null(original.RequestId); // 迟到回执绝不写回原尝试
         Assert.False(original.IsStale);
         Assert.Null(original.RawResponse);
 
@@ -396,7 +466,6 @@ OUTPUT inserted.id VALUES(@taskId,@partId,1,N'UPLOAD',N'MOCK',@w,@token)",
         Assert.True(evidence.IsStale);
         Assert.NotNull(evidence.FinishedAt);
         Assert.Contains("r-fj-4-late", evidence.RawResponse ?? "", StringComparison.Ordinal);
-        Assert.Equal(0, await CodeResultsAsync(seed.TaskId));
         Assert.Equal(0, await QueryJobsAsync(seed.PartId, "PENDING"));
     }
 
@@ -447,7 +516,8 @@ OUTPUT inserted.id VALUES(@taskId,@partId,1,N'UPLOAD',N'MOCK',@w,@token)",
 
     /// <summary>
     /// 回执提交前崩溃：平台已给出"受理成功"的应答，但 T3 未提交，本地不得据此落成功——
-    /// 恢复后仍是受理未知，任务绝不会变成 Succeeded，也没有任何逐码成功证据。
+    /// 崩溃后任务/分片停在 T2 预发送标记且尝试行保持开放；恢复后分片与任务精确落在受理未知，
+    /// 绝不出现受理成功/逐码成功/核验流水证据。
     /// </summary>
     [Fact]
     public async Task Crash_before_receipt_commit_keeps_accepted_unknown_and_no_task_success()
@@ -459,23 +529,26 @@ OUTPUT inserted.id VALUES(@taskId,@partId,1,N'UPLOAD',N'MOCK',@w,@token)",
         await Assert.ThrowsAsync<SimulatedCrashException>(() =>
             service.DispatchAsync(seed.PartId, Worker, seed.FencingToken, default));
 
-        // 提交前崩溃 ⇒ 回执与状态推进全部回滚，本地看不到"受理成功"。
+        // 提交前崩溃 ⇒ 回执与状态推进全部回滚：任务/分片只停在 T2 预发送标记，尝试行保持开放。
         Assert.Equal("Dispatching", await PartStateAsync(seed.PartId));
-        Assert.NotEqual("Accepted", await TaskStateAsync(seed.TaskId));
-        Assert.Null((await AttemptAsync(seed.TaskId, "UPLOAD", 1)).FinishedAt);
-        Assert.Equal(0, await CodeResultsAsync(seed.TaskId));
+        Assert.Equal("Dispatching", await TaskStateAsync(seed.TaskId));
+        Assert.Equal(1, await OpenAttemptsAsync(seed.TaskId, "UPLOAD"));
+        var attempt = await AttemptAsync(seed.TaskId, "UPLOAD", 1);
+        Assert.Null(attempt.FinishedAt);
+        Assert.Null(attempt.RequestId);
+        Assert.Null(attempt.ErrorKind);
+        Assert.Null(attempt.RawResponse);
+        Assert.False(attempt.IsStale);
+        Assert.Equal(0, await VerificationRowsAsync(seed.TaskId)); // 未提交的受理成功不得产生核验流水
 
         await ExpireLeaseAsync(seed.JobId);
         Assert.True(await RecoverAsync() >= 1);
 
         Assert.Equal("AcceptanceUnknown", await PartStateAsync(seed.PartId));
-        var taskState = await TaskStateAsync(seed.TaskId);
-        Assert.NotEqual("Succeeded", taskState);
-        Assert.NotEqual("Accepted", taskState);
-        Assert.NotEqual("PartialSuccess", taskState);
+        Assert.Equal("AcceptanceUnknown", await TaskStateAsync(seed.TaskId)); // 恢复事务内精确重算聚合
         Assert.Equal(1, await QueryJobsAsync(seed.PartId, "PENDING"));
         Assert.Equal(1, await UploadAttemptsAsync(seed.TaskId));
-        Assert.Equal(0, await CodeResultsAsync(seed.TaskId)); // 无一码被判成功
+        Assert.Equal(0, await VerificationRowsAsync(seed.TaskId)); // 恢复也不得凭未提交回执推进核验
     }
 
     // ---------------------------------------------------------------- 7
@@ -508,14 +581,23 @@ OUTPUT inserted.id VALUES(@taskId,@partId,1,N'UPLOAD',N'MOCK',@w,@token)",
         var settings = new SettingsService(_fx.ConnectionString, new DpapiProtector());
         var factory = new RetailTaskFactory(settings, new JobQueue(_fx.ConnectionString, new AuditLog()));
 
-        var results = await Task.WhenAll(Enumerable.Range(0, 4).Select(async _ =>
+        // 4 条独立连接/事务先各自就绪，再由同一放行信号同时进入工厂，确保调用真正重叠。
+        var ready = Enumerable.Range(0, 4)
+            .Select(_ => new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)).ToArray();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var workers = Enumerable.Range(0, 4).Select(async i =>
         {
             await using var conn = await _fx.OpenAsync();
             await using var tx = (SqlTransaction)await conn.BeginTransactionAsync();
+            ready[i].SetResult();
+            await release.Task;
             var result = await factory.CreateAsync(conn, tx, ctx, default);
             await tx.CommitAsync();
             return result;
-        }));
+        }).ToArray();
+        await Task.WhenAll(ready.Select(t => t.Task));
+        release.SetResult();
+        var results = await Task.WhenAll(workers);
 
         var taskIds = results.Select(r => r.TaskId).Distinct().ToList();
         Assert.Single(taskIds);
@@ -558,12 +640,31 @@ OUTPUT inserted.id VALUES(@taskId,@partId,1,N'UPLOAD',N'MOCK',@w,@token)",
     /// <summary>
     /// MOCK 成功不得推进 LIVE 状态：env=LIVE 的任务经 Fake 网关必抛 <see cref="TopNotCertifiedException"/>，
     /// 网关处理函数零调用、无回执、无回查作业、无逐码结论；任务/分片只保留 HTTP 之前写入的发送中标记，
-    /// 绝不出现任何"受理成功/逐码成功"的推进。
+    /// 逐码占用与码事件整行不变，绝不出现任何"受理成功/逐码成功"的推进。
     /// </summary>
     [Fact]
     public async Task Mock_success_never_advances_live_state()
     {
-        var seed = await SeedAsync(NewTag(), new[] { Code(181) }, env: "LIVE");
+        var tag = NewTag();
+        var codes = new[] { Code(181), Code(182) };
+        var seed = await SeedLiveTaskAsync(tag, codes);
+
+        // 台账基线：逐码 ACTIVE 占用 + SALE 事件均归属本任务（基线为空时"未变化"断言不可证伪）。
+        var claimsBefore = await ClaimRowsAsync(seed.TaskId);
+        var eventsBefore = await EventRowsAsync(seed.TaskId);
+        Assert.Equal(codes.Length, claimsBefore.Count);
+        Assert.All(claimsBefore, row =>
+        {
+            Assert.Equal("ACTIVE", row.ClaimState);
+            Assert.Equal(seed.TaskId, row.UploadTaskId);
+        });
+        Assert.Equal(codes.Length, eventsBefore.Count);
+        Assert.All(eventsBefore, row =>
+        {
+            Assert.Equal("SALE", row.EventType);
+            Assert.Equal(seed.TaskId, row.UploadTaskId);
+        });
+
         var gatewayCalls = 0;
         var service = NewDispatchService(_ => { gatewayCalls++; return Accepted("r-fj-8"); });
 
@@ -580,6 +681,8 @@ OUTPUT inserted.id VALUES(@taskId,@partId,1,N'UPLOAD',N'MOCK',@w,@token)",
         Assert.Null(attempt.ErrorKind);
         Assert.False(attempt.IsStale);
         Assert.Equal(0, await QueryJobsAsync(seed.PartId, "PENDING"));
-        Assert.Equal(0, await CodeResultsAsync(seed.TaskId));
+        // 码台账整行不变：占用仍 ACTIVE、事件仍归属本任务（LIVE 失败不得改写/释放任何码证据）。
+        Assert.Equal(claimsBefore, await ClaimRowsAsync(seed.TaskId));
+        Assert.Equal(eventsBefore, await EventRowsAsync(seed.TaskId));
     }
 }

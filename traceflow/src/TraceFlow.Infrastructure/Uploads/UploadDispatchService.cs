@@ -73,6 +73,8 @@ public sealed class UploadDispatchService
     /// <summary>
     /// 故障注入钩子：T3 内回执/状态已写入事务、但提交之前执行；抛出的异常令整个 T3 回滚，
     /// 使尝试行保持未收尾（模拟提交前进程消失）。生产路径从不赋值。
+    /// 注意：钩子在 T3 尚未提交的事务内触发；钩子实现不得在另一连接上读取或等待同一任务/分片行，
+    /// 否则会与事务内尚未释放的写锁互相等待。
     /// </summary>
     internal Func<Task>? BeforeCommit { get; set; }
 
