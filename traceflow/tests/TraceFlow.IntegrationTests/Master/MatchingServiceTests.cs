@@ -226,4 +226,52 @@ VALUES(@snap,N'1',N'MP10',1,REPLICATE(N'e',64),N'SALE',N'BBBBBBB1111222233334',N
         Assert.Equal(1, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.drug_prefix_index WHERE prefix=N'AAAAAAA' AND platform_drug_id=@d", new { d = drugId }));
         Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.drug_prefix_index WHERE prefix=N'BBBBBBB'"));
     }
+
+    private async Task<long> SeedShadowOrgAsync()
+        => await ScalarAsync<long>(@"
+IF NOT EXISTS (SELECT 1 FROM dbo.organization WHERE org_code = N'O2-FIX')
+    INSERT INTO dbo.organization(org_code,name,is_active) VALUES(N'O2-FIX',N'影子组织',0);
+SELECT id FROM dbo.organization WHERE org_code = N'O2-FIX'");
+
+    [Fact]
+    public async Task Fallback_unique_violation_never_downgrades_locked_confirmed()
+    {
+        // AT-015/MD-01 确定性接缝：初始加载按 org 过滤，而 2601 兜底重选只按 product_id（无 org 过滤）。
+        // 挂在另一 org 下的锁定 MANUAL_CONFIRMED 行（同 product_id+drug 对）占据 UX_pmap_pair/UX_pmap_active_platform，
+        // 本 org 自动匹配 INSERT AUTO_CONFIRMED 必撞 2601，兜底重选命中该锁定行——基线强制 CONFLICT（RED），修复后整体跳过。
+        var pid = await SeedProductAsync("MPF1");
+        var drugId = await SeedDrugAsync("PD-MF1");
+        var shadowOrg = await SeedShadowOrgAsync();
+        var mapId = await ScalarAsync<long>(@"
+INSERT INTO dbo.product_mapping(org_id,product_id,platform_drug_id,state,is_locked,version,confirmed_by,confirmed_at)
+OUTPUT inserted.id VALUES(@org,@pid,@drug,N'MANUAL_CONFIRMED',1,7,N'tester',SYSUTCDATETIME())",
+            new { org = shadowOrg, pid, drug = drugId });
+        var result = await RunAsync();
+        Assert.Equal("MANUAL_CONFIRMED", await ScalarAsync<string>("SELECT state FROM dbo.product_mapping WHERE id=@id", new { id = mapId }));
+        Assert.Equal(7, await ScalarAsync<int>("SELECT version FROM dbo.product_mapping WHERE id=@id", new { id = mapId }));
+        Assert.Equal(1, await ScalarAsync<int>("SELECT CAST(is_locked AS int) FROM dbo.product_mapping WHERE id=@id", new { id = mapId }));
+        Assert.Equal("tester", await ScalarAsync<string>("SELECT confirmed_by FROM dbo.product_mapping WHERE id=@id", new { id = mapId }));
+        Assert.Equal(1, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.product_mapping WHERE id=@id AND confirmed_at IS NOT NULL", new { id = mapId }));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.product_mapping_history WHERE mapping_id=@id", new { id = mapId }));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.product_mapping WHERE product_id=@pid AND state=N'AUTO_CONFIRMED'", new { pid }));
+        Assert.Equal(0, result.ProductsConflict); // 跳过降级→不产生 CONFLICT 计数
+    }
+
+    [Fact]
+    public async Task Fallback_unique_violation_non_locked_still_conflicts()
+    {
+        // 回归钉住：非锁定/非有效行的 2601 兜底语义必须与修复前逐字一致（降级 CONFLICT + version+1 + 历史行 + 计数）。
+        var pid = await SeedProductAsync("MPF2");
+        var drugId = await SeedDrugAsync("PD-MF2");
+        var shadowOrg = await SeedShadowOrgAsync();
+        var mapId = await ScalarAsync<long>(@"
+INSERT INTO dbo.product_mapping(org_id,product_id,platform_drug_id,state,is_locked,version)
+OUTPUT inserted.id VALUES(@org,@pid,@drug,N'CONFLICT',0,3)",
+            new { org = shadowOrg, pid, drug = drugId });
+        var result = await RunAsync();
+        Assert.Equal("CONFLICT", await ScalarAsync<string>("SELECT state FROM dbo.product_mapping WHERE id=@id", new { id = mapId }));
+        Assert.Equal(4, await ScalarAsync<int>("SELECT version FROM dbo.product_mapping WHERE id=@id", new { id = mapId }));
+        Assert.Equal(1, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.product_mapping_history WHERE mapping_id=@id AND state=N'CONFLICT'", new { id = mapId }));
+        Assert.Equal(1, result.ProductsConflict);
+    }
 }

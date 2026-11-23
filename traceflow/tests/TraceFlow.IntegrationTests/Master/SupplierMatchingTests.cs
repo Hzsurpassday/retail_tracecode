@@ -155,4 +155,59 @@ VALUES(@org,@sid,@ev,N'MANUAL_CONFIRMED',1,5)", new { org, sid, ev });
         Assert.Equal("MANUAL_CONFIRMED", await ScalarAsync<string>("SELECT state FROM dbo.supplier_mapping WHERE supplier_id=@sid", new { sid }));
         Assert.Equal(5, await ScalarAsync<int>("SELECT version FROM dbo.supplier_mapping WHERE supplier_id=@sid", new { sid }));
     }
+
+    private async Task<long> SeedShadowOrgAsync()
+        => await ScalarAsync<long>(@"
+IF NOT EXISTS (SELECT 1 FROM dbo.organization WHERE org_code = N'O2-FIX')
+    INSERT INTO dbo.organization(org_code,name,is_active) VALUES(N'O2-FIX',N'影子组织',0);
+SELECT id FROM dbo.organization WHERE org_code = N'O2-FIX'");
+
+    private async Task ExecAsync(string sql, object? param = null)
+    {
+        await using var c = new SqlConnection(_fx.ConnectionString);
+        await c.OpenAsync();
+        await c.ExecuteAsync(sql, param);
+    }
+
+    [Fact]
+    public async Task Fallback_unique_violation_never_downgrades_locked_confirmed()
+    {
+        // AT-015/MD-01 确定性接缝（与商品侧对称）：初始加载按 org 过滤，2601 兜底重选只按 supplier_id（无 org 过滤）。
+        // 另一 org 下的锁定 MANUAL_CONFIRMED 行占据 UX_smap_pair/UX_smap_active_platform，
+        // 本 org 自动匹配 INSERT AUTO_CONFIRMED 必撞 2601，兜底重选命中锁定行——基线强制 CONFLICT（RED），修复后整体跳过。
+        var sid = await SeedSupplierAsync("SF1");
+        var ev = await SeedEntAsync("REF-SF1", "ENT-SF1");
+        await SetAuditPassAsync("[\"审核通过\"]");
+        var shadowOrg = await SeedShadowOrgAsync();
+        await ExecAsync(@"
+INSERT INTO dbo.supplier_mapping(org_id,supplier_id,enterprise_version_id,state,is_locked,version)
+VALUES(@org,@sid,@ev,N'MANUAL_CONFIRMED',1,5)", new { org = shadowOrg, sid, ev });
+        var mapId = await ScalarAsync<long>("SELECT id FROM dbo.supplier_mapping WHERE supplier_id=@sid", new { sid });
+        var result = await RunAsync();
+        Assert.Equal("MANUAL_CONFIRMED", await ScalarAsync<string>("SELECT state FROM dbo.supplier_mapping WHERE id=@id", new { id = mapId }));
+        Assert.Equal(5, await ScalarAsync<int>("SELECT version FROM dbo.supplier_mapping WHERE id=@id", new { id = mapId }));
+        Assert.Equal(1, await ScalarAsync<int>("SELECT CAST(is_locked AS int) FROM dbo.supplier_mapping WHERE id=@id", new { id = mapId }));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.supplier_mapping_history WHERE mapping_id=@id", new { id = mapId }));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.supplier_mapping WHERE supplier_id=@sid AND state=N'AUTO_CONFIRMED'", new { sid }));
+        Assert.Equal(0, result.SuppliersConflict); // 跳过降级→不产生 CONFLICT 计数
+    }
+
+    [Fact]
+    public async Task Fallback_unique_violation_non_locked_still_conflicts()
+    {
+        // 回归钉住：非锁定/非有效行的 2601 兜底语义必须与修复前逐字一致（降级 CONFLICT + version+1 + 历史行 + 计数）。
+        var sid = await SeedSupplierAsync("SF2");
+        var ev = await SeedEntAsync("REF-SF2", "ENT-SF2");
+        await SetAuditPassAsync("[\"审核通过\"]");
+        var shadowOrg = await SeedShadowOrgAsync();
+        await ExecAsync(@"
+INSERT INTO dbo.supplier_mapping(org_id,supplier_id,enterprise_version_id,state,is_locked,version)
+VALUES(@org,@sid,@ev,N'CONFLICT',0,3)", new { org = shadowOrg, sid, ev });
+        var mapId = await ScalarAsync<long>("SELECT id FROM dbo.supplier_mapping WHERE supplier_id=@sid", new { sid });
+        var result = await RunAsync();
+        Assert.Equal("CONFLICT", await ScalarAsync<string>("SELECT state FROM dbo.supplier_mapping WHERE id=@id", new { id = mapId }));
+        Assert.Equal(4, await ScalarAsync<int>("SELECT version FROM dbo.supplier_mapping WHERE id=@id", new { id = mapId }));
+        Assert.Equal(1, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.supplier_mapping_history WHERE mapping_id=@id AND state=N'CONFLICT'", new { id = mapId }));
+        Assert.Equal(1, result.SuppliersConflict);
+    }
 }

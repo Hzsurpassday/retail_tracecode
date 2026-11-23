@@ -84,9 +84,11 @@ public sealed class MatchingService
                 if (m is null || !m.IsFullMatch)
                 {
                     var ev = JsonSerializer.Serialize(new { reason = "platform-identity-changed", equal = m?.Equal, missing = m?.Missing, conflicts = m?.Conflicts });
-                    await conn.ExecuteAsync(new CommandDefinition(
-                        "UPDATE dbo.product_mapping SET state=N'REVIEW_REQUIRED', evidence_json=@ev, version=version+1 WHERE id=@id",
-                        new { id = map.id, ev }, tx, cancellationToken: ct));
+                    // AT-015/MD-01：加载后若被并发人工确认/锁定/改写（state/version 变化）→0 行命中，放弃本次写入与历史，下轮重读
+                    var affected = await conn.ExecuteAsync(new CommandDefinition(
+                        "UPDATE dbo.product_mapping SET state=N'REVIEW_REQUIRED', evidence_json=@ev, version=version+1 WHERE id=@id AND is_locked=0 AND state=@loadedState AND version=@loadedVersion",
+                        new { id = map.id, ev, loadedState = map.state, loadedVersion = map.version }, tx, cancellationToken: ct));
+                    if (affected == 0) continue;
                     await WriteProductHistoryAsync(conn, tx, map.id, prod.id, map.platform_drug_id, MappingStates.ReviewRequired, ev, ct);
                     review++;
                 }
@@ -120,9 +122,11 @@ public sealed class MatchingService
                 if (map is not null && map.state != MappingStates.Unresolved)
                 {
                     var ev0 = JsonSerializer.Serialize(new { reason = "no-candidates" });
-                    await conn.ExecuteAsync(new CommandDefinition(
-                        "UPDATE dbo.product_mapping SET state=N'UNRESOLVED', evidence_json=@ev, version=version+1 WHERE id=@id",
-                        new { id = map.id, ev = ev0 }, tx, cancellationToken: ct));
+                    // AT-015/MD-01：并发人工确认/锁定/改写→0 行命中，放弃本次写入与历史，下轮重读
+                    var affected = await conn.ExecuteAsync(new CommandDefinition(
+                        "UPDATE dbo.product_mapping SET state=N'UNRESOLVED', evidence_json=@ev, version=version+1 WHERE id=@id AND is_locked=0 AND state=@loadedState AND version=@loadedVersion",
+                        new { id = map.id, ev = ev0, loadedState = map.state, loadedVersion = map.version }, tx, cancellationToken: ct));
+                    if (affected == 0) continue;
                     await WriteProductHistoryAsync(conn, tx, map.id, prod.id, map.platform_drug_id, MappingStates.Unresolved, ev0, ct);
                 }
                 unresolved++;
@@ -138,7 +142,9 @@ public sealed class MatchingService
                 equal = best.Equal, missing = best.Missing, conflicts = best.Conflicts, bidirectionalUnique,
                 candidates = candidates.Select(x => new { platformDrugId = x.d.platform_drug_id, equal = x.match.Equal, missing = x.match.Missing, conflicts = x.match.Conflicts }),
             });
-            var (mapId, finalState) = await UpsertProductMappingAsync(conn, tx, orgId, prod.id, target!.Value, state, evidence, map, ct);
+            var upserted = await UpsertProductMappingAsync(conn, tx, orgId, prod.id, target!.Value, state, evidence, map, ct);
+            if (upserted is null) continue; // AT-015/MD-01：并发人工确认/锁定→放弃本次写入（无历史、不计数），下轮重读新状态
+            var (mapId, finalState) = upserted.Value;
             if (map is null || map.state != finalState)
                 await WriteProductHistoryAsync(conn, tx, mapId, prod.id, target.Value, finalState, evidence, ct);
             switch (finalState)
@@ -152,7 +158,7 @@ public sealed class MatchingService
         return (auto, candidate, conflict, unresolved, review);
     }
 
-    private static async Task<(long Id, string State)> UpsertProductMappingAsync(SqlConnection conn, SqlTransaction tx,
+    private static async Task<(long Id, string State)?> UpsertProductMappingAsync(SqlConnection conn, SqlTransaction tx,
         long orgId, long productId, long drugId, string state, string evidence, PMapRec? existing, CancellationToken ct)
     {
         try
@@ -165,24 +171,30 @@ OUTPUT inserted.id VALUES(@org,@pid,@drug,@state,N'match-1',@ev)",
                     new { org = orgId, pid = productId, drug = drugId, state, ev = evidence }, tx, cancellationToken: ct));
                 return (id, state);
             }
-            await conn.ExecuteAsync(new CommandDefinition(@"
+            // AT-015/MD-01：乐观并发守卫——加载后被并发人工确认/锁定/改写（is_locked/state/version 任一变化）→0 行命中，
+            // 放弃本次写入（返回 null→调用方跳过历史与计数），绝不覆盖人工绑定；下轮重读新状态
+            var affected = await conn.ExecuteAsync(new CommandDefinition(@"
 UPDATE dbo.product_mapping SET platform_drug_id=@drug, state=@state, rule_version=N'match-1', evidence_json=@ev, version=version+1
-WHERE id=@id",
-                new { id = existing.id, drug = drugId, state, ev = evidence }, tx, cancellationToken: ct));
+WHERE id=@id AND is_locked=0 AND state=@loadedState AND version=@loadedVersion",
+                new { id = existing.id, drug = drugId, state, ev = evidence, loadedState = existing.state, loadedVersion = existing.version }, tx, cancellationToken: ct));
+            if (affected == 0) return null;
             return (existing.id, state);
         }
         catch (SqlException ex) when (ex.Number is 2601 or 2627)
         {
             // AT-015 并发兜底：有效唯一/对唯一竞态→降级 CONFLICT（语句级错误，事务仍可用）
-            var existingId = await conn.ExecuteScalarAsync<long?>(new CommandDefinition(
-                "SELECT TOP 1 id FROM dbo.product_mapping WHERE product_id=@pid ORDER BY id DESC",
+            // MD-01：UPDLOCK+HOLDLOCK 锁住重选行至事务结束；锁定/有效（并发人工确认）→绝不降级，整体跳过
+            var current = await conn.QueryFirstOrDefaultAsync<PMapRec>(new CommandDefinition(
+                "SELECT TOP 1 id,product_id,platform_drug_id,state,is_locked,version FROM dbo.product_mapping WITH (UPDLOCK, HOLDLOCK) WHERE product_id=@pid ORDER BY id DESC",
                 new { pid = productId }, tx, cancellationToken: ct));
-            if (existingId is not null)
+            if (current is not null)
             {
-                await conn.ExecuteAsync(new CommandDefinition(
-                    "UPDATE dbo.product_mapping SET state=N'CONFLICT', evidence_json=@ev, version=version+1 WHERE id=@id",
-                    new { id = existingId.Value, ev = evidence }, tx, cancellationToken: ct));
-                return (existingId.Value, MappingStates.Conflict);
+                if (current.is_locked || MappingStates.Active.Contains(current.state)) return null;
+                var affected = await conn.ExecuteAsync(new CommandDefinition(
+                    "UPDATE dbo.product_mapping SET state=N'CONFLICT', evidence_json=@ev, version=version+1 WHERE id=@id AND is_locked=0 AND state=@loadedState AND version=@loadedVersion",
+                    new { id = current.id, ev = evidence, loadedState = current.state, loadedVersion = current.version }, tx, cancellationToken: ct));
+                if (affected == 0) return null;
+                return (current.id, MappingStates.Conflict);
             }
             var newId = await conn.ExecuteScalarAsync<long>(new CommandDefinition(@"
 INSERT INTO dbo.product_mapping(org_id,product_id,platform_drug_id,state,rule_version,evidence_json)
@@ -229,9 +241,11 @@ VALUES(@mid,@pid,@drug,@state,N'match-1',@ev,N'SYSTEM',N'auto-match')",
                 if (!same)
                 {
                     var evJson = JsonSerializer.Serialize(new { reason = "credit-code-changed", local = sup.credit_code, platform = ev?.credit_code });
-                    await conn.ExecuteAsync(new CommandDefinition(
-                        "UPDATE dbo.supplier_mapping SET state=N'REVIEW_REQUIRED', evidence_json=@ev, version=version+1 WHERE id=@id",
-                        new { id = map.id, ev = evJson }, tx, cancellationToken: ct));
+                    // AT-015/MD-01：加载后若被并发人工确认/锁定/改写（state/version 变化）→0 行命中，放弃本次写入与历史，下轮重读
+                    var affected = await conn.ExecuteAsync(new CommandDefinition(
+                        "UPDATE dbo.supplier_mapping SET state=N'REVIEW_REQUIRED', evidence_json=@ev, version=version+1 WHERE id=@id AND is_locked=0 AND state=@loadedState AND version=@loadedVersion",
+                        new { id = map.id, ev = evJson, loadedState = map.state, loadedVersion = map.version }, tx, cancellationToken: ct));
+                    if (affected == 0) continue;
                     await WriteSupplierHistoryAsync(conn, tx, map.id, sup.id, map.enterprise_version_id, MappingStates.ReviewRequired, evJson, ct);
                     review++;
                 }
@@ -264,9 +278,11 @@ VALUES(@mid,@pid,@drug,@state,N'match-1',@ev,N'SYSTEM',N'auto-match')",
                     if (map is not null && map.state != MappingStates.Unresolved)
                     {
                         var ev0 = JsonSerializer.Serialize(new { reason = "no-candidates" });
-                        await conn.ExecuteAsync(new CommandDefinition(
-                            "UPDATE dbo.supplier_mapping SET state=N'UNRESOLVED', evidence_json=@ev, version=version+1 WHERE id=@id",
-                            new { id = map.id, ev = ev0 }, tx, cancellationToken: ct));
+                        // AT-015/MD-01：并发人工确认/锁定/改写→0 行命中，放弃本次写入与历史，下轮重读
+                        var affected = await conn.ExecuteAsync(new CommandDefinition(
+                            "UPDATE dbo.supplier_mapping SET state=N'UNRESOLVED', evidence_json=@ev, version=version+1 WHERE id=@id AND is_locked=0 AND state=@loadedState AND version=@loadedVersion",
+                            new { id = map.id, ev = ev0, loadedState = map.state, loadedVersion = map.version }, tx, cancellationToken: ct));
+                        if (affected == 0) continue;
                         await WriteSupplierHistoryAsync(conn, tx, map.id, sup.id, map.enterprise_version_id, MappingStates.Unresolved, ev0, ct);
                     }
                     unresolved++;
@@ -281,7 +297,9 @@ VALUES(@mid,@pid,@drug,@state,N'match-1',@ev,N'SYSTEM',N'auto-match')",
                 nameOnly = creditCandidates.Count == 0,
                 candidates = creditCandidates.Select(e => new { entId = e.ent_id, refEntId = e.ref_ent_id, auditStatus = e.audit_status }),
             });
-            var (mapId, finalState) = await UpsertSupplierMappingAsync(conn, tx, orgId, sup.id, target!.Value, state, evidence, map, ct);
+            var upserted = await UpsertSupplierMappingAsync(conn, tx, orgId, sup.id, target!.Value, state, evidence, map, ct);
+            if (upserted is null) continue; // AT-015/MD-01：并发人工确认/锁定→放弃本次写入（无历史、不计数），下轮重读新状态
+            var (mapId, finalState) = upserted.Value;
             if (map is null || map.state != finalState)
                 await WriteSupplierHistoryAsync(conn, tx, mapId, sup.id, target.Value, finalState, evidence, ct);
             switch (finalState)
@@ -295,7 +313,7 @@ VALUES(@mid,@pid,@drug,@state,N'match-1',@ev,N'SYSTEM',N'auto-match')",
         return (auto, candidate, conflict, unresolved, review);
     }
 
-    private static async Task<(long Id, string State)> UpsertSupplierMappingAsync(SqlConnection conn, SqlTransaction tx,
+    private static async Task<(long Id, string State)?> UpsertSupplierMappingAsync(SqlConnection conn, SqlTransaction tx,
         long orgId, long supplierId, long entVersionId, string state, string evidence, SMapRec? existing, CancellationToken ct)
     {
         try
@@ -308,23 +326,29 @@ OUTPUT inserted.id VALUES(@org,@sid,@ev,@state,@evid)",
                     new { org = orgId, sid = supplierId, ev = entVersionId, state, evid = evidence }, tx, cancellationToken: ct));
                 return (id, state);
             }
-            await conn.ExecuteAsync(new CommandDefinition(@"
+            // AT-015/MD-01：乐观并发守卫——加载后被并发人工确认/锁定/改写（is_locked/state/version 任一变化）→0 行命中，
+            // 放弃本次写入（返回 null→调用方跳过历史与计数），绝不覆盖人工绑定；下轮重读新状态
+            var affected = await conn.ExecuteAsync(new CommandDefinition(@"
 UPDATE dbo.supplier_mapping SET enterprise_version_id=@ev, state=@state, evidence_json=@evid, version=version+1
-WHERE id=@id",
-                new { id = existing.id, ev = entVersionId, state, evid = evidence }, tx, cancellationToken: ct));
+WHERE id=@id AND is_locked=0 AND state=@loadedState AND version=@loadedVersion",
+                new { id = existing.id, ev = entVersionId, state, evid = evidence, loadedState = existing.state, loadedVersion = existing.version }, tx, cancellationToken: ct));
+            if (affected == 0) return null;
             return (existing.id, state);
         }
         catch (SqlException ex) when (ex.Number is 2601 or 2627)
         {
-            var existingId = await conn.ExecuteScalarAsync<long?>(new CommandDefinition(
-                "SELECT TOP 1 id FROM dbo.supplier_mapping WHERE supplier_id=@sid ORDER BY id DESC",
+            // MD-01：UPDLOCK+HOLDLOCK 锁住重选行至事务结束；锁定/有效（并发人工确认）→绝不降级，整体跳过
+            var current = await conn.QueryFirstOrDefaultAsync<SMapRec>(new CommandDefinition(
+                "SELECT TOP 1 id,supplier_id,enterprise_version_id,state,is_locked,version FROM dbo.supplier_mapping WITH (UPDLOCK, HOLDLOCK) WHERE supplier_id=@sid ORDER BY id DESC",
                 new { sid = supplierId }, tx, cancellationToken: ct));
-            if (existingId is not null)
+            if (current is not null)
             {
-                await conn.ExecuteAsync(new CommandDefinition(
-                    "UPDATE dbo.supplier_mapping SET state=N'CONFLICT', evidence_json=@ev, version=version+1 WHERE id=@id",
-                    new { id = existingId.Value, ev = evidence }, tx, cancellationToken: ct));
-                return (existingId.Value, MappingStates.Conflict);
+                if (current.is_locked || MappingStates.Active.Contains(current.state)) return null;
+                var affected = await conn.ExecuteAsync(new CommandDefinition(
+                    "UPDATE dbo.supplier_mapping SET state=N'CONFLICT', evidence_json=@ev, version=version+1 WHERE id=@id AND is_locked=0 AND state=@loadedState AND version=@loadedVersion",
+                    new { id = current.id, ev = evidence, loadedState = current.state, loadedVersion = current.version }, tx, cancellationToken: ct));
+                if (affected == 0) return null;
+                return (current.id, MappingStates.Conflict);
             }
             var newId = await conn.ExecuteScalarAsync<long>(new CommandDefinition(@"
 INSERT INTO dbo.supplier_mapping(org_id,supplier_id,enterprise_version_id,state,evidence_json)
