@@ -161,6 +161,24 @@ IF NOT EXISTS (SELECT 1 FROM dbo.user_permission WHERE user_id=@id AND permissio
     }
 
     [Fact]
+    public async Task Mapping_endpoints_gated()
+    {
+        var anon = _factory.CreateClient();
+        Assert.Equal(HttpStatusCode.Unauthorized, (await anon.PostAsJsonAsync("/api/v1/product-mappings/1/confirm",
+            new { targetId = "X", expectedVersion = "0", reason = "x" })).StatusCode);
+        var (viewer, _) = await LoginAsync("m1viewer", "Test-Password-123");
+        viewer.DefaultRequestHeaders.Add("Idempotency-Key", Guid.NewGuid().ToString());
+        Assert.Equal(HttpStatusCode.Forbidden, (await viewer.PostAsJsonAsync("/api/v1/product-mappings/1/confirm",
+            new { targetId = "X", expectedVersion = "0", reason = "x" })).StatusCode);
+        var (admin, _) = await LoginAsync("m1admin", "Admin-Password-123");
+        admin.DefaultRequestHeaders.Remove("X-CSRF-TOKEN");
+        admin.DefaultRequestHeaders.Add("Idempotency-Key", Guid.NewGuid().ToString());
+        var noCsrf = await admin.PostAsJsonAsync("/api/v1/supplier-mappings/1/disable", new { expectedVersion = "0", reason = "x" });
+        Assert.Equal(HttpStatusCode.BadRequest, noCsrf.StatusCode);
+        Assert.Contains("CSRF_INVALID", await noCsrf.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
     public async Task Import_lookup_by_lowercase_hash_finds_staged_batch()
     {
         // T10 Fix Round 1 回归：StageAsync 以 OrdinalIgnoreCase 接受任意大小写 fileHash 并存储大写 hex，
