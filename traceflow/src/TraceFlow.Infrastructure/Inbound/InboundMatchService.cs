@@ -96,6 +96,20 @@ VALUES(@orgId,@sys,@key,@lk,N'QTY_NONPOSITIVE',N'REQUIRED 行数量≤0')",
         if (required.Any(l => l.quantity_original <= 0))
             return await Save("UNMATCHED", "REQUIRED 行数量≤0，已记录接入异常", null, new { });
 
+        // R8a：既有任务先于证据判定处置——已发送/非发送前状态一律冻结；发送前且来源未变则无需重算（防周期扫描空转）。
+        var existing = await c.QuerySingleOrDefaultAsync<TaskRow>(new CommandDefinition(
+            "SELECT id,state,source_hash,source_snapshot_id FROM dbo.upload_task WHERE org_id=@orgId AND env=@env AND event_key=@key",
+            new { orgId, env, key = $"KSOA:{snap.source_document_key}:PURCHASE_IN" }, tx, cancellationToken: ct));
+        if (existing is not null && existing.state != "Cancelled")
+        {
+            var sent = await c.ExecuteScalarAsync<int>(new CommandDefinition(
+                "SELECT COUNT(*) FROM dbo.upload_attempt WHERE task_id=@id AND attempt_kind=N'UPLOAD'", new { id = existing.id }, tx, cancellationToken: ct));
+            if (sent > 0 || existing.state is not ("Blocked" or "Ready"))
+                return await Save("COMPLETE", "既有已发送任务冻结，来源变化由 M3 处置", null, new { });
+            if (existing.source_hash == snap.content_hash)
+                return await Save("COMPLETE", "既有发送前任务与来源一致，无需重建", null, new { });
+        }
+
         string? dwbh = null, ywdjbh = null;
         if (snap.raw_header is not null)
         {
@@ -219,19 +233,9 @@ WHERE p.code_normalized IN @allCodes AND ch.code_normalized IN @allCodes",
             || required.Select(l => candidates[l.id][0].id).Distinct().Count() != required.Count)
             return await Save("AMBIGUOUS", "存在多解或上游明细争用，须人工补配", dwbh, evidence);
 
-        var existing = await c.QuerySingleOrDefaultAsync<TaskRow>(new CommandDefinition(
-            "SELECT id,state,source_hash,source_snapshot_id FROM dbo.upload_task WHERE org_id=@orgId AND env=@env AND event_key=@key",
-            new { orgId, env, key = $"KSOA:{snap.source_document_key}:PURCHASE_IN" }, tx, cancellationToken: ct));
+        // 来源版本变化且发送前：按旧任务自己的 source_snapshot_id 取消（释放旧占用/占用码），再走 R7a 复活重建（bill_code 不变）。
         if (existing is not null && existing.state != "Cancelled")
-        {
-            var sent = await c.ExecuteScalarAsync<int>(new CommandDefinition(
-                "SELECT COUNT(*) FROM dbo.upload_attempt WHERE task_id=@id AND attempt_kind=N'UPLOAD'", new { id = existing.id }, tx, cancellationToken: ct));
-            if (sent > 0 || existing.state is not ("Blocked" or "Ready"))
-                return await Save("COMPLETE", "既有已发送任务冻结，来源变化由 M3 处置", dwbh, evidence);
-            if (existing.source_hash == snap.content_hash)
-                return await Save("COMPLETE", "既有发送前任务与来源一致，无需重建", dwbh, evidence);
             await InboundCancelService.CancelPreSendAsync(c, tx, orgId, env, existing.source_snapshot_id, "SYSTEM", "来源版本变化，重建补配", env, ct);
-        }
 
         var allocLines = new List<AllocatedLine>();
         var mappingVersions = new List<string> { $"supplier:{dwbh}:{sup.map_version}" };
