@@ -230,4 +230,57 @@ OUTPUT INSERTED.id VALUES(@billId,N'L1',@drug,N'B2026',2,N'盒')", new { billId,
         Assert.Equal(1, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.inbound_allocation WHERE source_line_id=@id AND state=N'RESERVED'", new { id = s.LineId }));
         Assert.Equal(2, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.code_claim cc JOIN dbo.inbound_allocation a ON a.id=cc.allocation_id WHERE a.source_line_id=@id AND cc.claim_state=N'ACTIVE'", new { id = s.LineId }));
     }
+
+    // 快照一致性：发送前任务挂靠 v1，却用 v2（同文档新版本）保存 → 409 VERSION_CONFLICT，且不得释放 v1 的分配/占用。
+    [Fact]
+    public async Task Save_rejects_task_from_other_snapshot()
+    {
+        await using var c = await _fx.OpenAsync();
+        var s = await SeedAsync(c, "A11", 10);
+
+        // v1：正常保存流程落分配 + 码占用；随后挂 Blocked 发送前任务并转 COMMITTED（T10 确认后的形态）。
+        await using (var tx = (SqlTransaction)await c.BeginTransactionAsync())
+        {
+            await NewService().SaveAsync(c, tx, s.OrgId, "MOCK", s.SnapId, Req(s.LineId, s.UpLineId, "1", 1m, "1/1", null, s.Code1), "tester", default);
+            await tx.CommitAsync();
+        }
+        var v1AllocId = await c.ExecuteScalarAsync<long>("SELECT id FROM dbo.inbound_allocation WHERE source_line_id=@id", new { id = s.LineId });
+        await c.ExecuteAsync("UPDATE dbo.inbound_allocation SET state=N'COMMITTED' WHERE id=@id", new { id = v1AllocId });
+        var docKey = await c.ExecuteScalarAsync<string>("SELECT source_document_key FROM dbo.source_snapshot WHERE id=@id", new { id = s.SnapId });
+        var taskId = await c.ExecuteScalarAsync<long>(@"
+INSERT INTO dbo.upload_task(org_id,env,event_key,task_type,source_snapshot_id,source_hash,payload_hash,state)
+OUTPUT INSERTED.id VALUES(@orgId,N'MOCK',@key,N'PURCHASE_IN_102',@snapId,@hash,@hash,N'Blocked')",
+            new { s.OrgId, key = "KSOA:" + docKey + ":PURCHASE_IN", snapId = s.SnapId, hash = new string('0', 64) });
+        Assert.Equal(1, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.code_claim WHERE allocation_id=@id AND claim_state=N'ACTIVE'", new { id = v1AllocId }));
+
+        // v2：同一 source_document_key 的新版本快照（自带来源行与匹配记录）。
+        var sysId = await c.ExecuteScalarAsync<long>("SELECT source_system_id FROM dbo.source_snapshot WHERE id=@id", new { id = s.SnapId });
+        var header = await c.ExecuteScalarAsync<string>("SELECT raw_header FROM dbo.source_snapshot WHERE id=@id", new { id = s.SnapId });
+        var spid = await c.ExecuteScalarAsync<string>("SELECT product_source_id FROM dbo.source_line WHERE id=@id", new { id = s.LineId });
+        var v2SnapId = await c.ExecuteScalarAsync<long>(@"
+INSERT INTO dbo.source_snapshot(org_id,source_system_id,source_document_key,document_type,version,business_datetime,completeness_status,content_hash,raw_header)
+OUTPUT INSERTED.id VALUES(@orgId,@sysId,@docKey,N'PURCHASE_IN',2,@biz,N'COMPLETE',@hash,@header)",
+            new { s.OrgId, sysId, docKey, biz = new DateTime(2026, 11, 20, 3, 0, 0, DateTimeKind.Utc), hash = new string('1', 64), header });
+        var v2LineId = await c.ExecuteScalarAsync<long>(@"
+INSERT INTO dbo.source_line(snapshot_id,source_line_key,product_source_id,quantity_original,unit_original,batch_raw,line_hash,event_kind)
+OUTPUT INSERTED.id VALUES(@v2SnapId,N'1',@spid,1,N'盒',N'B2026',@hash,N'PURCHASE_IN')",
+            new { v2SnapId, spid, hash = new string('1', 64) });
+        await c.ExecuteAsync("INSERT INTO dbo.inbound_match(org_id,env,source_snapshot_id,supplier_dwbh,match_state) VALUES(@orgId,N'MOCK',@v2SnapId,N'DWA11',N'UNMATCHED')",
+            new { s.OrgId, v2SnapId });
+
+        // 保存 v2：VERSION_CONFLICT 拒绝，不释放 v1（任务所属快照）的分配/占用，也不落 v2 新分配。
+        await using var tx2 = (SqlTransaction)await c.BeginTransactionAsync();
+        var ex = await Assert.ThrowsAsync<AllocationConflictException>(() =>
+            NewService().SaveAsync(c, tx2, s.OrgId, "MOCK", v2SnapId, Req(v2LineId, s.UpLineId, "1", 1m, "1/1", null, s.Code2), "tester", default));
+        Assert.Equal("VERSION_CONFLICT", ex.ErrorCode);
+        await tx2.RollbackAsync();
+
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>(@"SELECT COUNT(*) FROM dbo.inbound_allocation a JOIN dbo.source_line l ON l.id=a.source_line_id WHERE l.snapshot_id=@id", new { id = v2SnapId }));
+        Assert.Equal("UNMATCHED", await c.ExecuteScalarAsync<string>("SELECT match_state FROM dbo.inbound_match WHERE source_snapshot_id=@id", new { id = v2SnapId }));
+        Assert.Equal("COMMITTED", await c.ExecuteScalarAsync<string>("SELECT state FROM dbo.inbound_allocation WHERE id=@id", new { id = v1AllocId }));
+        Assert.Equal(1, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.code_claim WHERE allocation_id=@id AND claim_state=N'ACTIVE'", new { id = v1AllocId }));
+        Assert.Equal(1, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.allocation_code WHERE allocation_id=@id", new { id = v1AllocId }));
+        Assert.Equal("Blocked", await c.ExecuteScalarAsync<string>("SELECT state FROM dbo.upload_task WHERE id=@id", new { id = taskId }));
+        Assert.Equal(1, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.upload_task WHERE event_key=@key", new { key = "KSOA:" + docKey + ":PURCHASE_IN" }));
+    }
 }

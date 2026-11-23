@@ -26,7 +26,7 @@ public sealed class AllocationService
     private sealed record LineRow(long id, string source_line_key, string product_source_id, decimal quantity_original, string? unit_original, string? batch_raw);
     private sealed record UpRow(long id, long bill_id, string? platform_drug_id, string? batch_no, string upstream_ref_ent_id, string completeness);
     private sealed record UpCodeRow(string code_normalized, string? package_level);
-    private sealed record AllocRow(long id, string state);
+    private sealed record AllocRow(long id, string state, string source_document_key);
     private sealed record ParsedLine(AllocationLineInput Input, LineRow Line, Qty Qty, long Num, long Den, IReadOnlyList<long> CodeIds);
 
     public async Task<AllocationSaveResult> SaveAsync(SqlConnection conn, SqlTransaction tx, long orgId, string env,
@@ -49,7 +49,8 @@ WHERE org_id=@orgId AND env=@env AND source_snapshot_id=@snapshotId", new { orgI
             throw new AllocationConflictException("VERSION_CONFLICT", "匹配版本已变化，请刷新后重试");
 
         // R4/R8a：已发送或已进入发送流程的任务一律冻结，先于证据判定拒绝（只读，不改状态）。
-        var task = await TaskForSnapshotAsync(conn, tx, orgId, env, snap.source_document_key, ct);
+        // 任务必须挂靠本次保存的快照：占用豁免与释放同用一个 snapshotId 作用域，跨快照任务直接 409。
+        var task = await ResolveTaskAsync(conn, tx, orgId, env, snap.source_document_key, snapshotId, ct);
         var taskCancellable = false;
         if (task is not null)
         {
@@ -151,11 +152,12 @@ WHERE p.org_id=@orgId AND p.source_system_id=@sys AND p.spid=@spid",
         await AssertNoForeignClaimsAsync(conn, tx, orgId, env, snapshotId, parsed.SelectMany(p => p.CodeIds).Distinct().ToList(), ct);
 
         // R9a：先回退该快照旧占用（任务存在→发送前取消整单回退；否则撤销 RESERVED/TENTATIVE 分配并释放占用）。
+        // 两条路径共用 snapshotId 作用域（与占用豁免一致）：发送前取消只覆盖任务挂靠的 RESERVED/COMMITTED，
+        // 残留的 TENTATIVE（无占用但受 UX_alloc_pair_active 约束）由随后的撤销一并清理，避免同对重插被唯一索引阻断。
         if (taskCancellable)
-            await InboundCancelService.CancelPreSendAsync(conn, tx, orgId, env, task!.source_snapshot_id, actor,
+            await InboundCancelService.CancelPreSendAsync(conn, tx, orgId, env, snapshotId, actor,
                 "人工补配保存前撤销旧任务", "LIVE", ct);
-        else
-            await CancelReservedForSnapshotAsync(conn, tx, orgId, env, snapshotId, actor, "人工补配保存替换", ct);
+        await CancelReservedForSnapshotAsync(conn, tx, orgId, env, snapshotId, actor, "人工补配保存替换", ct);
 
         foreach (var p in parsed)
         {
@@ -202,7 +204,10 @@ WHERE org_id=@orgId AND env=@env AND source_snapshot_id=@snapshotId",
         if (allocationId is not null)
         {
             var alloc = await conn.QuerySingleOrDefaultAsync<AllocRow>(new CommandDefinition(@"
-SELECT a.id, a.state FROM dbo.inbound_allocation a JOIN dbo.source_line l ON l.id=a.source_line_id
+SELECT a.id, a.state, s.source_document_key
+FROM dbo.inbound_allocation a
+JOIN dbo.source_line l ON l.id=a.source_line_id
+JOIN dbo.source_snapshot s ON s.id=l.snapshot_id
 WHERE a.id=@id AND a.org_id=@orgId AND a.env=@env AND l.snapshot_id=@snapshotId",
                 new { id = allocationId, orgId, env, snapshotId }, tx, cancellationToken: ct));
             if (alloc is null)
@@ -211,6 +216,12 @@ WHERE a.id=@id AND a.org_id=@orgId AND a.env=@env AND l.snapshot_id=@snapshotId"
             if (alloc.state == "COMMITTED")
             {
                 // COMMITTED 已挂任务：单行取消=整单发送前取消（任务/分配/占用/匹配一并回退）。
+                // 与 SaveAsync 同一冻结闸与快照作用域：已发送/发送中→FROZEN，任务属于其他快照→VERSION_CONFLICT。
+                var committedTask = await ResolveTaskAsync(conn, tx, orgId, env, alloc.source_document_key, snapshotId, ct);
+                if (committedTask is null) return 0;
+                var committedSent = await SentAttemptsAsync(conn, tx, committedTask.id, ct);
+                if (committedSent > 0 || committedTask.state is not ("Blocked" or "Ready"))
+                    throw new AllocationConflictException("FROZEN", "任务已发送或已进入发送流程，禁止取消");
                 var ok = await InboundCancelService.CancelPreSendAsync(conn, tx, orgId, env, snapshotId, actor, reason, "LIVE", ct);
                 if (ok)
                     await _audit.AppendAsync(conn, tx, new AuditEntry(actor, "User", "inbound.allocate.cancel", "source_snapshot", snapshotId.ToString(), reason, null, null, null, null, "LIVE"));
@@ -230,13 +241,13 @@ SELECT id, source_system_id, source_document_key, document_type, completeness_st
 FROM dbo.source_snapshot WHERE id=@snapshotId AND org_id=@orgId", new { orgId, snapshotId }, tx, cancellationToken: ct));
         if (snap is null)
             throw new AllocationValidationException("VALIDATION", "快照不存在");
-        var task = await TaskForSnapshotAsync(conn, tx, orgId, env, snap.source_document_key, ct);
+        var task = await ResolveTaskAsync(conn, tx, orgId, env, snap.source_document_key, snapshotId, ct);
         if (task is not null)
         {
             var sent = await SentAttemptsAsync(conn, tx, task.id, ct);
             if (sent > 0 || task.state is not ("Blocked" or "Ready"))
                 throw new AllocationConflictException("FROZEN", "任务已发送或已进入发送流程，禁止取消");
-            var ok = await InboundCancelService.CancelPreSendAsync(conn, tx, orgId, env, task.source_snapshot_id, actor, reason, "LIVE", ct);
+            var ok = await InboundCancelService.CancelPreSendAsync(conn, tx, orgId, env, snapshotId, actor, reason, "LIVE", ct);
             return ok ? 1 : 0;
         }
         var n = await CancelReservedForSnapshotAsync(conn, tx, orgId, env, snapshotId, actor, reason, ct);
@@ -253,6 +264,20 @@ FROM dbo.source_snapshot WHERE id=@snapshotId AND org_id=@orgId", new { orgId, s
 SELECT id, state, source_snapshot_id FROM dbo.upload_task WITH (UPDLOCK, HOLDLOCK)
 WHERE org_id=@orgId AND env=@env AND event_key=@eventKey AND source_snapshot_id IS NOT NULL AND state<>N'Cancelled'",
             new { orgId, env, eventKey = $"KSOA:{docKey}:PURCHASE_IN" }, tx, cancellationToken: ct));
+
+    /// <summary>
+    /// 任务路径的单一作用域：占用豁免（AssertNoForeignClaimsAsync）与释放（CancelPreSendAsync/CancelReservedForSnapshotAsync）
+    /// 都必须锚定这次调用的 snapshotId。任务来自其他快照版本（陈旧 UI / 旧版本任务）时直接 409 VERSION_CONFLICT 拒绝且不写，
+    /// 否则会释放错快照的占用：本快照自己的 RESERVED 行存活（→ ALLOCATION_EXISTS），另一版本的占用被误撤。
+    /// </summary>
+    private static async Task<TaskRow?> ResolveTaskAsync(SqlConnection conn, SqlTransaction tx, long orgId, string env,
+        string docKey, long snapshotId, CancellationToken ct)
+    {
+        var task = await TaskForSnapshotAsync(conn, tx, orgId, env, docKey, ct);
+        if (task is not null && task.source_snapshot_id != snapshotId)
+            throw new AllocationConflictException("VERSION_CONFLICT", "发送前任务属于其他快照版本，请刷新后重试");
+        return task;
+    }
 
     private static Task<int> SentAttemptsAsync(SqlConnection conn, SqlTransaction tx, long taskId, CancellationToken ct)
         => conn.ExecuteScalarAsync<int>(new CommandDefinition(
