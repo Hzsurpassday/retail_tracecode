@@ -2,10 +2,16 @@
 ALTER TABLE dbo.upload_task ADD predecessor_task_id bigint NULL
   CONSTRAINT FK_task_predecessor REFERENCES dbo.upload_task(id);
 GO
+-- 前置任务链按需回查（仅非空行；JSON 下游扫描无需全表），2008 R2 支持筛选索引
+CREATE INDEX IX_task_predecessor ON dbo.upload_task(predecessor_task_id) WHERE predecessor_task_id IS NOT NULL;
+GO
 ALTER TABLE dbo.upload_part ADD
   next_query_at datetime2(3) NULL,
   query_count int NOT NULL CONSTRAINT DF_part_qcount DEFAULT 0,
   first_sent_at datetime2(3) NULL;
+GO
+-- 回查调度扫「同状态且到期」的分片（不回表）
+CREATE INDEX IX_part_query ON dbo.upload_part(state, next_query_at);
 GO
 CREATE TABLE dbo.verification_code (
   id bigint IDENTITY(1,1) NOT NULL CONSTRAINT PK_verification_code PRIMARY KEY,
@@ -21,6 +27,9 @@ CREATE TABLE dbo.verification_code (
   CONSTRAINT UQ_vcode UNIQUE (verification_id, code_id),
   CONSTRAINT CK_vcode_result CHECK (result IN (N'PASS',N'FAIL',N'UNKNOWN'))
 );
+GO
+-- 按码回查（trace_code → 结论）走此索引；与 UQ_vcode 的 (verification_id, code_id) 前缀互补
+CREATE INDEX IX_vcode_code ON dbo.verification_code(code_id);
 GO
 CREATE TABLE dbo.return_confirmation (
   id bigint IDENTITY(1,1) NOT NULL CONSTRAINT PK_return_confirmation PRIMARY KEY,

@@ -63,8 +63,9 @@ public class Migration0009Tests : IClassFixture<Sql2008Fixture>
         var row = await c.QuerySingleAsync<(string name, string checksum)>(
             "SELECT name, checksum FROM dbo.schema_version WHERE version=9 AND success=1");
         Assert.StartsWith("0009_", row.name);
-        Assert.False(string.IsNullOrWhiteSpace(row.checksum));
-        Assert.Equal(64, row.checksum.Trim().Length); // SHA-256 hex
+        // 0009 在本未合并分支上仍在演进（本轮加索引），期望值随文件字节更新；0001–0008 见下一用例（不可变）。
+        Assert.Equal("23E10ACA2D01A7A76DBB0A7E0E8A16FF28A2031D71E2C53400989F2C32442C1F",
+            row.checksum.Trim(), StringComparer.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -114,12 +115,19 @@ WHERE TABLE_NAME='upload_part' AND COLUMN_NAME='next_query_at'");
         Assert.Equal(1, await c.ExecuteScalarAsync<int>(@"
 SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
 WHERE TABLE_NAME='upload_part' AND COLUMN_NAME='first_sent_at' AND DATA_TYPE='datetime2' AND IS_NULLABLE='YES'"));
-        var qcount = await c.QuerySingleAsync<(string type, string nullable, string dflt)>(@"
-SELECT DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT FROM INFORMATION_SCHEMA.COLUMNS
+        var qcount = await c.QuerySingleAsync<(string type, string nullable)>(@"
+SELECT DATA_TYPE, IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS
 WHERE TABLE_NAME='upload_part' AND COLUMN_NAME='query_count'");
         Assert.Equal("int", qcount.type);
         Assert.Equal("NO", qcount.nullable);
-        Assert.Contains("0", qcount.dflt); // NOT NULL DEFAULT 0
+        // 精确默认约束：具名 DF_part_qcount 且表达式为 ((0))（不含任何负值/其他字面量）
+        var qcountDefault = await c.QuerySingleAsync<(string name, string definition)>(@"
+SELECT dc.name, dc.definition
+FROM sys.default_constraints dc
+JOIN sys.columns col ON col.object_id=dc.parent_object_id AND col.column_id=dc.parent_column_id
+WHERE dc.parent_object_id=OBJECT_ID(N'dbo.upload_part') AND col.name=N'query_count'");
+        Assert.Equal("DF_part_qcount", qcountDefault.name);
+        Assert.Equal("((0))", qcountDefault.definition);
     }
 
     [Fact]
@@ -136,15 +144,17 @@ VALUES(@v,@org,N'MOCK',@code,0,N'PASS')", new { v = verifId, org = orgId, code =
         Assert.Equal(1, await c.ExecuteScalarAsync<int>(
             "SELECT COUNT(*) FROM dbo.verification_code WHERE verification_id=@v AND code_id=@code",
             new { v = verifId, code = codeId }));
-        // 同核验同码重复→唯一约束拒绝
-        await Assert.ThrowsAsync<Microsoft.Data.SqlClient.SqlException>(() => c.ExecuteAsync(@"
+        // 同核验同码重复→唯一约束拒绝（2601/2627 与既有 org 唯一索引断言同型）
+        var dup = await Assert.ThrowsAsync<Microsoft.Data.SqlClient.SqlException>(() => c.ExecuteAsync(@"
 INSERT INTO dbo.verification_code(verification_id,org_id,env,code_id,source_line_id,result)
 VALUES(@v,@org,N'MOCK',@code,0,N'FAIL')", new { v = verifId, org = orgId, code = codeId }));
-        // 非法结论→CHECK 拒绝
+        Assert.True(dup.Number is 2601 or 2627, $"UQ_vcode 应报唯一约束，实际 {dup.Number}");
+        // 非法结论→CHECK 约束拒绝（547）
         var code2 = await SeedTraceCodeAsync(c, "TF-M3-VCODE-2");
-        await Assert.ThrowsAsync<Microsoft.Data.SqlClient.SqlException>(() => c.ExecuteAsync(@"
+        var badResult = await Assert.ThrowsAsync<Microsoft.Data.SqlClient.SqlException>(() => c.ExecuteAsync(@"
 INSERT INTO dbo.verification_code(verification_id,org_id,env,code_id,source_line_id,result)
 VALUES(@v,@org,N'MOCK',@code,0,N'MAYBE')", new { v = verifId, org = orgId, code = code2 }));
+        Assert.True(badResult.Number is 547, $"CK_vcode_result 应报 CHECK 约束，实际 {badResult.Number}");
     }
 
     [Fact]
@@ -160,17 +170,20 @@ VALUES(@org,N'MOCK',@task,N'CONFIRMED',N'PURCHASE_IN',N'{}',N'tester')", new { o
         Assert.Equal(1, await c.ExecuteScalarAsync<int>(
             "SELECT COUNT(*) FROM dbo.return_confirmation WHERE task_id=@task", new { task = taskId }));
         // 同任务重复确认→唯一约束拒绝
-        await Assert.ThrowsAsync<Microsoft.Data.SqlClient.SqlException>(() => c.ExecuteAsync(@"
+        var dup = await Assert.ThrowsAsync<Microsoft.Data.SqlClient.SqlException>(() => c.ExecuteAsync(@"
 INSERT INTO dbo.return_confirmation(org_id,env,task_id,decision,relation_kind,evidence_json,confirmed_by)
 VALUES(@org,N'MOCK',@task,N'REJECTED',N'SALE',N'{}',N'tester')", new { org = orgId, task = taskId }));
-        // 非法决策/关系→CHECK 拒绝
+        Assert.True(dup.Number is 2601 or 2627, $"UQ_retconf_task 应报唯一约束，实际 {dup.Number}");
+        // 非法决策/关系→CHECK 拒绝（547）
         var task2 = await SeedUploadTaskAsync(c, orgId, "M3-RETCONF-2", "PURCHASE_RETURN_202");
-        await Assert.ThrowsAsync<Microsoft.Data.SqlClient.SqlException>(() => c.ExecuteAsync(@"
+        var badDecision = await Assert.ThrowsAsync<Microsoft.Data.SqlClient.SqlException>(() => c.ExecuteAsync(@"
 INSERT INTO dbo.return_confirmation(org_id,env,task_id,decision,relation_kind,evidence_json,confirmed_by)
 VALUES(@org,N'MOCK',@task,N'ACCEPTED',N'SALE',N'{}',N'tester')", new { org = orgId, task = task2 }));
-        await Assert.ThrowsAsync<Microsoft.Data.SqlClient.SqlException>(() => c.ExecuteAsync(@"
+        Assert.True(badDecision.Number is 547, $"CK_retconf_decision 应报 CHECK 约束，实际 {badDecision.Number}");
+        var badRelation = await Assert.ThrowsAsync<Microsoft.Data.SqlClient.SqlException>(() => c.ExecuteAsync(@"
 INSERT INTO dbo.return_confirmation(org_id,env,task_id,decision,relation_kind,evidence_json,confirmed_by)
 VALUES(@org,N'MOCK',@task,N'CONFIRMED',N'OTHER',N'{}',N'tester')", new { org = orgId, task = task2 }));
+        Assert.True(badRelation.Number is 547, $"CK_retconf_relation 应报 CHECK 约束，实际 {badRelation.Number}");
     }
 
     private static async Task<long> SeedVerificationAsync(Microsoft.Data.SqlClient.SqlConnection c, long orgId, long sysId, string key)

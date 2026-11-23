@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Dapper;
@@ -331,10 +332,20 @@ IF @rc < 0 RAISERROR('applock %s failed (%d)', 16, 1, @res, @rc);",
 
     // M3 读取器：与 GetIntAsync 同形（自开连接、单键读取、无行回落默认），默认值取 M3Defaults。
 
-    private async Task<long> GetM3IntAsync(string key, CancellationToken ct)
+    /// <summary>
+    /// 只接受 InvariantCulture 整数且必须 &gt; 0：非数字、0、负数一律回落默认值。
+    /// 0/负数若被采信会让回查退避变成 0 或负秒数（退避失效/立即重试），故按默认值 fail-safe。
+    /// 直接用 int.TryParse（不走 long 再强转），避免越界 long 静默截断成错误 int。
+    /// </summary>
+    private async Task<int> GetM3IntAsync(string key, CancellationToken ct)
     {
+        var fallback = int.Parse(M3Defaults[key], CultureInfo.InvariantCulture);
         var raw = await GetRawAsync(key, ct);
-        return raw is not null && long.TryParse(raw, out var n) ? n : long.Parse(M3Defaults[key]);
+        return raw is not null
+            && int.TryParse(raw.AsSpan().Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var n)
+            && n > 0
+            ? n
+            : fallback;
     }
 
     private async Task<string> GetM3StringAsync(string key, CancellationToken ct)
@@ -346,37 +357,27 @@ IF @rc < 0 RAISERROR('applock %s failed (%d)', 16, 1, @res, @rc);",
         catch (JsonException) { return raw; } // 容忍未加引号的裸文本（人工直写 app_setting）
     }
 
+    /// <summary>只接受大小写不敏感的 true/false 文本；其余（1/0、JSON 引号字符串、乱码）一律回落默认 false。</summary>
     private async Task<bool> GetM3BoolAsync(string key, CancellationToken ct)
     {
         var fallback = bool.Parse(M3Defaults[key]);
         var raw = await GetRawAsync(key, ct);
-        if (raw is null) return fallback;
-        try
-        {
-            using var doc = JsonDocument.Parse(raw);
-            return doc.RootElement.ValueKind switch
-            {
-                JsonValueKind.True => true,
-                JsonValueKind.False => false,
-                _ => fallback,
-            };
-        }
-        catch (JsonException) { return fallback; }
+        return raw is not null && bool.TryParse(raw.AsSpan().Trim(), out var b) ? b : fallback;
     }
 
     public async Task<SaleVerifySettings> GetSaleVerifySettingsAsync(CancellationToken ct) => new(
         await GetM3StringAsync("sale.verify.ruleVersion", ct),
-        (int)await GetM3IntAsync("sale.verify.maxCodesPerRun", ct));
+        await GetM3IntAsync("sale.verify.maxCodesPerRun", ct));
 
-    public async Task<int> GetPartMaxCodesAsync(CancellationToken ct)
-        => (int)await GetM3IntAsync("upload.part.maxCodes", ct);
+    public Task<int> GetPartMaxCodesAsync(CancellationToken ct)
+        => GetM3IntAsync("upload.part.maxCodes", ct);
 
     public async Task<QueryPolicy> GetQueryPolicyAsync(CancellationToken ct) => new(
-        (int)await GetM3IntAsync("top.query.backoffSeconds", ct),
-        (int)await GetM3IntAsync("top.query.maxAttempts", ct),
-        (int)await GetM3IntAsync("top.query.manualAfterHours", ct),
-        (int)await GetM3IntAsync("top.query.consistencyWindowSeconds", ct),
-        (int)await GetM3IntAsync("top.dispatch.leaseSeconds", ct));
+        await GetM3IntAsync("top.query.backoffSeconds", ct),
+        await GetM3IntAsync("top.query.maxAttempts", ct),
+        await GetM3IntAsync("top.query.manualAfterHours", ct),
+        await GetM3IntAsync("top.query.consistencyWindowSeconds", ct),
+        await GetM3IntAsync("top.dispatch.leaseSeconds", ct));
 
     /// <summary>受控重试合同门禁：默认 false，读取失败（缺行/非法值）一律按 false（fail-closed，不放行重试）。</summary>
     public Task<bool> GetRetryPathCertifiedAsync(CancellationToken ct)
