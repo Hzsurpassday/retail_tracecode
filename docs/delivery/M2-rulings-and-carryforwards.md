@@ -65,3 +65,5 @@
 - KSOA 侧 fixture-only（FixtureKsoaAdapter）；ywdjbh 为候选字段仅从 raw_header JSON 读取；RealKsoaAdapter 仍抛 AdapterNotCertifiedException。
 - 浏览器人工验证使用独立库 TraceFlow_M2Manual（保留不删）；若执行环境无浏览器工具，须在门禁报告如实声明"浏览器验证未执行"，不得以构建通过冒充 UI 验证。
 - **补充（Task 15 执行期事实）**：浏览器验证**已执行**（控制器执行，chrome-devtools MCP）：Task 13 流程 1–8 与 Task 14 核验清单 1–6（含 §4.7 设置面板与商品/供应商改绑）；证据见本目录 `task-13-report.md`、`task-13-fix1-report.md`、`task-14-report.md` §8 及截图目录 `t13-shots/`、`t14-shots/`。门禁报告据此引用，不重复声称本次新跑。
+
+- **M3 裁决与携带项**：见 `docs/delivery/M3-rulings-and-carryforwards.md`（R-M3-1…22 与 M4 携带清单）。
