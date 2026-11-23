@@ -10,6 +10,7 @@ traceflow/src/TraceFlow.Host/wwwroot/
 appsettings.Local.json
 *.pfx
 .env
+secrets/
 # 首轮参考代码与用户资料不跟踪不删除
 retail_tracecode/
 zww-md/
