@@ -30,11 +30,18 @@ public sealed class InboundMatchService
         await c.OpenAsync(ct);
         List<long> ids;
         if (snapshotId is not null) ids = new List<long> { snapshotId.Value };
+        // 只扫描每个 (org,source_system,document_key) 的最新版本：被取代的快照在重建取消时会被置 UNMATCHED，
+        // 若仍可被扫描则会与新版本互相取消重建（≤5 分钟无限循环）。定向触发（snapshotId 非空）不受此限。
         else ids = (await c.QueryAsync<long>(new CommandDefinition(@"
 SELECT s.id FROM dbo.source_snapshot s
 LEFT JOIN dbo.inbound_match m ON m.org_id=s.org_id AND m.env=@env AND m.source_snapshot_id=s.id
 WHERE s.org_id=@orgId AND s.document_type=N'PURCHASE_IN' AND s.completeness_status=N'COMPLETE'
-  AND (m.id IS NULL OR m.match_state<>N'COMPLETE')", new { orgId, env }, cancellationToken: ct))).ToList();
+  AND (m.id IS NULL OR m.match_state<>N'COMPLETE')
+  AND NOT EXISTS (
+      SELECT 1 FROM dbo.source_snapshot n
+      WHERE n.org_id=s.org_id AND n.source_system_id=s.source_system_id
+        AND n.source_document_key=s.source_document_key AND n.version>s.version)
+ORDER BY s.id", new { orgId, env }, cancellationToken: ct))).ToList();
         int seen = 0, complete = 0, notRequired = 0, partial = 0, ambiguous = 0, conflict = 0, unmatched = 0, tasks = 0;
         foreach (var id in ids)
         {

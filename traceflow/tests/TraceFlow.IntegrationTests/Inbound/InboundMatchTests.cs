@@ -29,6 +29,21 @@ public class InboundMatchTests : IAsyncLifetime
 
     private static string Code(int i) => "812345678901234567" + i.ToString("D2");
 
+    // 直接读库断言持久化状态（非服务返回值），使“只判不落库”的实现无法通过。
+    private static Task<MatchRow> LoadMatchAsync(SqlConnection c, long snapshotId)
+        => c.QuerySingleAsync<MatchRow>(@"
+SELECT match_state,reason,matched_at,supplier_dwbh,version
+FROM dbo.inbound_match WHERE source_snapshot_id=@id", new { id = snapshotId });
+
+    private sealed class MatchRow
+    {
+        public string match_state { get; set; } = "";
+        public string? reason { get; set; }
+        public DateTime? matched_at { get; set; }
+        public string? supplier_dwbh { get; set; }
+        public int version { get; set; }
+    }
+
     private async Task<Seed> SeedBaseAsync(SqlConnection c, string tag, int codeBase)
     {
         var (orgId, sysId) = await TestSeed.EnsureAsync(c);
@@ -89,6 +104,11 @@ VALUES(@billId,@lineId,@n,@raw,N'MIN')", new { billId, lineId = upLineId, n = st
         Assert.Equal(1, sum.Complete);
         Assert.Equal(1, sum.TasksCreated);
         Assert.Equal("COMPLETE", await c.ExecuteScalarAsync<string>("SELECT match_state FROM dbo.inbound_match WHERE source_snapshot_id=@id", new { id = s.SnapId }));
+        var m = await LoadMatchAsync(c, s.SnapId);
+        Assert.Equal("COMPLETE", m.match_state);
+        Assert.Null(m.reason);
+        Assert.NotNull(m.matched_at);
+        Assert.Equal(s.Dwbh, m.supplier_dwbh);
         var taskId = await c.ExecuteScalarAsync<long>("SELECT id FROM dbo.upload_task WHERE event_key=@k", new { k = "KSOA:PI-M1:PURCHASE_IN" });
         Assert.Equal("Ready", await c.ExecuteScalarAsync<string>("SELECT state FROM dbo.upload_task WHERE id=@id", new { id = taskId }));
         Assert.Equal(1, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.inbound_allocation WHERE source_line_id=@id AND state=N'RESERVED'", new { id = s.LineId }));
@@ -117,6 +137,10 @@ VALUES(@billId,@lineId,@n,@raw,N'MIN')", new { billId, lineId = upLineId, n = st
         var sum = await NewService().RunAsync(s.OrgId, "MOCK", s.SnapId, default);
         Assert.Equal(1, sum.Unmatched);
         Assert.Equal(0, sum.TasksCreated);
+        var m = await LoadMatchAsync(c, s.SnapId);
+        Assert.Equal("UNMATCHED", m.match_state);
+        Assert.False(string.IsNullOrWhiteSpace(m.reason));
+        Assert.NotNull(m.matched_at);
     }
 
     [Fact]
@@ -139,6 +163,10 @@ VALUES(@billId,@lineId,@n,@raw,N'MIN')", new { billId, lineId = upLineId, n = st
         var sum = await NewService().RunAsync(s.OrgId, "MOCK", s.SnapId, default);
         Assert.Equal(1, sum.Ambiguous);
         Assert.Equal(0, sum.TasksCreated);
+        var m = await LoadMatchAsync(c, s.SnapId);
+        Assert.Equal("AMBIGUOUS", m.match_state);
+        Assert.Contains("多解", m.reason);
+        Assert.NotNull(m.matched_at);
     }
 
     [Fact]
@@ -151,6 +179,10 @@ VALUES(@billId,@lineId,@n,@raw,N'MIN')", new { billId, lineId = upLineId, n = st
         var sum = await NewService().RunAsync(s.OrgId, "MOCK", s.SnapId, default);
         Assert.Equal(1, sum.Conflict);
         Assert.Equal(0, sum.TasksCreated);
+        var m = await LoadMatchAsync(c, s.SnapId);
+        Assert.Equal("CONFLICT", m.match_state);
+        Assert.Contains("批号冲突", m.reason);
+        Assert.NotNull(m.matched_at);
     }
 
     [Fact]
@@ -164,6 +196,10 @@ VALUES(@snapId,N'2',@spid,2,N'盒',N'B0000',@hash,N'PURCHASE_IN')", new { snapId
         var sum = await NewService().RunAsync(s.OrgId, "MOCK", s.SnapId, default);
         Assert.Equal(1, sum.Partial);
         Assert.Equal(0, sum.TasksCreated);
+        var m = await LoadMatchAsync(c, s.SnapId);
+        Assert.Equal("PARTIAL", m.match_state);
+        Assert.False(string.IsNullOrWhiteSpace(m.reason));
+        Assert.NotNull(m.matched_at);
     }
 
     [Fact]
@@ -181,6 +217,10 @@ VALUES(@snapId,N'2',@spid,2,N'盒',N'B0000',@hash,N'PURCHASE_IN')", new { snapId
         Assert.Equal(0, sum.TasksCreated);
         Assert.Equal("Succeeded", await c.ExecuteScalarAsync<string>("SELECT state FROM dbo.upload_task WHERE id=@id", new { id = taskId }));
         Assert.Equal(1, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.inbound_allocation WHERE source_line_id=@id AND state=N'RESERVED'", new { id = s.LineId }));
+        var m = await LoadMatchAsync(c, s.SnapId);
+        Assert.Equal("COMPLETE", m.match_state);
+        Assert.Contains("冻结", m.reason);
+        Assert.NotNull(m.matched_at);
     }
 
     [Fact]
@@ -208,6 +248,50 @@ VALUES(@snapId,N'1',@spid,2,N'盒',N'B2026',@hash,N'PURCHASE_IN')", new { snapId
         Assert.Equal("UNMATCHED", await c.ExecuteScalarAsync<string>("SELECT match_state FROM dbo.inbound_match WHERE source_snapshot_id=@id", new { id = s.SnapId }));
         Assert.Equal("COMPLETE", await c.ExecuteScalarAsync<string>("SELECT match_state FROM dbo.inbound_match WHERE source_snapshot_id=@id", new { id = snap2 }));
         Assert.Equal(2, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.code_claim WHERE upload_task_id=@id AND claim_state=N'ACTIVE'", new { id = taskId }));
+    }
+
+    [Fact]
+    public async Task Stale_superseded_version_never_rescanned()
+    {
+        await using var c = await _fx.OpenAsync();
+        var s = await SeedBaseAsync(c, "M10", 95);
+        await NewService().RunAsync(s.OrgId, "MOCK", s.SnapId, default);
+        var taskId = await c.ExecuteScalarAsync<long>("SELECT id FROM dbo.upload_task WHERE event_key=@k", new { k = "KSOA:PI-M10:PURCHASE_IN" });
+        var snap2 = await c.ExecuteScalarAsync<long>(@"
+INSERT INTO dbo.source_snapshot(org_id,source_system_id,source_document_key,document_type,version,business_datetime,completeness_status,content_hash,raw_header)
+OUTPUT INSERTED.id VALUES(@orgId,@sysId,N'PI-M10',N'PURCHASE_IN',2,@biz,N'COMPLETE',@hash,@header)",
+            new { orgId = s.OrgId, sysId = s.SysId, biz = new DateTime(2026, 11, 20, 2, 0, 0, DateTimeKind.Utc),
+                  hash = new string('1', 64), header = "{\"dwbh\":\"" + s.Dwbh + "\"}" });
+        await c.ExecuteAsync(@"
+INSERT INTO dbo.source_line(snapshot_id,source_line_key,product_source_id,quantity_original,unit_original,batch_raw,line_hash,event_kind)
+VALUES(@snapId,N'1',@spid,2,N'盒',N'B2026',@hash,N'PURCHASE_IN')", new { snapId = snap2, spid = s.Spid, hash = new string('1', 64) });
+
+        // null 扫描选中新版本 v2：取消按旧任务自己的快照（v1）执行，v1 的匹配置被改为 UNMATCHED。
+        var first = await NewService().RunAsync(s.OrgId, "MOCK", null, default);
+        Assert.Equal(1, first.SnapshotsSeen);
+        Assert.Equal(1, first.TasksCreated);
+        var stale = await LoadMatchAsync(c, s.SnapId);
+        Assert.Equal("UNMATCHED", stale.match_state);
+        var cancelSql = "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'inbound.cancel' AND object_type=N'upload_task' AND object_id=@id";
+        var cancelsBefore = await c.ExecuteScalarAsync<int>(cancelSql, new { id = taskId.ToString() });
+        Assert.Equal(1, cancelsBefore);
+        var taskVersion = await c.ExecuteScalarAsync<int>("SELECT version FROM dbo.upload_task WHERE id=@id", new { id = taskId });
+        var tasksBefore = await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.upload_task WHERE org_id=@orgId", new { orgId = s.OrgId });
+
+        var second = await NewService().RunAsync(s.OrgId, "MOCK", null, default);
+
+        Assert.Equal(0, second.SnapshotsSeen);
+        Assert.Equal(0, second.TasksCreated);
+        Assert.Equal(tasksBefore, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.upload_task WHERE org_id=@orgId", new { orgId = s.OrgId }));
+        Assert.Equal(1, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.upload_task WHERE event_key=@k", new { k = "KSOA:PI-M10:PURCHASE_IN" }));
+        Assert.Equal(cancelsBefore, await c.ExecuteScalarAsync<int>(cancelSql, new { id = taskId.ToString() }));
+        Assert.Equal(taskVersion, await c.ExecuteScalarAsync<int>("SELECT version FROM dbo.upload_task WHERE id=@id", new { id = taskId }));
+        var staleAfter = await LoadMatchAsync(c, s.SnapId);
+        Assert.Equal("UNMATCHED", staleAfter.match_state);
+        Assert.Equal(stale.version, staleAfter.version);
+        Assert.Equal(stale.matched_at, staleAfter.matched_at);
+        Assert.Equal(snap2, await c.ExecuteScalarAsync<long>("SELECT source_snapshot_id FROM dbo.upload_task WHERE id=@id", new { id = taskId }));
+        Assert.Equal("COMPLETE", (await LoadMatchAsync(c, snap2)).match_state);
     }
 
     [Fact]
