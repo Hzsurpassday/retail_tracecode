@@ -16,6 +16,8 @@ public sealed class RateBudgetService
     public async Task<TimeSpan?> TryAcquireAsync(SqlConnection conn, SqlTransaction tx, string env,
         IReadOnlyList<string> budgetKeys, DateTime nowUtc, CancellationToken ct)
     {
+        // 单把 per-env 应用锁串行化写路径，消除缺行 RangeS-U 与 INSERT 的锁序环（1205）
+        await AppLockAsync(conn, tx, "topbudget:" + env, ct);
         var rows = new List<BudgetRow>();
         foreach (var key in budgetKeys.OrderBy(k => k, StringComparer.Ordinal)) // 固定加锁顺序防死锁
         {
@@ -67,6 +69,8 @@ WHERE id=@id",
     public async Task RegisterWaitAsync(SqlConnection conn, SqlTransaction tx, string env,
         IReadOnlyList<string> budgetKeys, DateTime waitUntilUtc, CancellationToken ct)
     {
+        // 单把 per-env 应用锁串行化写路径，消除缺行 RangeS-U 与 INSERT 的锁序环（1205）
+        await AppLockAsync(conn, tx, "topbudget:" + env, ct);
         foreach (var key in budgetKeys)
             await conn.ExecuteAsync(new CommandDefinition(@"
 UPDATE dbo.top_rate_budget
@@ -82,6 +86,13 @@ WHERE env=@env AND budget_key=@key",
     public static TimeSpan Backoff(int attemptCount) => Backoff(attemptCount, Random.Shared.Next(0, 6));
 
     private static TimeSpan Max(TimeSpan a, TimeSpan b) => a > b ? a : b;
+
+    private static async Task AppLockAsync(SqlConnection conn, SqlTransaction tx, string resource, CancellationToken ct)
+        => await conn.ExecuteAsync(new CommandDefinition(@"
+DECLARE @rc int;
+EXEC @rc = sp_getapplock @Resource=@res, @LockMode='Exclusive', @LockOwner='Transaction', @LockTimeout=30000;
+IF @rc < 0 RAISERROR('applock %s failed (%d)', 16, 1, @res, @rc);",
+            new { res = resource }, tx, cancellationToken: ct));
 
     private static (int Count, DateTime Start) Roll(int count, DateTime? start, DateTime now, TimeSpan period)
         => start is DateTime s && now < s + period ? (count, s) : (0, now);

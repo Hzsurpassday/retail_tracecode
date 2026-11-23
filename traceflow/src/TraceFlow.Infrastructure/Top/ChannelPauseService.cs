@@ -11,6 +11,8 @@ public sealed class ChannelPauseService
     public async Task PauseAsync(SqlConnection conn, SqlTransaction tx, string env,
         IReadOnlyList<string> scopeKeys, string reason, string actor, CancellationToken ct)
     {
+        // 单把 per-env 应用锁串行化写路径，消除缺行 RangeS-U 与 INSERT 的锁序环（1205）
+        await AppLockAsync(conn, tx, "toppause:" + env, ct);
         foreach (var key in scopeKeys.Distinct(StringComparer.Ordinal).OrderBy(k => k, StringComparer.Ordinal))
         {
             var active = await conn.ExecuteScalarAsync<int>(new CommandDefinition(
@@ -39,10 +41,21 @@ WHERE env=@env AND is_active=1 AND scope_key IN @keys",
     }
 
     public async Task<int> ResumeAsync(SqlConnection conn, SqlTransaction tx, string env, string scopeKey, string actor, CancellationToken ct)
-        => await conn.ExecuteAsync(new CommandDefinition(@"
+    {
+        // 单把 per-env 应用锁串行化写路径，消除缺行 RangeS-U 与 INSERT 的锁序环（1205）
+        await AppLockAsync(conn, tx, "toppause:" + env, ct);
+        return await conn.ExecuteAsync(new CommandDefinition(@"
 UPDATE dbo.top_channel_pause SET is_active=0, resumed_at=SYSUTCDATETIME(), resumed_by=@actor
 WHERE env=@env AND scope_key=@key AND is_active=1",
             new { env, key = scopeKey, actor }, tx, cancellationToken: ct));
+    }
+
+    private static async Task AppLockAsync(SqlConnection conn, SqlTransaction tx, string resource, CancellationToken ct)
+        => await conn.ExecuteAsync(new CommandDefinition(@"
+DECLARE @rc int;
+EXEC @rc = sp_getapplock @Resource=@res, @LockMode='Exclusive', @LockOwner='Transaction', @LockTimeout=30000;
+IF @rc < 0 RAISERROR('applock %s failed (%d)', 16, 1, @res, @rc);",
+            new { res = resource }, tx, cancellationToken: ct));
 
     public async Task<IReadOnlyList<PauseView>> ListAsync(SqlConnection conn, string env, CancellationToken ct)
         => (await conn.QueryAsync<PauseView>(new CommandDefinition(@"

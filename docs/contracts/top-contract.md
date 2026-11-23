@@ -30,5 +30,5 @@ M2 真实通道（env=LIVE）一律禁用（RealTopGateway 占位拒绝，422 TO
 ## 预算键与暂停范围
 
 - 预算键：`appkey:total`、`method:{method}`、`ent:{refEntId}:method:{method}`（门店 ref_ent_id 已知时）。
-- 暂停范围：`method:{method}`、`credential:top`、`ent:{refEntId}`（有主体时）。
+- 门禁检查范围 = `method:{method}`、`credential:top`、`ent:{refEntId}`（有主体时）；授权错误自动暂停写入范围 = 仅 `method:{method}`（+`ent:{refEntId}`），`credential:top` 仅人工全局暂停使用。
 - 平台明确等待秒数优先；否则 30s×2^min(attempt,5)（上限 600s）+0..5s 抖动。
