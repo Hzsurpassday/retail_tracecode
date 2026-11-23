@@ -56,6 +56,31 @@ public sealed class UploadDispatchService
         _recovery = recovery;
     }
 
+    // ---------------------------------------------------------------- 故障注入钩子（仅测试可见）
+
+    /// <summary>
+    /// 故障注入钩子（internal，仅测试程序集可见）：在"尝试行已提交 + 分片已置 Dispatching"之后、
+    /// 调网关之前执行，用于模拟进程在此刻消失（请求从未发出）。生产路径从不赋值。
+    /// </summary>
+    internal Func<Task>? BeforeSend { get; set; }
+
+    /// <summary>
+    /// 故障注入钩子：网关调用已返回（含限流/暂停归一）之后、进入 T3 写回之前执行，
+    /// 用于模拟"请求可能已发出、回执尚未落库"的崩溃。生产路径从不赋值。
+    /// </summary>
+    internal Func<Task>? AfterSend { get; set; }
+
+    /// <summary>
+    /// 故障注入钩子：T3 内回执/状态已写入事务、但提交之前执行；抛出的异常令整个 T3 回滚，
+    /// 使尝试行保持未收尾（模拟提交前进程消失）。生产路径从不赋值。
+    /// </summary>
+    internal Func<Task>? BeforeCommit { get; set; }
+
+    private static async Task RunHookAsync(Func<Task>? hook)
+    {
+        if (hook is not null) await hook();
+    }
+
     /// <summary>发送一个分片。任何异常都不得在此吞掉（尤其网关/未取证异常）。</summary>
     public async Task<DispatchOutcome> DispatchAsync(long partId, string workerId, long fencingToken, CancellationToken ct)
     {
@@ -72,6 +97,8 @@ public sealed class UploadDispatchService
         var claim = await OpenAttemptAsync(head, workerId, fencingToken, ct);
         if (claim is null) return DispatchOutcome.StaleRejected;
 
+        await RunHookAsync(BeforeSend); // 仅测试注入：此刻崩溃 = 尝试行已落、请求未发出
+
         TopOutcome outcome;
         try
         {
@@ -87,6 +114,8 @@ public sealed class UploadDispatchService
         {
             outcome = new TopOutcome(TopOutcomeKind.AuthError, null, null, ex.Message, null, null, null);
         }
+
+        await RunHookAsync(AfterSend); // 仅测试注入：此刻崩溃 = 请求可能已发出、回执未落库
 
         return await ApplyReceiptAsync(new AttemptReceipt(claim.Value.AttemptId, partId, head.TaskId, head.Env,
             workerId, fencingToken, outcome, HttpStatusFor(outcome.Kind)), ct);
@@ -183,6 +212,7 @@ WHERE job_kind=N'upload-dispatch' AND intent_key=@intent AND job_state=N'RUNNING
                     error = ErrorKind(receipt.Outcome.Kind) + ": " + (receipt.Outcome.Message ?? ""),
                 }, tx, cancellationToken: ct));
 
+        await RunHookAsync(BeforeCommit); // 仅测试注入：此刻崩溃 = 回执已写入事务但未提交，整个 T3 回滚
         await tx.CommitAsync(ct);
         return mapped.Outcome;
     }
