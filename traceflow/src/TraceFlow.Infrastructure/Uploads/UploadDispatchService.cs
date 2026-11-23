@@ -386,8 +386,9 @@ SELECT ISNULL(MAX(attempt_no),0)+1 FROM dbo.upload_attempt WHERE task_id=@taskId
     /// 守卫：除行政取消（Cancelled）外一律写入——分片独立收尾，任务不得因停留在 AcceptanceUnknown/
     /// ManualAction 等中间态而永远无法被聚合结果更新；全 Cancelled 的取消结论始终可写（终态幂等）。
     /// 并发取消已提交时，UPDATE 在守卫内重读 state，不会把已取消任务复活。
+    /// 供回查（<see cref="BillQueryService"/>）复用，不得复制粘贴第二份聚合写入逻辑。
     /// </summary>
-    private static async Task<int> RecomputeTaskStateAsync(SqlConnection conn, SqlTransaction tx, long taskId, CancellationToken ct)
+    internal static async Task<int> RecomputeTaskStateAsync(SqlConnection conn, SqlTransaction tx, long taskId, CancellationToken ct)
     {
         var states = (await conn.QueryAsync<string>(new CommandDefinition(
             "SELECT state FROM dbo.upload_part WHERE task_id=@taskId", new { taskId }, tx, cancellationToken: ct)))

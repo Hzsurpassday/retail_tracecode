@@ -4,6 +4,7 @@ using Microsoft.Data.SqlClient;
 using TraceFlow.Application.Abstractions;
 using TraceFlow.Infrastructure.Sales;
 using TraceFlow.Infrastructure.Settings;
+using TraceFlow.Infrastructure.Uploads;
 
 namespace TraceFlow.Infrastructure.Sources;
 
@@ -61,6 +62,13 @@ public sealed class SyncScheduler
             var entPayload = JsonSerializer.Serialize(new { orgId = orgId.Value, env = _env, trigger = "daily" });
             await _queue.EnqueueAsync(c, tx, orgId.Value, _env, "enterprise-sync",
                 $"daily:{nowUtc:yyyyMMdd}", entPayload, nowUtc, ct);
+            n++;
+            // 回查兜底（JOB-04）：按 5 分钟桶挑出 next_query_at 到期的分片逐片回查（单批上限 50）。
+            // 常规路径是查询作业自身退避重排 query:part:{id}；本扫描只补漏入队/进程重启丢失的作业。
+            // 命中平台渠道，暂停通道时跳过（恢复后下一桶自动接手，不用重放）。
+            var scanPayload = JsonSerializer.Serialize(new { orgId = orgId.Value, env = _env, trigger = "scan" });
+            await _queue.EnqueueAsync(c, tx, orgId.Value, _env, BillQueryService.JobKind,
+                $"{BillQueryService.ScanIntentPrefix}{unix / 300}", scanPayload, nowUtc, ct);
             n++;
             // 核验兜底（SALE-05）：近 24h COMPLETE SALE 且当前结论非 PASSED/FAILED 的快照（漏入队/未知重核），
             // 按 5 分钟桶重入队；WAIT_RETRY/RUNNING 已由作业自身退避重排，此处排除以杜绝重试风暴（HIGH 4）。

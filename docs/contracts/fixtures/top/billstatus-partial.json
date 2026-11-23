@@ -1,0 +1,16 @@
+{
+  "_verified": false,
+  "_note": "result_type=3 + sub_process_flag=52 = 部分成功（TOP-03）；code_list 每个码都带结论，缺失一律 UNKNOWN。G-TOP 取证前为候选合同。",
+  "alibaba_alihealth_drugtrace_top_lsyd_query_billstatus_response": {
+    "response_success": true,
+    "model": {
+      "result_type": "3",
+      "sub_process_flag": "52",
+      "code_list": [
+        { "code": "81234567890123456781", "status": "1" },
+        { "code": "81234567890123456782", "status": "2", "reason": "码已被其他企业绑定" }
+      ]
+    },
+    "request_id": "mock-req-bs-partial"
+  }
+}

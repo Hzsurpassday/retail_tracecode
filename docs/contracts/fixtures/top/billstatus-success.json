@@ -1,0 +1,16 @@
+{
+  "_verified": false,
+  "_note": "result_type=2 = 全部成功（TOP-02）；code_list 逐码 status=1 提供成功证据。G-TOP 取证前为候选合同。",
+  "alibaba_alihealth_drugtrace_top_lsyd_query_billstatus_response": {
+    "response_success": true,
+    "model": {
+      "result_type": "2",
+      "sub_process_flag": null,
+      "code_list": [
+        { "code": "81234567890123456781", "status": "1" },
+        { "code": "81234567890123456782", "status": "1" }
+      ]
+    },
+    "request_id": "mock-req-bs-success"
+  }
+}

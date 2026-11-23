@@ -69,6 +69,15 @@ builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Jo
 builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Jobs.UploadDispatchJobHandler(
     sp.GetRequiredService<TraceFlow.Infrastructure.Uploads.UploadDispatchService>(),
     sp.GetRequiredService<IJobQueue>(), connectionString));
+// billstatus 回查（TOP-02..04、JOB-04）：未注册则 query:part/query:scan 作业永久 PENDING，受理结论永远悬空。
+builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Uploads.BillQueryService(
+    connectionString, sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(),
+    sp.GetRequiredService<TraceFlow.Infrastructure.Top.TopClientService>(),
+    sp.GetRequiredService<IJobQueue>(),
+    sp.GetRequiredService<TraceFlow.Infrastructure.Sales.SaleVerificationService>(),
+    sp.GetRequiredService<IAuditLog>()));
+builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Jobs.BillQueryJobHandler(
+    sp.GetRequiredService<TraceFlow.Infrastructure.Uploads.BillQueryService>(), connectionString));
 builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Upstream.UpstreamDownloadService(
     connectionString, sp.GetRequiredService<TraceFlow.Infrastructure.Top.TopClientService>(),
     sp.GetRequiredService<IJobQueue>(), sp.GetRequiredService<IAuditLog>()));
