@@ -113,4 +113,15 @@ public class TopResponseParserTests
         var o = TopResponseParser.Parse(true, null, null, null);
         Assert.Equal(TopOutcomeKind.SystemError, o.Kind);
     }
+
+    [Fact]
+    public void Non_object_json_root_is_system_error()
+    {
+        var o = TopResponseParser.Parse(true, "null", null, null);
+        Assert.Equal(TopOutcomeKind.SystemError, o.Kind);
+        Assert.Equal("null", o.ResultJson);
+        var o2 = TopResponseParser.Parse(true, "[]", null, null);
+        Assert.Equal(TopOutcomeKind.SystemError, o2.Kind);
+        Assert.Equal("[]", o2.ResultJson);
+    }
 }

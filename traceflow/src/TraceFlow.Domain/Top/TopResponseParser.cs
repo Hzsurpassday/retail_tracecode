@@ -16,6 +16,8 @@ public static class TopResponseParser
             {
                 using var doc = JsonDocument.Parse(errorJson);
                 var r = doc.RootElement;
+                if (r.ValueKind != JsonValueKind.Object)
+                    return new TopOutcome(TopOutcomeKind.SystemError, null, null, "非对象响应", errorJson, null, retryAfterSeconds);
                 var code = GetString(r, "code");
                 var subCode = GetString(r, "sub_code");
                 var msg = GetString(r, "sub_msg") ?? GetString(r, "msg");
@@ -36,6 +38,8 @@ public static class TopResponseParser
             {
                 using var doc = JsonDocument.Parse(businessJson);
                 var r = doc.RootElement;
+                if (r.ValueKind != JsonValueKind.Object)
+                    return new TopOutcome(TopOutcomeKind.SystemError, null, null, "非对象响应", businessJson, null, retryAfterSeconds);
                 var msgCode = GetString(r, "msg_code");
                 var subMsgCode = GetString(r, "sub_msg_code");
                 var msg = GetString(r, "sub_msg") ?? GetString(r, "msg");
