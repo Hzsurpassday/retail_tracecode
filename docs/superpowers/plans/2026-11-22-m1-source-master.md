@@ -7686,6 +7686,8 @@ git -c user.name=Hzsurpassday -c user.email=219255064+Hzsurpassday@users.noreply
 
 ### Task 15: 前端供应商映射页 + 设置页 + api 健壮性 + 路由/代理（UI-10/11/13、NFR-02）
 
+> **执行批注（2026-11-23，控制器裁定）：** 任务审查发现本任务 brief 中 SuppliersPage 的 `load` 缺少 Task 14 已确立的 seqRef 竞态守卫（Important，计划既定缺陷）。已按 ProductsPage 模式逐行移植（useRef 导入、seqRef、每次 load `seq=++seqRef.current`、await 后 success+catch 双分支 bail）。**以仓库提交 62757c9 为准**，本任务代码块中 SuppliersPage 原始版本仅作历史参考。
+
 **Files:**
 - Create: `traceflow/src/TraceFlow.Web/src/pages/SuppliersPage.tsx`
 - Create: `traceflow/src/TraceFlow.Web/src/pages/SettingsPage.tsx`
