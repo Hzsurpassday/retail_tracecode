@@ -114,7 +114,7 @@
 | NFR-02 | Web/src（React 18+TS：顶层对话框组件、轮询 active 守卫清理、分页 50/页、交互在事件处理） | npm run build（tsc -b 0 错误 + vite 产物） | — | M1 完成（六页）；其余页面 M4 |
 | NFR-03 | （M4 计划：10000 商品/100000 销售行基准 p95≤2s） | AT-075（计划） | — | 未实现（M4）；M0 不声称性能 |
 | NFR-04 | FixtureKsoaAdapter 分页拉取（≤500 头/页）；真实 ERP 慢查询记录未取证 | FixtureKsoaAdapterTests（8 用例）；AT-075（性能基准待 M4） | G-ERP 未取证 | M1 部分完成（fixture 分页）；真实 ERP 取证待做 |
-| NFR-05 | DpapiProtector + app_setting 密文/明文互斥 + SettingsService 密钥只写/连接测试不回显凭据 | DpapiProtectorTests（2 用例）；SettingsServiceTests.Secret_is_write_only_never_echoed_and_audit_has_no_plaintext、Connection_test_with_stored_local_connection_succeeds、Connection_test_rejects_non_erp_config_and_missing_id；SettingsApiTests.Secret_write_returns_has_secret_value_and_null_value_json、Connection_test_guards_and_stored_local_connection | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成（设置层） |
+| NFR-05 | DpapiProtector + app_setting 密文/明文互斥 + SettingsService 密钥只写/连接测试不回显凭据 | DpapiProtectorTests（2 用例）；SettingsServiceTests.Secret_is_write_only_never_echoed_and_audit_has_no_plaintext、Connection_test_with_stored_local_connection_succeeds、Connection_test_rejects_non_erp_config_and_missing_id；SettingsApiTests.Secret_write_returns_has_secret_value_and_null_value_json、Connection_test_guards_and_stored_local_connection | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成（设置层）；spec §4.7 运行账号/DPAPI 作用域显示未实现，携带 M2（见 M1-rulings-and-carryforwards.md） |
 | NFR-06 | DashboardEndpoints 基础计数（积压/最近活动时间）；完整指标/站内告警未实现 | ApiGateTests.Dashboard_requires_trace_read_and_returns_real_counts | — | M0 部分完成；完整告警 M4 未实现 |
 | NFR-07 | （M4/G-DEPLOY 计划：备份恢复/配置备份/密钥恢复文档与演练） | AT-072（计划） | G-DEPLOY 未取证 | 未实现（M4） |
 | NFR-08 | （M4 计划：恢复后暂停上传→平台对账修复→再开放） | AT-072（计划） | G-DEPLOY 未取证 | 未实现（M4） |
