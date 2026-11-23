@@ -16,6 +16,7 @@ public class UploadStateMachineTests
         { UploadState.Dispatching, UploadEvent.TransportUncertain, UploadState.AcceptanceUnknown },
         { UploadState.Dispatching, UploadEvent.DuplicateBillCode, UploadState.AcceptanceUnknown },
         { UploadState.Dispatching, UploadEvent.LeaseLost, UploadState.AcceptanceUnknown },
+        { UploadState.Dispatching, UploadEvent.ObservationExpired, UploadState.ManualAction },
         { UploadState.AcceptanceUnknown, UploadEvent.QueryConfirmedAccepted, UploadState.Accepted },
         { UploadState.AcceptanceUnknown, UploadEvent.QueryProcessing, UploadState.Processing },
         { UploadState.AcceptanceUnknown, UploadEvent.QueryAllSuccess, UploadState.Succeeded },
@@ -28,6 +29,7 @@ public class UploadStateMachineTests
         { UploadState.Accepted, UploadEvent.QueryPartial, UploadState.PartialSuccess },
         { UploadState.Accepted, UploadEvent.QueryFailed, UploadState.Failed },
         { UploadState.Accepted, UploadEvent.QueryUnresolved, UploadState.ResultUnresolved },
+        { UploadState.Accepted, UploadEvent.ObservationExpired, UploadState.ManualAction },
         { UploadState.Processing, UploadEvent.QueryAllSuccess, UploadState.Succeeded },
         { UploadState.Processing, UploadEvent.QueryPartial, UploadState.PartialSuccess },
         { UploadState.Processing, UploadEvent.QueryFailed, UploadState.Failed },
@@ -97,4 +99,32 @@ public class UploadStateMachineTests
             if (s != UploadState.Succeeded && s != UploadState.Cancelled)
                 Assert.Contains(UploadStateMachine.AllTransitions, t => t.From == s);
     }
+
+    /// <summary>
+    /// 已受理/已发送但始终拿不到结论的分片必须能升级人工（H1）：只经观察窗过期一条边，
+    /// 不接受 ManualEscalate（该边只留给受理未知/部分成功等已取证的中间态），两条路都只通向 ManualAction。
+    /// </summary>
+    [Theory]
+    [InlineData(UploadState.Accepted)]
+    [InlineData(UploadState.Dispatching)]
+    public void Pre_result_states_escalate_via_observation_expired_only(UploadState from)
+    {
+        Assert.True(UploadStateMachine.TryGetNext(from, UploadEvent.ObservationExpired, out var next));
+        Assert.Equal(UploadState.ManualAction, next);
+        Assert.False(UploadStateMachine.TryGetNext(from, UploadEvent.ManualEscalate, out _));
+    }
+
+    /// <summary>每个可回查状态都必须有到 ManualAction 的合法出口，杜绝"升级无路可走→永远重排"。</summary>
+    [Theory]
+    [InlineData(UploadState.Dispatching)]
+    [InlineData(UploadState.Accepted)]
+    [InlineData(UploadState.Processing)]
+    [InlineData(UploadState.AcceptanceUnknown)]
+    [InlineData(UploadState.PartialSuccess)]
+    [InlineData(UploadState.ResultUnresolved)]
+    public void Queryable_states_can_reach_manual_action(UploadState from)
+        => Assert.Equal(UploadState.ManualAction, UploadStateMachine.AllTransitions
+            .Where(t => t.From == from)
+            .Select(t => (UploadState?)t.To)
+            .FirstOrDefault(to => to == UploadState.ManualAction));
 }

@@ -17,6 +17,10 @@ public static class UploadStateMachine
         [(UploadState.Dispatching, UploadEvent.TransportUncertain)] = UploadState.AcceptanceUnknown,
         [(UploadState.Dispatching, UploadEvent.DuplicateBillCode)] = UploadState.AcceptanceUnknown,
         [(UploadState.Dispatching, UploadEvent.LeaseLost)] = UploadState.AcceptanceUnknown,
+        // 回查观察窗过期但始终未取得可推进的结论：受理态（Dispatching/Accepted）必须有出口，
+        // 否则人工升级无路可走、整单会永久卡在等待态（H1）。
+        [(UploadState.Dispatching, UploadEvent.ObservationExpired)] = UploadState.ManualAction,
+        [(UploadState.Accepted, UploadEvent.ObservationExpired)] = UploadState.ManualAction,
         [(UploadState.AcceptanceUnknown, UploadEvent.QueryConfirmedAccepted)] = UploadState.Accepted,
         [(UploadState.AcceptanceUnknown, UploadEvent.QueryProcessing)] = UploadState.Processing,
         [(UploadState.AcceptanceUnknown, UploadEvent.QueryAllSuccess)] = UploadState.Succeeded,

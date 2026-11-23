@@ -87,7 +87,7 @@ public class BillQueryTests : IClassFixture<Sql2008Fixture>
     /// <summary>播种任务+分片（可选回查作业并定向认领），返回句柄。</summary>
     private async Task<Seed> SeedAsync(string[] codes, string partState = "Accepted", string taskState = "Accepted",
         string taskType = "RETAIL_321", int queryCount = 0, DateTime? firstSentAt = null, DateTime? nextQueryAt = null,
-        bool withQueryJob = true)
+        bool withQueryJob = true, string env = "MOCK")
     {
         var tag = Guid.NewGuid().ToString("N")[..8];
         await using var c = await _fx.OpenAsync();
@@ -96,14 +96,14 @@ public class BillQueryTests : IClassFixture<Sql2008Fixture>
         var taskId = await c.ExecuteScalarAsync<long>(@"
 INSERT INTO dbo.upload_task(org_id,env,event_key,task_type,source_hash,payload_hash,payload_json,state)
 OUTPUT inserted.id
-VALUES(@orgId,N'MOCK',@key,@type,REPLICATE('a',64),REPLICATE('b',64),@payload,@state)",
-            new { orgId, key = $"KSOA:{tag}:{taskType}", type = taskType, payload, state = taskState });
+VALUES(@orgId,@env,@key,@type,REPLICATE('a',64),REPLICATE('b',64),@payload,@state)",
+            new { orgId, env, key = $"KSOA:{tag}:{taskType}", type = taskType, payload, state = taskState });
         var partId = await c.ExecuteScalarAsync<long>(@"
 INSERT INTO dbo.upload_part(task_id,org_id,env,part_index,bill_code,payload_json,payload_hash,code_set_hash,state,
     query_count,first_sent_at,next_query_at)
 OUTPUT inserted.id
-VALUES(@taskId,@orgId,N'MOCK',0,@bill,@payload,REPLICATE('b',64),REPLICATE('c',64),@state,@queryCount,@firstSentAt,@nextQueryAt)",
-            new { taskId, orgId, bill = "TFQ" + tag, payload, state = partState, queryCount, firstSentAt, nextQueryAt });
+VALUES(@taskId,@orgId,@env,0,@bill,@payload,REPLICATE('b',64),REPLICATE('c',64),@state,@queryCount,@firstSentAt,@nextQueryAt)",
+            new { taskId, orgId, env, bill = "TFQ" + tag, payload, state = partState, queryCount, firstSentAt, nextQueryAt });
 
         if (!withQueryJob) return new Seed(orgId, taskId, partId, 0, 0, codes);
 
@@ -111,8 +111,8 @@ VALUES(@taskId,@orgId,N'MOCK',0,@bill,@payload,REPLICATE('b',64),REPLICATE('c',6
         long jobId;
         await using (var tx = (SqlTransaction)await c.BeginTransactionAsync())
         {
-            jobId = await q.EnqueueAsync(c, tx, orgId, "MOCK", "bill-query", $"query:part:{partId}",
-                JsonSerializer.Serialize(new { orgId, env = "MOCK", taskId, partId, trigger = "test" }), null, default);
+            jobId = await q.EnqueueAsync(c, tx, orgId, env, "bill-query", $"query:part:{partId}",
+                JsonSerializer.Serialize(new { orgId, env, taskId, partId, trigger = "test" }), null, default);
             await tx.CommitAsync();
         }
         var token = await ClaimAsync(c, $"query:part:{partId}");
@@ -155,6 +155,33 @@ WHERE job_kind=N'bill-query' AND intent_key=@intent AND job_state=N'PENDING'",
         => ScalarAsync<int>(
             "SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'bill-query' AND intent_key=@k AND job_state=N'PENDING'",
             new { k = $"query:part:{partId}" });
+
+    /// <summary>该分片仍待执行/执行中的回查作业数（升级人工后必须为 0，杜绝无限回查）。</summary>
+    private Task<int> OpenPartJobsAsync(long partId)
+        => ScalarAsync<int>(@"
+SELECT COUNT(*) FROM dbo.outbox_job
+WHERE job_kind=N'bill-query' AND intent_key=@k AND job_state IN (N'PENDING',N'RUNNING')",
+            new { k = $"query:part:{partId}" });
+
+    /// <summary>该分片的复核对账差异行数（object_ref=part:{id}，跨测试隔离）。</summary>
+    private Task<int> DifferenceCountAsync(long partId)
+        => ScalarAsync<int>("SELECT COUNT(*) FROM dbo.reconciliation_difference WHERE object_ref=@objectRef",
+            new { objectRef = $"part:{partId}" });
+
+    /// <summary>清掉扫描类测试自建的分片（同库共享，避免影响其它扫描用例的 TOP 名额）。</summary>
+    private async Task DeleteSeedsAsync(IReadOnlyList<Seed> seeds)
+    {
+        await using var c = await _fx.OpenAsync();
+        foreach (var s in seeds)
+        {
+            await c.ExecuteAsync("DELETE FROM dbo.outbox_job WHERE job_kind=N'bill-query' AND intent_key=@k",
+                new { k = $"query:part:{s.PartId}" });
+            await c.ExecuteAsync("DELETE FROM dbo.code_result WHERE part_id=@id", new { id = s.PartId });
+            await c.ExecuteAsync("DELETE FROM dbo.upload_attempt WHERE part_id=@id", new { id = s.PartId });
+            await c.ExecuteAsync("DELETE FROM dbo.upload_part WHERE id=@id", new { id = s.PartId });
+            await c.ExecuteAsync("DELETE FROM dbo.upload_task WHERE id=@id", new { id = s.TaskId });
+        }
+    }
 
     [Fact]
     public async Task Processing_then_success_walks_processing_to_succeeded()
@@ -289,8 +316,11 @@ WHERE r.part_id=@id AND c.code_normalized=@code", new { id = seed.PartId, code =
         Assert.Equal(0, await PendingPartJobsAsync(seed.PartId)); // 到人工后不再无限回查
 
         var run = await RowAsync<(long Id, string BusinessType, string Status, string? Summary)>(@"
-SELECT id AS Id, business_type AS BusinessType, status AS Status, local_summary AS Summary
-FROM dbo.reconciliation_run WHERE org_id=@orgId", new { seed.OrgId });
+SELECT r.id AS Id, r.business_type AS BusinessType, r.status AS Status, r.local_summary AS Summary
+FROM dbo.reconciliation_run r
+JOIN dbo.reconciliation_difference d ON d.run_id=r.id
+WHERE r.org_id=@orgId AND d.object_ref=@objectRef",
+            new { orgId = seed.OrgId, objectRef = $"part:{seed.PartId}" });
         Assert.Equal("SALE", run.BusinessType.Trim());
         Assert.Equal("COMPLETE", run.Status.Trim());
         Assert.NotNull(run.Summary);
@@ -408,5 +438,171 @@ VALUES(@orgId,N'MOCK',@key,N'RETAIL_321',@snapshotId,REPLICATE('f',64),REPLICATE
         Assert.Equal(1, await PendingPartJobsAsync(due2.PartId));
         Assert.Equal("RUNNING", await ScalarAsync<string>(
             "SELECT job_state FROM dbo.outbox_job WHERE id=@id", new { id = jobId }));
+    }
+
+    // ---------------------------------------------------------------- H1：受理态/发送态的升级出口与迟到结论
+
+    /// <summary>
+    /// H1(i)：分片长期停在 Accepted（受理成功但从未拿到可推进结论）且已满 20 次查询——
+    /// 必须走 ObservationExpired 升级人工并落 ACCEPTANCE_UNKNOWN 差异行，绝不无限重排。
+    /// </summary>
+    [Fact]
+    public async Task Accepted_part_with_expired_observation_escalates_to_manual_action()
+    {
+        var seed = await SeedAsync(new[] { Code(13) }, partState: "Accepted", taskState: "Accepted",
+            queryCount: 19, firstSentAt: DateTime.UtcNow.AddHours(-2));
+        var service = NewService(_ => new TopRawResponse(false, null, null, null, null)); // 传输不确定 → 无结论
+
+        var outcome = await service.QueryPartAsync(seed.PartId, Worker, seed.FencingToken, default);
+
+        Assert.Equal(QueryOutcome.Escalated, outcome);
+        Assert.Equal("ManualAction", await PartStateAsync(seed.PartId));
+        Assert.Equal("ManualAction", await TaskStateAsync(seed.TaskId));
+        Assert.Equal(20, await ScalarAsync<int>("SELECT query_count FROM dbo.upload_part WHERE id=@id", new { id = seed.PartId }));
+        Assert.Null(await ScalarAsync<DateTime?>(
+            "SELECT next_query_at FROM dbo.upload_part WHERE id=@id", new { id = seed.PartId }));
+        Assert.Equal(0, await PendingPartJobsAsync(seed.PartId));
+        Assert.Equal(1, await DifferenceCountAsync(seed.PartId));
+        Assert.Equal("ACCEPTANCE_UNKNOWN", (await ScalarAsync<string>(@"
+SELECT diff_type FROM dbo.reconciliation_difference WHERE object_ref=@objectRef",
+            new { objectRef = $"part:{seed.PartId}" }))!.Trim());
+    }
+
+    /// <summary>
+    /// H1(ii)：累计已达 20 次的分片再查出 AllSuccess——结论先落地，迟到的成功必须胜过人工升级。
+    /// </summary>
+    [Fact]
+    public async Task Late_all_success_wins_over_escalation()
+    {
+        var code = Code(14);
+        var seed = await SeedAsync(new[] { code }, partState: "Accepted", taskState: "Accepted",
+            queryCount: 20, firstSentAt: DateTime.UtcNow.AddHours(-2));
+        var service = NewService(_ => BillStatus("2", null, (code, "1", null)));
+
+        var outcome = await service.QueryPartAsync(seed.PartId, Worker, seed.FencingToken, default);
+
+        Assert.Equal(QueryOutcome.Succeeded, outcome);
+        Assert.Equal("Succeeded", await PartStateAsync(seed.PartId));
+        Assert.Equal("Succeeded", await TaskStateAsync(seed.TaskId));
+        Assert.Equal(21, await ScalarAsync<int>("SELECT query_count FROM dbo.upload_part WHERE id=@id", new { id = seed.PartId }));
+        Assert.Null(await ScalarAsync<DateTime?>(
+            "SELECT next_query_at FROM dbo.upload_part WHERE id=@id", new { id = seed.PartId }));
+        Assert.Equal(0, await PendingPartJobsAsync(seed.PartId));
+        Assert.Equal(0, await DifferenceCountAsync(seed.PartId)); // 成功结论不得产生人工升级差异
+    }
+
+    /// <summary>
+    /// H1(iii)：Dispatching 分片（无任何结论边）观察窗过期升级人工后，作业收尾为 DONE，
+    /// 不得残留 PENDING/RUNNING 的 bill-query 作业继续重排。
+    /// </summary>
+    [Fact]
+    public async Task Dispatching_part_escalation_leaves_no_reschedule_job()
+    {
+        var seed = await SeedAsync(new[] { Code(15) }, partState: "Dispatching", taskState: "Dispatching",
+            queryCount: 19, firstSentAt: DateTime.UtcNow.AddHours(-2));
+        var service = NewService(_ => BillStatus("1", null));
+        var handler = new BillQueryJobHandler(service, _fx.ConnectionString);
+
+        await handler.HandleAsync(new ClaimedJob(seed.JobId, "bill-query", $"query:part:{seed.PartId}", null,
+            seed.FencingToken, DateTime.UtcNow.AddMinutes(5), 2), default);
+        // Worker 收尾（处理成功即 Complete）：升级人工后作业不得被重排成 PENDING。
+        var queue = new JobQueue(_fx.ConnectionString, new AuditLog());
+        Assert.True(await queue.CompleteAsync(seed.JobId, Worker, seed.FencingToken, default));
+
+        Assert.Equal("ManualAction", await PartStateAsync(seed.PartId));
+        Assert.Equal("DONE", await ScalarAsync<string>(
+            "SELECT job_state FROM dbo.outbox_job WHERE id=@id", new { id = seed.JobId }));
+        Assert.Equal(0, await OpenPartJobsAsync(seed.PartId)); // 升级后无作业重排
+        Assert.Null(await ScalarAsync<DateTime?>(
+            "SELECT next_query_at FROM dbo.upload_part WHERE id=@id", new { id = seed.PartId }));
+        Assert.Equal(1, await DifferenceCountAsync(seed.PartId));
+    }
+
+    // ---------------------------------------------------------------- M1/M2：扫描批量与盲区
+
+    /// <summary>M1：扫描单批最多 10 个分片（5 分钟租约内串行 HTTP，避免批次被租约回收）。</summary>
+    [Fact]
+    public async Task Scan_selection_is_bounded_to_at_most_ten_parts()
+    {
+        Assert.True(BillQueryService.ScanLimit <= 10);
+        var codes = new[] { Code(16) };
+        var seeds = new List<Seed>();
+        // 刻意用很早的到期时间：同库其它测试分片的到期时间更近，TOP 10 必然落在本批。
+        for (var i = 0; i < 12; i++)
+            seeds.Add(await SeedAsync(codes, withQueryJob: false, nextQueryAt: DateTime.UtcNow.AddDays(-10)));
+
+        try
+        {
+            var service = NewService(_ => BillStatus("1", null));
+            var ids = await service.SelectDuePartIdsAsync("MOCK", BillQueryService.ScanLimit, default);
+
+            Assert.Equal(BillQueryService.ScanLimit, ids.Count);
+            Assert.Equal(10, ids.Count);
+            Assert.All(ids, id => Assert.Contains(id, seeds.Select(s => s.PartId)));
+        }
+        finally
+        {
+            // 同库共享：本测试的极早到期分片必须清掉，否则会抢走其它扫描测试的 TOP 名额。
+            await DeleteSeedsAsync(seeds);
+        }
+    }
+
+    /// <summary>
+    /// M2：受理后回查作业丢失（next_query_at 为 NULL）的分片在首次发送 5 分钟后由扫描兜底选中；
+    /// 未过 5 分钟、已有待执行 per-part 作业、或不是受理侧状态的分片一律不选。
+    /// </summary>
+    [Fact]
+    public async Task Scan_selects_never_scheduled_parts_only_after_grace_and_without_open_job()
+    {
+        var codes = new[] { Code(17) };
+        var blind = await SeedAsync(codes, partState: "Accepted", taskState: "Accepted",
+            firstSentAt: DateTime.UtcNow.AddMinutes(-10), nextQueryAt: null, withQueryJob: false);
+        var recent = await SeedAsync(codes, partState: "Accepted", taskState: "Accepted",
+            firstSentAt: DateTime.UtcNow.AddMinutes(-1), nextQueryAt: null, withQueryJob: false);
+        var busy = await SeedAsync(codes, partState: "Accepted", taskState: "Accepted",
+            firstSentAt: DateTime.UtcNow.AddMinutes(-10), nextQueryAt: null, withQueryJob: true);
+        var processing = await SeedAsync(codes, partState: "Processing", taskState: "Processing",
+            firstSentAt: DateTime.UtcNow.AddMinutes(-10), nextQueryAt: null, withQueryJob: false);
+
+        try
+        {
+            var service = NewService(_ => BillStatus("1", null));
+            var ids = await service.SelectDuePartIdsAsync("MOCK", 200, default);
+
+            Assert.Contains(blind.PartId, ids);
+            Assert.DoesNotContain(recent.PartId, ids);     // 5 分钟宽限内不抢
+            Assert.DoesNotContain(busy.PartId, ids);       // 已有待执行 per-part 作业由该作业负责
+            Assert.DoesNotContain(processing.PartId, ids); // 盲区只接管受理侧状态
+        }
+        finally
+        {
+            await DeleteSeedsAsync(new[] { blind, recent, busy, processing });
+        }
+    }
+
+    // ---------------------------------------------------------------- 收尾加固：网关异常先关尝试行
+
+    /// <summary>
+    /// LIVE fail-closed：网关未取证直接抛错时，本次查询尝试必须先收尾（finished_at/error_kind），
+    /// 不允许在重排循环里累积 finished_at 为空的尝试行。
+    /// </summary>
+    [Fact]
+    public async Task Not_certified_gateway_closes_attempt_row_and_fails_closed()
+    {
+        var seed = await SeedAsync(new[] { Code(18) }, env: "LIVE");
+        var service = NewService(_ => throw new InvalidOperationException("LIVE 不得触达 Fake 网关"));
+
+        await Assert.ThrowsAsync<TopNotCertifiedException>(
+            () => service.QueryPartAsync(seed.PartId, Worker, seed.FencingToken, default));
+
+        Assert.Equal("Accepted", await PartStateAsync(seed.PartId));
+        Assert.Equal(0, await ScalarAsync<int>(
+            "SELECT query_count FROM dbo.upload_part WHERE id=@id", new { id = seed.PartId }));
+        var attempt = await RowAsync<(DateTime? FinishedAt, string? ErrorKind, int? HttpStatus)>(@"
+SELECT finished_at AS FinishedAt, error_kind AS ErrorKind, http_status AS HttpStatus
+FROM dbo.upload_attempt WHERE task_id=@id AND attempt_kind=N'QUERY'", new { id = seed.TaskId });
+        Assert.NotNull(attempt.FinishedAt);
+        Assert.Equal("NOT_CERTIFIED", attempt.ErrorKind);
+        Assert.Null(attempt.HttpStatus);
     }
 }

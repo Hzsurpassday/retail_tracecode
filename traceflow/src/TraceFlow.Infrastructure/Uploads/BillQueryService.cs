@@ -28,8 +28,10 @@ public enum QueryOutcome { Skipped, Processing, Succeeded, Partial, Failed, Unre
 /// <item>T3 守卫（同发送侧）：任务非 Cancelled、分片仍可回查、回查作业仍由本 Worker 持租且 fencing token 未变。</item>
 /// <item>写逐码结论（分片载荷内无平台状态的码一律 UNKNOWN，绝不静默成功）→ <c>query_count+1</c> → 状态机推进 →
 /// 任务聚合重算；全部成功且任务 Succeeded 时唤醒依赖该码的 sale-verify。</item>
-/// <item>Processing/Unresolved/平台不可用按 <see cref="Backoff"/> 退避重排；达到 <c>top.query.maxAttempts</c>
-/// 或 <c>top.query.manualAfterHours</c> → ManualAction + <c>reconciliation_difference(ACCEPTANCE_UNKNOWN)</c>。</item>
+/// <item>结论先行：先应用任何合法结论转换（AllSuccess/Partial/Failed/Processing/Unresolved），再判升级——
+/// 迟到的成功结论永远胜过人工升级。仅当结论仍把分片留在等待态（处理中/未决/状态未变）且达到
+/// <c>top.query.maxAttempts</c> 或 <c>top.query.manualAfterHours</c> → ManualAction +
+/// <c>reconciliation_difference(ACCEPTANCE_UNKNOWN)</c>；状态机无升级边时停回查（不再重排）但仍落差异行。</item>
 /// </list>
 /// </summary>
 public sealed class BillQueryService
@@ -39,8 +41,12 @@ public sealed class BillQueryService
     public const string BillStatusMethod = "alibaba.alihealth.drugtrace.top.lsyd.query.billstatus";
     public const string PartIntentPrefix = "query:part:";
     public const string ScanIntentPrefix = "query:scan:";
-    /// <summary>周期扫描单批上限（避免一次扫描吞掉整个 Worker 循环）。</summary>
-    public const int ScanLimit = 50;
+    /// <summary>
+    /// 周期扫描单批上限。扫描作业租约 5 分钟且不续期：每个分片要串行完成一次 TOP HTTP 回查，
+    /// 50 片会在 <c>RecoverExpiredLeasesAsync</c> 收租后中途被抢走，故一批最多回查 10 个分片
+    /// （每片一次同步 HTTP，10 片留足余量；不足量由下一轮扫描兜底，绝不扩租约）。
+    /// </summary>
+    public const int ScanLimit = 10;
 
     private const int ReasonMaxChars = 500;
     private const int EvidenceMaxChars = 4000;
@@ -93,7 +99,15 @@ public sealed class BillQueryService
         string scanIntent, CancellationToken ct)
         => QueryPartCoreAsync(partId, workerId, fencingToken, scanIntent, ct);
 
-    /// <summary>扫描选片：到期且非终态、任务未取消，且没有待执行的 per-part 回查作业（扫描只做兜底，避免双查）。</summary>
+    /// <summary>
+    /// 扫描选片（兜底，只挑没有待执行 per-part 回查作业的分片，避免双查）：
+    /// <list type="number">
+    /// <item>到期分片：<c>next_query_at &lt;= now</c>。</item>
+    /// <item>从未排期的盲区分片：<c>next_query_at IS NULL</c> 且处于受理侧状态（Accepted/Dispatching/AcceptanceUnknown）
+    /// 且首次发送已超过 5 分钟——受理后回查作业丢失（如入队失败/租约回收丢意图）时由扫描接管（M2）。</item>
+    /// </list>
+    /// 到期分片优先；批次同样受 <paramref name="limit"/> 约束。
+    /// </summary>
     public async Task<IReadOnlyList<long>> SelectDuePartIdsAsync(string? env, int limit, CancellationToken ct)
     {
         if (limit <= 0) return Array.Empty<long>();
@@ -103,15 +117,22 @@ public sealed class BillQueryService
 SELECT TOP (@limit) p.id
 FROM dbo.upload_part p
 JOIN dbo.upload_task t ON t.id = p.task_id
-WHERE p.next_query_at IS NOT NULL AND p.next_query_at <= SYSUTCDATETIME()
-  AND p.state IN (N'Dispatching',N'Accepted',N'Processing',N'AcceptanceUnknown',N'PartialSuccess',N'ResultUnresolved')
+WHERE p.state IN (N'Dispatching',N'Accepted',N'Processing',N'AcceptanceUnknown',N'PartialSuccess',N'ResultUnresolved')
+  AND (
+    (p.next_query_at IS NOT NULL AND p.next_query_at <= SYSUTCDATETIME())
+    OR (p.next_query_at IS NULL
+        AND p.state IN (N'Accepted',N'Dispatching',N'AcceptanceUnknown')
+        AND p.first_sent_at IS NOT NULL
+        AND p.first_sent_at < DATEADD(minute,-5,SYSUTCDATETIME()))
+  )
   AND t.state <> N'Cancelled'
   AND (@env IS NULL OR p.env = @env)
   AND NOT EXISTS (
     SELECT 1 FROM dbo.outbox_job j
     WHERE j.job_kind = N'bill-query' AND j.job_state IN (N'PENDING',N'RUNNING')
       AND j.intent_key = N'query:part:' + CAST(p.id AS nvarchar(20)))
-ORDER BY p.next_query_at, p.id", new { limit, env }, cancellationToken: ct))).ToList();
+ORDER BY CASE WHEN p.next_query_at IS NULL THEN 1 ELSE 0 END, p.next_query_at, p.id",
+            new { limit, env }, cancellationToken: ct))).ToList();
     }
 
     // ---------------------------------------------------------------- 主体
@@ -140,6 +161,23 @@ ORDER BY p.next_query_at, p.id", new { limit, env }, cancellationToken: ct))).To
         catch (ChannelPausedException ex)
         {
             outcome = new TopOutcome(TopOutcomeKind.AuthError, null, null, ex.Message, null, null, null);
+        }
+        catch (TopNotCertifiedException ex)
+        {
+            // LIVE fail-closed：真实通道未取证时网关直接抛错。先收尾本次查询尝试再抛出（作业由 Worker 退避重排），
+            // 绝不留下 finished_at 为空的尝试行在循环里反复累积。
+            await CloseAttemptOnExceptionAsync(attempt.AttemptId, "NOT_CERTIFIED", ex);
+            throw;
+        }
+        catch (OperationCanceledException ex)
+        {
+            await CloseAttemptOnExceptionAsync(attempt.AttemptId, "CANCELLED", ex);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            await CloseAttemptOnExceptionAsync(attempt.AttemptId, ex is SqlException ? "DB_ERROR" : "UNEXPECTED_ERROR", ex);
+            throw;
         }
 
         return await ApplyAsync(head, attempt, outcome, workerId, fencingToken, guardIntent, policy, ct);
@@ -186,7 +224,7 @@ WHERE p.id = @partId", new { partId }, cancellationToken: ct));
             tx, cancellationToken: ct));
         var leaseAlive = await conn.ExecuteScalarAsync<int>(new CommandDefinition(@"
 SELECT CASE WHEN EXISTS (
-  SELECT 1 FROM dbo.outbox_job
+  SELECT 1 FROM dbo.outbox_job WITH (UPDLOCK, HOLDLOCK)
   WHERE job_kind=N'bill-query' AND intent_key=@intent AND job_state=N'RUNNING'
     AND lease_owner=@worker AND fencing_token=@token
 ) THEN 1 ELSE 0 END", new { intent = guardIntent, worker = workerId, token = fencingToken },
@@ -241,7 +279,7 @@ WHERE task_id=@taskId AND attempt_kind=N'QUERY'",
             tx, cancellationToken: ct));
         var leaseAlive = await conn.ExecuteScalarAsync<int>(new CommandDefinition(@"
 SELECT CASE WHEN EXISTS (
-  SELECT 1 FROM dbo.outbox_job
+  SELECT 1 FROM dbo.outbox_job WITH (UPDLOCK, HOLDLOCK)
   WHERE job_kind=N'bill-query' AND intent_key=@intent AND job_state=N'RUNNING'
     AND lease_owner=@worker AND fencing_token=@token
 ) THEN 1 ELSE 0 END", new { intent = guardIntent, worker = workerId, token = fencingToken },
@@ -296,11 +334,9 @@ VALUES(@taskId,@partId,@codeId,@result,@reason,@evidence,@attemptId)",
                 "UPDATE dbo.upload_part SET query_count=query_count+1, next_query_at=@nextQueryAt WHERE id=@partId",
                 new { partId = head.PartId, nextQueryAt }, tx, cancellationToken: ct));
 
-        // 观察窗过期：达最大次数 / 超过转人工小时数 → 人工处置（绝不无限回查）。
-        if (!isSettled && counted && IsObservationExpired(head, attemptCount, policy, now))
-            return await EscalateAsync(conn, tx, head, current, attempt.AttemptId, parsed, platformError,
-                attemptCount, policy, workerId, fencingToken, guardIntent, codeIds, ct);
-
+        // 先应用任何合法结论转换——无论累计查询次数是否已到上限：迟到的 AllSuccess/Partial/Failed/Processing
+        // 都必须先落地（否则一旦 attempts≥max 后续所有结论都会被丢弃，分片永久冻结在原状态）。H1。
+        var expired = counted && IsObservationExpired(head, attemptCount, policy, now);
         var evt = parsed?.Kind switch
         {
             BillStatusKind.AllSuccess => UploadEvent.QueryAllSuccess,
@@ -324,9 +360,10 @@ VALUES(@taskId,@partId,@codeId,@result,@reason,@evidence,@attemptId)",
                 applied = rows == 1;
                 if (applied) next = candidate;
             }
-            else
+            else if (!expired)
             {
                 // 非法转换只告警不改状态（如 Dispatching 分片：先由发送恢复收敛为受理未知）。
+                // 已决定升级人工时不再报"非法转换"，避免把正常升级误标为异常。
                 await _audit.AppendAsync(conn, tx, new AuditEntry("SYSTEM", "Worker", "bill.query.illegal_transition",
                     "upload_part", head.PartId.ToString(CultureInfo.InvariantCulture), $"{current}->{e}", null,
                     JsonSerializer.Serialize(new { from = current.ToString(), attempt = e.ToString(), kind = parsed?.Kind }),
@@ -341,8 +378,13 @@ VALUES(@taskId,@partId,@codeId,@result,@reason,@evidence,@attemptId)",
                 await EnqueueDependentVerificationsAsync(conn, tx, head, codeIds, ct);
         }
 
-        var retrying = !isSettled;
-        if (retrying)
+        // 只有当结论把分片留在非终态等待（处理中/未决/状态未变）且观察窗已过期时才升级人工：
+        // 已落地的成功/部分/失败结论永远优先于升级。H1。
+        if (!isSettled && expired)
+            return await EscalateAsync(conn, tx, head, next, attempt.AttemptId, parsed, platformError,
+                attemptCount, policy, codeIds, ct);
+
+        if (!isSettled)
             await ScheduleRetryAsync(conn, tx, head, guardIntent, workerId, fencingToken, nextQueryAt!.Value,
                 parsed?.Note ?? platformError, ct);
 
@@ -354,8 +396,7 @@ VALUES(@taskId,@partId,@codeId,@result,@reason,@evidence,@attemptId)",
 
     private async Task<QueryOutcome> EscalateAsync(SqlConnection conn, SqlTransaction tx, HeadRow head,
         UploadState current, long attemptId, BillStatusParseResult? parsed, string? platformError, int attemptCount,
-        QueryPolicy policy, string workerId, long fencingToken, string guardIntent, IReadOnlyList<long> codeIds,
-        CancellationToken ct)
+        QueryPolicy policy, IReadOnlyList<long> codeIds, CancellationToken ct)
     {
         // 观察窗到期优先走 ObservationExpired；状态机无该边的中间态（AcceptanceUnknown/PartialSuccess）
         // 走 ManualEscalate——两条边都只通向 ManualAction，状态机仍是唯一权威。
@@ -374,16 +415,28 @@ VALUES(@taskId,@partId,@codeId,@result,@reason,@evidence,@attemptId)",
 
         if (escalateEvent is null)
         {
-            // 无可达人工态（如 Dispatching/Accepted）：保持状态，继续按退避回查，并留证。
+            // 兜底（正常不可达：所有可回查状态都已有到 ManualAction 的边）：绝不无限重排——
+            // 停回查（next_query_at=NULL）、撤掉待执行的 per-part 回查作业，但仍落复核对账差异，让分片浮到人工面前。
+            await conn.ExecuteAsync(new CommandDefinition(
+                "UPDATE dbo.upload_part SET next_query_at=NULL WHERE id=@partId",
+                new { partId = head.PartId }, tx, cancellationToken: ct));
+            await conn.ExecuteAsync(new CommandDefinition(@"
+UPDATE dbo.outbox_job
+SET job_state=N'DONE', finished_at=SYSUTCDATETIME(), lease_owner=NULL, lease_until=NULL
+WHERE org_id=@orgId AND env=@env AND job_kind=N'bill-query' AND intent_key=@intent AND job_state=N'PENDING'",
+                new { orgId = head.OrgId, env = head.Env, intent = PartIntent(head.PartId) }, tx, cancellationToken: ct));
+
+            var fallbackRunId = await InsertEscalationRunAsync(conn, tx, head, attemptCount, policy, parsed,
+                platformError, ct);
+            await InsertEscalationDifferenceAsync(conn, tx, head, fallbackRunId, attemptCount, policy, parsed,
+                platformError, ct);
             await _audit.AppendAsync(conn, tx, new AuditEntry("SYSTEM", "Worker", "bill.query.escalation_unavailable",
                 "upload_part", head.PartId.ToString(CultureInfo.InvariantCulture), "OBSERVATION_EXPIRED", null,
-                JsonSerializer.Serialize(new { from = current.ToString(), attemptCount, maxAttempts = policy.MaxAttempts }),
-                null, null, head.Env));
-            var retryAt = DateTime.UtcNow.Add(Backoff(attemptCount, policy.BackoffSeconds));
-            await conn.ExecuteAsync(new CommandDefinition(
-                "UPDATE dbo.upload_part SET next_query_at=@nextQueryAt WHERE id=@partId",
-                new { partId = head.PartId, nextQueryAt = retryAt }, tx, cancellationToken: ct));
-            await ScheduleRetryAsync(conn, tx, head, guardIntent, workerId, fencingToken, retryAt, "OBSERVATION_EXPIRED", ct);
+                JsonSerializer.Serialize(new
+                {
+                    from = current.ToString(), attemptCount, maxAttempts = policy.MaxAttempts,
+                    outcome = "STOPPED_RETRYING_DIFFERENCE_RAISED",
+                }), null, null, head.Env));
             await tx.CommitAsync(ct);
             return QueryOutcome.Unresolved;
         }
@@ -497,6 +550,32 @@ WHERE id=@attemptId AND is_stale_evidence=0",
                 attemptId, requestId = outcome.RequestId,
                 rawResponse = TopResponseSanitizer.Sanitize(SerializeOutcome(outcome, null)),
             }, cancellationToken: ct));
+    }
+
+    /// <summary>
+    /// 网关/数据库异常时收尾本次查询尝试（<c>finished_at</c> + <c>error_kind</c>）：异常照常上抛由 Worker 退避重排，
+    /// 但尝试行不得留在未完成状态。收尾自身失败不掩盖原始异常（优先保住根因，行留给审计/人工发现）。
+    /// </summary>
+    private async Task CloseAttemptOnExceptionAsync(long attemptId, string errorKind, Exception cause)
+    {
+        try
+        {
+            var summary = TopResponseSanitizer.Sanitize(JsonSerializer.Serialize(new
+            {
+                kind = errorKind, message = cause.Message, exception = cause.GetType().Name,
+            }));
+            await using var conn = new SqlConnection(_cs);
+            await conn.OpenAsync(CancellationToken.None);
+            await conn.ExecuteAsync(new CommandDefinition(@"
+UPDATE dbo.upload_attempt
+SET finished_at=SYSUTCDATETIME(), error_kind=@errorKind, raw_response=@rawResponse
+WHERE id=@attemptId AND is_stale_evidence=0",
+                new { attemptId, errorKind, rawResponse = summary }, cancellationToken: CancellationToken.None));
+        }
+        catch (Exception)
+        {
+            // 收尾写失败（如库瞬断）不能把原始异常换成二级异常：抛出原始异常，尝试行交由审计/人工确认。
+        }
     }
 
     /// <summary>
