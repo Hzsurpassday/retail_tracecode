@@ -2,6 +2,7 @@ using System.Text.Json;
 using Dapper;
 using Microsoft.Data.SqlClient;
 using TraceFlow.Application.Abstractions;
+using TraceFlow.Infrastructure.Sales;
 using TraceFlow.Infrastructure.Settings;
 
 namespace TraceFlow.Infrastructure.Sources;
@@ -61,6 +62,26 @@ public sealed class SyncScheduler
             await _queue.EnqueueAsync(c, tx, orgId.Value, _env, "enterprise-sync",
                 $"daily:{nowUtc:yyyyMMdd}", entPayload, nowUtc, ct);
             n++;
+            // 核验兜底（SALE-05）：近 24h COMPLETE SALE 且当前结论非 PASSED/FAILED 的快照（漏入队/依赖等待/未知重核），
+            // 按 5 分钟桶重入队；无候选时零入队（既有桶计数不变）。
+            var verifyIds = (await c.QueryAsync<long>(new CommandDefinition(@"
+SELECT s.id FROM dbo.source_snapshot s
+WHERE s.org_id=@orgId AND s.document_type=N'SALE' AND s.completeness_status=N'COMPLETE'
+  AND s.observed_at >= DATEADD(hour,-24,@now)
+  AND NOT EXISTS (SELECT 1 FROM dbo.verification v
+                  WHERE v.org_id=s.org_id AND v.env=@env AND v.source_snapshot_id=s.id AND v.is_current=1
+                    AND v.state IN (N'PASSED',N'FAILED'))
+  AND NOT EXISTS (SELECT 1 FROM dbo.source_snapshot n
+                  WHERE n.org_id=s.org_id AND n.source_system_id=s.source_system_id
+                    AND n.source_document_key=s.source_document_key AND n.version>s.version)
+ORDER BY s.id", new { orgId = orgId.Value, env = _env, now = nowUtc }, tx, cancellationToken: ct))).ToList();
+            foreach (var snapshotId in verifyIds)
+            {
+                var verifyPayload = JsonSerializer.Serialize(new { orgId = orgId.Value, env = _env, snapshotId });
+                await _queue.EnqueueAsync(c, tx, orgId.Value, _env, SaleVerificationService.JobKind,
+                    $"snapshot:{snapshotId}:retry:{unix / 300}", verifyPayload, nowUtc, ct);
+                n++;
+            }
         }
         var matchPayload = JsonSerializer.Serialize(new { orgId = orgId.Value, env = _env, entity = (string?)null, trigger = "periodic" });
         await _queue.EnqueueAsync(c, tx, orgId.Value, _env, "master-match",

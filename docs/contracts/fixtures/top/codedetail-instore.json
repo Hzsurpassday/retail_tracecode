@@ -1,0 +1,19 @@
+[
+  {
+    "note": "候选合同（_verified:false，G-TOP 取证前仅文档用途；测试一律注入 Fake 网关委托，不依赖本文件）",
+    "response": {
+      "alibaba_alihealth_drugtrace_top_lsyd_query_codedetail_response": {
+        "_verified": false,
+        "response_success": true,
+        "request_id": "fixture-codedetail-instore-1",
+        "result": {
+          "_verified": false,
+          "model": {
+            "exists": true,
+            "instore": true
+          }
+        }
+      }
+    }
+  }
+]

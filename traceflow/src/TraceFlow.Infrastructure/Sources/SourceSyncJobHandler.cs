@@ -3,6 +3,7 @@ using Dapper;
 using Microsoft.Data.SqlClient;
 using TraceFlow.Application.Abstractions;
 using TraceFlow.Domain.Sources;
+using TraceFlow.Infrastructure.Sales;
 using TraceFlow.Infrastructure.Settings;
 
 namespace TraceFlow.Infrastructure.Sources;
@@ -10,6 +11,7 @@ namespace TraceFlow.Infrastructure.Sources;
 /// <summary>
 /// source-sync 作业：窗口三态——manual 用 payload 显式窗口；daily 全量回扫；
 /// periodic 增量（检查点终点−回扫窗；首次 now−每日回扫天数）。停机缺口绝不截断（AT-007）。
+/// 同步后为新晋升 COMPLETE 的 SALE 快照入队 sale-verify（SALE-05；入队参数可选，测试可省略）。
 /// 失败抛异常→WorkerHostedService 指数退避重排（JOB-03）。
 /// </summary>
 public sealed class SourceSyncJobHandler : IJobHandler
@@ -18,13 +20,16 @@ public sealed class SourceSyncJobHandler : IJobHandler
     private readonly ISourceAdapter _adapter;
     private readonly SettingsService _settings;
     private readonly IAuditLog _audit;
+    private readonly IJobQueue? _queue;
 
-    public SourceSyncJobHandler(string connectionString, ISourceAdapter adapter, SettingsService settings, IAuditLog audit)
+    public SourceSyncJobHandler(string connectionString, ISourceAdapter adapter, SettingsService settings, IAuditLog audit,
+        IJobQueue? queue = null)
     {
         _cs = connectionString;
         _adapter = adapter;
         _settings = settings;
         _audit = audit;
+        _queue = queue;
     }
 
     public string Kind => "source-sync";
@@ -64,5 +69,39 @@ public sealed class SourceSyncJobHandler : IJobHandler
         }
         var svc = new SourceSyncService(_cs, _adapter, _settings, _audit);
         await svc.RunAsync(orgId, env, entity, start, end, ct);
+        await EnqueueSaleVerificationsAsync(orgId, env, ct);
+    }
+
+    /// <summary>
+    /// 快照晋升 COMPLETE 后的核验入队（SALE-05）：扫近 30 天「COMPLETE SALE 且无当前 PASSED/FAILED 结论」的快照，
+    /// 每快照入队 sale-verify（intent snapshot:{id}，outbox UQ 幂等）。
+    /// 偏差 D1：SourceSyncService 的写入事务未对外暴露，无法严格同事务入队；本方法紧随其后用独立短事务，
+    /// 窗口由 SyncScheduler 的 5 分钟兜底覆盖（见 task-2-report 偏差记录）。
+    /// </summary>
+    private async Task EnqueueSaleVerificationsAsync(long orgId, string env, CancellationToken ct)
+    {
+        var queue = _queue;
+        if (queue is null) return;
+        await using var c = new SqlConnection(_cs);
+        await c.OpenAsync(ct);
+        await using var tx = (SqlTransaction)await c.BeginTransactionAsync(ct);
+        var ids = (await c.QueryAsync<long>(new CommandDefinition(@"
+SELECT s.id FROM dbo.source_snapshot s
+WHERE s.org_id=@orgId AND s.document_type=N'SALE' AND s.completeness_status=N'COMPLETE'
+  AND s.observed_at >= DATEADD(day,-30,SYSUTCDATETIME())
+  AND NOT EXISTS (SELECT 1 FROM dbo.verification v
+                  WHERE v.org_id=s.org_id AND v.env=@env AND v.source_snapshot_id=s.id AND v.is_current=1
+                    AND v.state IN (N'PASSED',N'FAILED'))
+  AND NOT EXISTS (SELECT 1 FROM dbo.source_snapshot n
+                  WHERE n.org_id=s.org_id AND n.source_system_id=s.source_system_id
+                    AND n.source_document_key=s.source_document_key AND n.version>s.version)
+ORDER BY s.id", new { orgId, env }, tx, cancellationToken: ct))).ToList();
+        foreach (var snapshotId in ids)
+        {
+            var payload = JsonSerializer.Serialize(new { orgId, env, snapshotId });
+            await queue.EnqueueAsync(c, tx, orgId, env, SaleVerificationService.JobKind, $"snapshot:{snapshotId}",
+                payload, DateTime.UtcNow, ct);
+        }
+        await tx.CommitAsync(ct);
     }
 }

@@ -52,6 +52,16 @@ builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Top.TopClientSe
     sp.GetRequiredService<TraceFlow.Infrastructure.Top.RateBudgetService>(),
     sp.GetRequiredService<TraceFlow.Infrastructure.Top.ChannelPauseService>(),
     sp.GetRequiredService<IAuditLog>()));
+builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Sales.RetailTaskFactory(
+    sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(), sp.GetRequiredService<IJobQueue>()));
+builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Sales.SaleVerificationService(
+    connectionString, env, sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(),
+    sp.GetRequiredService<TraceFlow.Infrastructure.Top.TopClientService>(),
+    sp.GetRequiredService<TraceFlow.Infrastructure.Sales.RetailTaskFactory>(),
+    sp.GetRequiredService<IJobQueue>(), sp.GetRequiredService<IAuditLog>()));
+builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Jobs.SaleVerifyJobHandler(
+    sp.GetRequiredService<TraceFlow.Infrastructure.Sales.SaleVerificationService>(),
+    sp.GetRequiredService<IJobQueue>(), connectionString));
 builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Upstream.UpstreamDownloadService(
     connectionString, sp.GetRequiredService<TraceFlow.Infrastructure.Top.TopClientService>(),
     sp.GetRequiredService<IJobQueue>(), sp.GetRequiredService<IAuditLog>()));
@@ -74,7 +84,8 @@ builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Sources.SyncSch
     sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(), env));
 builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Sources.SourceSyncJobHandler(
     connectionString, sp.GetRequiredService<ISourceAdapter>(),
-    sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(), sp.GetRequiredService<IAuditLog>()));
+    sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(), sp.GetRequiredService<IAuditLog>(),
+    sp.GetRequiredService<IJobQueue>()));
 builder.Services.AddSingleton(sp => new IdempotencyExecutor(connectionString, sp.GetRequiredService<IIdempotencyStore>()));
 builder.Services.AddSingleton<IAuthorizationHandler, PermissionHandler>();
 
