@@ -7,5 +7,6 @@ public enum UploadEvent
     QueryProcessing, QueryAllSuccess, QueryPartial, QueryFailed, QueryUnresolved,
     QueryConfirmedAccepted, QueryConfirmedNotAccepted,
     ObservationExpired, RetryDue, ManualEscalate, ControlledRetryApproved,
-    EvidenceVerifiedAccepted, EvidenceVerifiedProcessing
+    EvidenceVerifiedAccepted, EvidenceVerifiedProcessing,
+    AllocationCancelled
 }
