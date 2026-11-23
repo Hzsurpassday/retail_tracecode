@@ -54,3 +54,10 @@ fixture 为 **Mock 形状**，非真实 KSOA schema 事实；列名/类型以 G-
 - KEY_REUSE：同单据键跨单据类型（lshh 与 djbh 碰撞）→ 服务侧 DB 校验。
 - BAD_BUSINESS_TIME：rq+ontime 无法解析 → 不猜时间，异常 + INVALID。
 - 行键按单内唯一（UQ_line_key(snapshot_id, source_line_key)）；plh/dj_sn 跨单重复属正常。
+
+## 5. M2 增补：采购单头供应商编号候选列（ywdjbh）
+
+- 用途：入库匹配按供应商过滤上游单（R8b）；`inbound_match.supplier_dwbh` 来源。
+- 候选：`jh_rkhz.ywdjbh`（业务单位编号）。**未取证（G-ERP）**：列名、语义（供应商 vs 部门）、与 supplier_map.dwbh 的对应关系均待真实库验证。
+- M2 实现口径：仅从 `source_snapshot.raw_header` JSON 读取 `ywdjbh` 字段（fixture 提供）；`ISourceAdapter` 接口不变、不新增查询列；取不到→supplier_dwbh=NULL，匹配走 CONFLICT/人工路径，不猜供应商。
+- 取证动作（并入 §3 清单执行）：真实 jh_rkhz 采样确认列存在与语义→更新 adapter-facts.md 证据列→source-mapping.md 固定映射→RealKsoaAdapter 落实。取证前 LIVE 采购同步保持 ERP_NOT_CERTIFIED 门禁。

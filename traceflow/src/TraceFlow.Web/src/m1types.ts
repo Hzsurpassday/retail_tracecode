@@ -34,5 +34,6 @@ export interface JobStatus {
 export interface SettingView {
   id: number; key: string; valueJson: string | null; isSecret: boolean; hasSecretValue: boolean;
   version: string; updatedBy: string | null; updatedAtUtc: string | null; reason: string | null;
+  protectionScope: string | null;
 }
 export interface ConnectionTestResult { ok: boolean; message: string; }

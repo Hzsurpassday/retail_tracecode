@@ -51,6 +51,8 @@ public class UploadStateMachineTests
         { UploadState.ManualAction, UploadEvent.QueryAllSuccess, UploadState.Succeeded },
         { UploadState.ManualAction, UploadEvent.QueryPartial, UploadState.PartialSuccess },
         { UploadState.ManualAction, UploadEvent.QueryFailed, UploadState.Failed },
+        { UploadState.Blocked, UploadEvent.AllocationCancelled, UploadState.Cancelled },
+        { UploadState.Ready, UploadEvent.AllocationCancelled, UploadState.Cancelled },
     };
 
     [Theory]
@@ -74,6 +76,9 @@ public class UploadStateMachineTests
         { UploadState.Accepted, UploadEvent.ReceiptAccepted },
         { UploadState.Blocked, UploadEvent.Claimed },
         { UploadState.ManualAction, UploadEvent.EligibilitySatisfied }, // 人工不能直接设成功/就绪
+        { UploadState.Dispatching, UploadEvent.AllocationCancelled },   // 已发起发送不可行政取消（IN-09）
+        { UploadState.Accepted, UploadEvent.AllocationCancelled },
+        { UploadState.Cancelled, UploadEvent.Claimed },                 // Cancelled 是终态
     };
 
     [Theory]
@@ -84,11 +89,12 @@ public class UploadStateMachineTests
     }
 
     [Fact]
-    public void Succeeded_is_terminal_and_every_other_state_has_exit()
+    public void Terminal_states_have_no_exit_and_every_other_state_has_exit()
     {
         Assert.DoesNotContain(UploadStateMachine.AllTransitions, t => t.From == UploadState.Succeeded);
+        Assert.DoesNotContain(UploadStateMachine.AllTransitions, t => t.From == UploadState.Cancelled);
         foreach (UploadState s in Enum.GetValues<UploadState>())
-            if (s != UploadState.Succeeded)
+            if (s != UploadState.Succeeded && s != UploadState.Cancelled)
                 Assert.Contains(UploadStateMachine.AllTransitions, t => t.From == s);
     }
 }

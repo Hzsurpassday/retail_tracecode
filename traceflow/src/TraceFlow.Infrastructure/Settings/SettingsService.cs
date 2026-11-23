@@ -1,7 +1,9 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Dapper;
 using Microsoft.Data.SqlClient;
 using TraceFlow.Application.Abstractions;
+using TraceFlow.Domain.Billing;
 using TraceFlow.Domain.Sources;
 using TraceFlow.Domain.Versioning;
 using TraceFlow.Infrastructure.Security;
@@ -9,7 +11,7 @@ using TraceFlow.Infrastructure.Security;
 namespace TraceFlow.Infrastructure.Settings;
 
 public sealed record SettingView(long Id, string Key, string? ValueJson, bool IsSecret, bool HasSecretValue,
-    string Version, string? UpdatedBy, DateTime? UpdatedAtUtc, string? Reason);
+    string Version, string? UpdatedBy, DateTime? UpdatedAtUtc, string? Reason, string? ProtectionScope);
 
 public sealed record ConnectionTestResult(bool Ok, string Message);
 
@@ -35,7 +37,24 @@ public sealed class SettingsService
         ["supplier.auditPassValues"] = new("supplier.auditPassValues", false, "[]", "stringArray", 0, 0),
         ["import.maxFileBytes"] = new("import.maxFileBytes", false, "20971520", "int", 1024, 104857600),
         ["import.maxRows"] = new("import.maxRows", false, "10000", "int", 1, 100000),
+        ["top.billPrefix"] = new("top.billPrefix", false, "\"TF\"", "string", 0, 0),
+        ["top.billMaxLength"] = new("top.billMaxLength", false, "32", "int", 8, 64),
+        ["upstream.pollSeconds"] = new("upstream.pollSeconds", false, "300", "int", 30, 3600),
     };
+
+    /// <summary>
+    /// 账单码 = 前缀 + Base35(taskId)（4 位可容 35^4-1≈150 万任务）+ 可选 "P{n}" 分片后缀（最多 3 位，"P99"）。
+    /// 预留 7 位后 prefix.Length + 7 ≤ top.billMaxLength，部署量级内生成的单号恒可容纳（超出仍由生成器抛错，不截断）。
+    /// </summary>
+    public const int ReservedBillSuffixLength = 7;
+
+    public static void EnsureBillContract(string prefix, long maxLength)
+    {
+        if (prefix.Length + ReservedBillSuffixLength > maxLength)
+            throw new SettingValidationException(
+                $"账单码合同不成立：top.billPrefix 长度 {prefix.Length} + 预留 {ReservedBillSuffixLength} 位（Base35 序号与 P 分片后缀）" +
+                $"超过 top.billMaxLength={maxLength}，生成的单号必然超长；请缩短前缀或提高上限");
+    }
 
     private readonly string _cs;
     private readonly ISecretProtector _protector;
@@ -50,7 +69,7 @@ public sealed class SettingsService
         await using var c = new SqlConnection(_cs);
         await c.OpenAsync(ct);
         var rows = await c.QueryAsync<Row>(new CommandDefinition(
-            "SELECT id,setting_key,value_json,is_secret,secret_protected,updated_by,updated_at,reason,ver FROM dbo.app_setting",
+            "SELECT id,setting_key,value_json,is_secret,secret_protected,protection_scope,updated_by,updated_at,reason,ver FROM dbo.app_setting",
             cancellationToken: ct));
         var byKey = rows.ToDictionary(r => r.setting_key, StringComparer.Ordinal);
         var list = new List<SettingView>();
@@ -58,9 +77,9 @@ public sealed class SettingsService
         {
             if (byKey.TryGetValue(def.Key, out var r))
                 list.Add(new SettingView(r.id, def.Key, def.IsSecret ? null : r.value_json, def.IsSecret,
-                    r.secret_protected is not null, RowVer.ToHex(r.ver), r.updated_by, r.updated_at, r.reason));
+                    r.secret_protected is not null, RowVer.ToHex(r.ver), r.updated_by, r.updated_at, r.reason, r.protection_scope));
             else
-                list.Add(new SettingView(0, def.Key, def.IsSecret ? null : def.DefaultJson, def.IsSecret, false, "0", null, null, null));
+                list.Add(new SettingView(0, def.Key, def.IsSecret ? null : def.DefaultJson, def.IsSecret, false, "0", null, null, null, null));
         }
         return list;
     }
@@ -123,10 +142,74 @@ WHERE setting_key=@k AND ver=@ver",
             key, reason, beforeDigest, afterDigest, null, null, "LIVE"));
         // 同事务读回（不可另开连接：未提交 X 锁会阻塞 ListAsync 直至命令超时）
         var row = await conn.QuerySingleAsync<Row>(new CommandDefinition(
-            "SELECT id,setting_key,value_json,is_secret,secret_protected,updated_by,updated_at,reason,ver FROM dbo.app_setting WHERE setting_key=@k",
+            "SELECT id,setting_key,value_json,is_secret,secret_protected,protection_scope,updated_by,updated_at,reason,ver FROM dbo.app_setting WHERE setting_key=@k",
             new { k = key }, tx, cancellationToken: ct));
         return new SettingView(row.id, key, def.IsSecret ? null : row.value_json, def.IsSecret,
-            row.secret_protected is not null, RowVer.ToHex(row.ver), row.updated_by, row.updated_at, row.reason);
+            row.secret_protected is not null, RowVer.ToHex(row.ver), row.updated_by, row.updated_at, row.reason, row.protection_scope);
+    }
+
+    /// <summary>
+    /// §4.7/T7 Important#2：账单码合同两键互相约束——任一键写入后须满足
+    /// prefix.Length + ReservedBillSuffixLength ≤ billMaxLength，否则生成的单号必然超长（建单抛错）。
+    /// sp_getapplock 串行化两键写入，消除「两键并发各看都合法、合起来却超长」的竞态；随后同一快照 UPDLOCK 读取两行。
+    /// </summary>
+    public async Task EnsureBillContractCouplingAsync(SqlConnection conn, SqlTransaction tx, string key, string? valueJson, CancellationToken ct)
+    {
+        if (key is not ("top.billPrefix" or "top.billMaxLength") || valueJson is null) return;
+        string? proposedPrefix = null;
+        long? proposedMaxLength = null;
+        try
+        {
+            using var doc = JsonDocument.Parse(valueJson);
+            var e = doc.RootElement;
+            if (key == "top.billPrefix" && e.ValueKind == JsonValueKind.String) proposedPrefix = e.GetString();
+            if (key == "top.billMaxLength" && e.ValueKind == JsonValueKind.Number && e.TryGetInt64(out var n)) proposedMaxLength = n;
+        }
+        catch (JsonException) { return; } // 非法 JSON/类型交给 UpdateAsync 统一报错
+        if (proposedPrefix is null && proposedMaxLength is null) return;
+        // 单键自身的类型/取值/字符集错误比耦合更早定位，留给 UpdateAsync 报原文
+        if (proposedPrefix is not null && !Regex.IsMatch(proposedPrefix, "^[A-Z0-9]{1,16}$")) return;
+        var maxDef = Catalog["top.billMaxLength"];
+        if (proposedMaxLength is long ml && (ml < maxDef.Min || ml > maxDef.Max)) return;
+
+        await conn.ExecuteAsync(new CommandDefinition(@"
+DECLARE @rc int;
+EXEC @rc = sp_getapplock @Resource=@res, @LockMode='Exclusive', @LockOwner='Transaction', @LockTimeout=30000;
+IF @rc < 0 RAISERROR('applock %s failed (%d)', 16, 1, @res, @rc);",
+            new { res = "settings:billcontract" }, tx, cancellationToken: ct));
+        var rows = (await conn.QueryAsync<BillContractRow>(new CommandDefinition(
+            "SELECT setting_key, value_json FROM dbo.app_setting WITH (UPDLOCK, HOLDLOCK) WHERE setting_key IN (N'top.billPrefix', N'top.billMaxLength')",
+            transaction: tx, cancellationToken: ct))).ToDictionary(r => r.setting_key, r => r.value_json, StringComparer.Ordinal);
+
+        var prefix = proposedPrefix
+            ?? StoredString(rows, "top.billPrefix")
+            ?? JsonSerializer.Deserialize<string>(Catalog["top.billPrefix"].DefaultJson)!;
+        var maxLength = proposedMaxLength
+            ?? StoredInt64(rows, "top.billMaxLength")
+            ?? long.Parse(Catalog["top.billMaxLength"].DefaultJson);
+        EnsureBillContract(prefix, maxLength);
+    }
+
+    private static string? StoredString(IReadOnlyDictionary<string, string?> rows, string key)
+    {
+        if (!rows.TryGetValue(key, out var raw) || raw is null) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(raw);
+            return doc.RootElement.ValueKind == JsonValueKind.String ? doc.RootElement.GetString() : null;
+        }
+        catch (JsonException) { return null; }
+    }
+
+    private static long? StoredInt64(IReadOnlyDictionary<string, string?> rows, string key)
+    {
+        if (!rows.TryGetValue(key, out var raw) || raw is null) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(raw);
+            return doc.RootElement.ValueKind == JsonValueKind.Number && doc.RootElement.TryGetInt64(out var n) ? n : null;
+        }
+        catch (JsonException) { return null; }
     }
 
     private static void ValidateJson(SettingDef def, string json)
@@ -147,6 +230,13 @@ WHERE setting_key=@k AND ver=@ver",
             case "stringArray":
                 if (e.ValueKind != JsonValueKind.Array || e.EnumerateArray().Any(x => x.ValueKind != JsonValueKind.String))
                     throw new SettingValidationException($"配置 {def.Key} 须为字符串数组");
+                break;
+            case "string":
+                if (e.ValueKind != JsonValueKind.String || e.GetString()!.Length is < 1 or > 200)
+                    throw new SettingValidationException($"配置 {def.Key} 须为 1..200 字符字符串");
+                // 账单码生成器只接受大写字母数字（BillCodeGenerator），非法前缀会让之后每次建单抛未映射异常
+                if (def.Key == "top.billPrefix" && !Regex.IsMatch(e.GetString()!, "^[A-Z0-9]{1,16}$"))
+                    throw new SettingValidationException("配置 top.billPrefix 须为 1..16 位大写字母或数字（A-Z0-9）");
                 break;
         }
     }
@@ -173,7 +263,26 @@ WHERE setting_key=@k AND ver=@ver",
         (int)await GetIntAsync("sync.roundIntervalSeconds", ct));
 
     public async Task<bool> IsChannelPausedAsync(CancellationToken ct)
-        => (await GetRawAsync("sync.paused", ct)) == "true";
+    {
+        // R11a fail-closed：只有「确实没有设置行」才回落到 Catalog 默认 false（开）。
+        // 行存在即须按值判定——COUNT 与 MAX 同查以区分「无行」与「有行但值为 NULL」（单读 value_json 无法区分）。
+        await using var c = new SqlConnection(_cs);
+        await c.OpenAsync(ct);
+        var row = await c.QuerySingleAsync<PauseRow>(new CommandDefinition(
+            "SELECT COUNT(*) AS row_count, MAX(value_json) AS value_json FROM dbo.app_setting WHERE setting_key=@k",
+            new { k = "sync.paused" }, cancellationToken: ct));
+        if (row.row_count == 0) return false;
+        if (row.value_json is null) return true; // 行存在但值缺失 → 保守视为暂停
+        try
+        {
+            using var doc = JsonDocument.Parse(row.value_json);
+            return doc.RootElement.ValueKind != JsonValueKind.False; // R11a：非布尔 false 一律视为暂停（fail-closed）
+        }
+        catch (JsonException)
+        {
+            return true;
+        }
+    }
 
     public async Task<IReadOnlyList<string>> GetAuditPassValuesAsync(CancellationToken ct)
     {
@@ -184,6 +293,16 @@ WHERE setting_key=@k AND ver=@ver",
 
     public async Task<(long MaxFileBytes, int MaxRows)> GetImportBoundsAsync(CancellationToken ct)
         => (await GetIntAsync("import.maxFileBytes", ct), (int)await GetIntAsync("import.maxRows", ct));
+
+    public async Task<BillCodeContract> GetBillContractAsync(CancellationToken ct)
+    {
+        var raw = await GetRawAsync("top.billPrefix", ct) ?? Catalog["top.billPrefix"].DefaultJson;
+        var prefix = JsonSerializer.Deserialize<string>(raw) ?? "TF";
+        return new BillCodeContract(prefix, (int)await GetIntAsync("top.billMaxLength", ct));
+    }
+
+    public async Task<int> GetUpstreamPollSecondsAsync(CancellationToken ct)
+        => (int)await GetIntAsync("upstream.pollSeconds", ct);
 
     public async Task<string> GetSecretAsync(string key, CancellationToken ct)
     {
@@ -232,9 +351,23 @@ WHERE setting_key=@k AND ver=@ver",
         public string? value_json { get; set; }
         public bool is_secret { get; set; }
         public byte[]? secret_protected { get; set; }
+        public string? protection_scope { get; set; }
         public string? updated_by { get; set; }
         public DateTime? updated_at { get; set; }
         public string? reason { get; set; }
         public byte[] ver { get; set; } = Array.Empty<byte>();
+    }
+
+    private sealed class BillContractRow
+    {
+        public string setting_key { get; set; } = "";
+        public string? value_json { get; set; }
+    }
+
+    /// <summary>存在性+值分离读取：row_count 为 0 表示无设置行；有行而 value_json 为 NULL 表示值缺失。</summary>
+    private sealed class PauseRow
+    {
+        public int row_count { get; set; }
+        public string? value_json { get; set; }
     }
 }

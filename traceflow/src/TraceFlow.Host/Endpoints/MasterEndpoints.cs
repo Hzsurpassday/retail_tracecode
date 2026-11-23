@@ -7,6 +7,7 @@ using TraceFlow.Application.Security;
 using TraceFlow.Domain.Matching;
 using TraceFlow.Domain.Versioning;
 using TraceFlow.Host.Security;
+using TraceFlow.Infrastructure.Inbound;
 using TraceFlow.Infrastructure.Security;
 
 namespace TraceFlow.Host.Endpoints;
@@ -150,9 +151,8 @@ SELECT id,dwbh,name,credit_code,role,ver,mapping_id,mapping_state,is_locked,mapp
         }).WithMetadata(new RequirePermissionAttribute(PermissionCatalog.TraceRead));
 
         // MD-01 分类专用端点：reason 必填；UPDATE 只动分类两列。
-        // 诚实声明：affectedNonTerminalTasks 仅统计（M1 无任务产生路径，恒 0）；
-        // 分类变更对已生成任务的失效/重阻断接线在 M2 上传管线实现。
-        app.MapPost("/api/v1/products/{id:long}/trace-policy", (HttpContext ctx, long id, IdempotencyExecutor idem) =>
+        // M2 接线（R11c/AT-057）：受影响发送前任务取消并入队 map: 重匹配；已发送任务仅计数不动。
+        app.MapPost("/api/v1/products/{id:long}/trace-policy", (HttpContext ctx, long id, IdempotencyExecutor idem, IJobQueue queue) =>
             idem.RunAsync(ctx, async (conn, tx, ct) =>
             {
                 ctx.Request.Body.Position = 0;
@@ -162,7 +162,7 @@ SELECT id,dwbh,name,credit_code,role,ver,mapping_id,mapping_state,is_locked,mapp
                     || string.IsNullOrEmpty(req.ExpectedVersion))
                     return (422, Err(ctx, "VALIDATION", "classification 须为 REQUIRED/EXEMPT，reason 必填且不超过 500 字，expectedVersion 必填"));
                 var prod = await conn.QuerySingleOrDefaultAsync<ProductPolicyRow>(new CommandDefinition(
-                    "SELECT id,org_id,source_system_id,spid,trace_classification,classification_reason,ver FROM dbo.product WITH (UPDLOCK, HOLDLOCK) WHERE id=@id",
+                    "SELECT id,org_id,source_system_id,spid,trace_classification,classification_reason,ver FROM dbo.product WITH (UPDLOCK, HOLDLOCK) WHERE id=@id AND org_id=(SELECT id FROM dbo.organization WHERE is_active=1)",
                     new { id }, tx, cancellationToken: ct));
                 if (prod is null) return (404, Err(ctx, "NOT_FOUND", "商品不存在"));
                 if (!prod.ver.SequenceEqual(RowVer.FromHex(req.ExpectedVersion)))
@@ -171,15 +171,31 @@ SELECT id,dwbh,name,credit_code,role,ver,mapping_id,mapping_state,is_locked,mapp
                 await conn.ExecuteAsync(new CommandDefinition(
                     "UPDATE dbo.product SET trace_classification=@cls, classification_reason=@reason, updated_at=SYSUTCDATETIME() WHERE id=@id",
                     new { id, cls = req.Classification, reason = req.Reason }, tx, cancellationToken: ct));
-                // 经快照→来源行 spid 关联的非终态任务数（终态=Succeeded/Failed，0006 CK_task_state）
-                var affected = await conn.ExecuteScalarAsync<int>(new CommandDefinition(@"
-SELECT COUNT(DISTINCT t.id)
+                var affectedTasks = (await conn.QueryAsync<AffectedTaskRow>(new CommandDefinition(@"
+SELECT DISTINCT t.id, t.env, t.state, t.source_snapshot_id
 FROM dbo.upload_task t
 JOIN dbo.source_snapshot ss ON ss.id=t.source_snapshot_id
 JOIN dbo.source_line sl ON sl.snapshot_id=ss.id
 WHERE ss.org_id=@org AND ss.source_system_id=@sys AND sl.product_source_id=@spid
-  AND t.state NOT IN (N'Succeeded',N'Failed')",
-                    new { org = prod.org_id, sys = prod.source_system_id, spid = prod.spid }, tx, cancellationToken: ct));
+  AND t.state NOT IN (N'Succeeded',N'Failed',N'Cancelled')",
+                    new { org = prod.org_id, sys = prod.source_system_id, spid = prod.spid }, tx, cancellationToken: ct))).ToList();
+                var affected = affectedTasks.Count;
+                var rematchedEnvs = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var t in affectedTasks)
+                {
+                    var sent = await conn.ExecuteScalarAsync<int>(new CommandDefinition(
+                        "SELECT COUNT(*) FROM dbo.upload_attempt WHERE task_id=@taskId AND attempt_kind=N'UPLOAD'",
+                        new { taskId = t.id }, tx, cancellationToken: ct));
+                    if (sent > 0 || (t.state != "Blocked" && t.state != "Ready")) continue; // AT-057：已发送任务冻结不动
+                    await InboundCancelService.CancelPreSendAsync(conn, tx, prod.org_id, t.env, t.source_snapshot_id,
+                        ctx.User.Identity!.Name!, "商品分类变更失效发送前任务", "LIVE", ct);
+                    rematchedEnvs.Add(t.env);
+                }
+                foreach (var e in rematchedEnvs)
+                {
+                    var payload = JsonSerializer.Serialize(new { orgId = prod.org_id, env = e, snapshotId = (long?)null, trigger = "map" });
+                    await queue.EnqueueAsync(conn, tx, prod.org_id, e, "inbound-match", $"map:{Guid.NewGuid():N}", payload, DateTime.UtcNow, ct);
+                }
                 var newVer = await conn.ExecuteScalarAsync<byte[]>(new CommandDefinition(
                     "SELECT ver FROM dbo.product WHERE id=@id", new { id }, tx, cancellationToken: ct));
                 await new AuditLog().AppendAsync(conn, tx, new AuditEntry(ctx.User.Identity!.Name!, "User", "master.classify",
@@ -284,6 +300,98 @@ SELECT @id,supplier_id,enterprise_version_id,N'MANUAL_CONFIRMED',evidence_json,@
                 return (200, JsonSerializer.Serialize(new { data = new { mappingId = id.ToString(), state = "MANUAL_CONFIRMED", version = newVer, mappingVersion = newVersion }, requestId = ctx.TraceIdentifier }));
             })).WithMetadata(new RequirePermissionAttribute(PermissionCatalog.MasterMatch));
 
+        // M2 改绑（R11b）：仅 CONFLICT/REVIEW_REQUIRED/CANDIDATE/UNRESOLVED 可 resolve；
+        // 与 confirm 不同——允许更换平台目标；有效唯一竞态→409 MAPPING_ACTIVE_CONFLICT。
+        app.MapPost("/api/v1/product-mappings/{id:long}/resolve", (HttpContext ctx, long id, IdempotencyExecutor idem) =>
+            idem.RunAsync(ctx, async (conn, tx, ct) =>
+            {
+                ctx.Request.Body.Position = 0;
+                var req = await JsonSerializer.DeserializeAsync<ConfirmMappingRequest>(ctx.Request.Body, Web, ct);
+                if (req is null || string.IsNullOrEmpty(req.TargetId) || string.IsNullOrEmpty(req.ExpectedVersion)
+                    || string.IsNullOrWhiteSpace(req.Reason) || req.Reason.Length > 500)
+                    return (422, Err(ctx, "VALIDATION", "targetId/expectedVersion 必填，reason 必填且不超过 500 字"));
+                var map = await conn.QuerySingleOrDefaultAsync<PMapFull>(new CommandDefinition(@"
+SELECT pm.id, pm.state, pm.version, pm.ver, pd.platform_drug_id AS drug_key
+FROM dbo.product_mapping pm WITH (UPDLOCK, HOLDLOCK)
+JOIN dbo.platform_drug pd ON pd.id=pm.platform_drug_id
+WHERE pm.id=@id", new { id }, tx, cancellationToken: ct));
+                if (map is null) return (404, Err(ctx, "NOT_FOUND", "映射不存在"));
+                if (!map.ver.SequenceEqual(RowVer.FromHex(req.ExpectedVersion)))
+                    throw new SettingVersionException("映射版本冲突，请刷新后重试");
+                if (map.state is not (MappingStates.Conflict or MappingStates.ReviewRequired or MappingStates.Candidate or MappingStates.Unresolved))
+                    return (422, Err(ctx, "STATE_NOT_RESOLVABLE", "仅 CONFLICT/REVIEW_REQUIRED/CANDIDATE/UNRESOLVED 可改绑"));
+                var target = await conn.ExecuteScalarAsync<long?>(new CommandDefinition(
+                    "SELECT id FROM dbo.platform_drug WHERE platform_drug_id=@key", new { key = req.TargetId }, tx, cancellationToken: ct));
+                if (target is null) return (422, Err(ctx, "VALIDATION", "目标平台药不存在"));
+                var actor = ctx.User.Identity!.Name!;
+                try
+                {
+                    await conn.ExecuteAsync(new CommandDefinition(@"
+UPDATE dbo.product_mapping SET platform_drug_id=@target, state=N'MANUAL_CONFIRMED', is_locked=1, confirmed_by=@by, confirmed_at=SYSUTCDATETIME(), version=version+1
+WHERE id=@id", new { id, target, by = actor }, tx, cancellationToken: ct));
+                }
+                catch (SqlException ex) when (ex.Number is 2601 or 2627)
+                {
+                    return (409, Err(ctx, "MAPPING_ACTIVE_CONFLICT", "该平台药已被其他有效映射占用（双向唯一）"));
+                }
+                var (newVer, newVersion) = await ReadMappingVersionAsync(conn, tx, "product_mapping", id, ct);
+                await conn.ExecuteAsync(new CommandDefinition(@"
+INSERT INTO dbo.product_mapping_history(mapping_id,product_id,platform_drug_id,state,rule_version,evidence_json,changed_by,reason)
+SELECT @id,product_id,platform_drug_id,N'MANUAL_CONFIRMED',rule_version,evidence_json,@by,@reason FROM dbo.product_mapping WHERE id=@id",
+                    new { id, by = actor, reason = req.Reason }, tx, cancellationToken: ct));
+                await new AuditLog().AppendAsync(conn, tx, new AuditEntry(actor, "User", "master.mapping.resolve", "product_mapping",
+                    id.ToString(), req.Reason, JsonSerializer.Serialize(new { state = map.state, targetId = map.drug_key }),
+                    JsonSerializer.Serialize(new { state = "MANUAL_CONFIRMED", targetId = req.TargetId }), null, null, "LIVE"));
+                return (200, JsonSerializer.Serialize(new { data = new { mappingId = id.ToString(), state = "MANUAL_CONFIRMED", version = newVer, mappingVersion = newVersion }, requestId = ctx.TraceIdentifier }));
+            })).WithMetadata(new RequirePermissionAttribute(PermissionCatalog.MasterMatch));
+
+        app.MapPost("/api/v1/supplier-mappings/{id:long}/resolve", (HttpContext ctx, long id, IdempotencyExecutor idem) =>
+            idem.RunAsync(ctx, async (conn, tx, ct) =>
+            {
+                ctx.Request.Body.Position = 0;
+                var req = await JsonSerializer.DeserializeAsync<ConfirmMappingRequest>(ctx.Request.Body, Web, ct);
+                if (req is null || string.IsNullOrEmpty(req.TargetId) || string.IsNullOrEmpty(req.ExpectedVersion)
+                    || string.IsNullOrWhiteSpace(req.Reason) || req.Reason.Length > 500)
+                    return (422, Err(ctx, "VALIDATION", "targetId/expectedVersion 必填，reason 必填且不超过 500 字"));
+                var map = await conn.QuerySingleOrDefaultAsync<SMapResolve>(new CommandDefinition(@"
+SELECT sm.id, sm.state, sm.version, sm.ver, s.credit_code AS sup_credit
+FROM dbo.supplier_mapping sm WITH (UPDLOCK, HOLDLOCK)
+JOIN dbo.supplier s ON s.id=sm.supplier_id
+WHERE sm.id=@id", new { id }, tx, cancellationToken: ct));
+                if (map is null) return (404, Err(ctx, "NOT_FOUND", "映射不存在"));
+                if (!map.ver.SequenceEqual(RowVer.FromHex(req.ExpectedVersion)))
+                    throw new SettingVersionException("映射版本冲突，请刷新后重试");
+                if (map.state is not (MappingStates.Conflict or MappingStates.ReviewRequired or MappingStates.Candidate or MappingStates.Unresolved))
+                    return (422, Err(ctx, "STATE_NOT_RESOLVABLE", "仅 CONFLICT/REVIEW_REQUIRED/CANDIDATE/UNRESOLVED 可改绑"));
+                var ev = await conn.QuerySingleOrDefaultAsync<EvResolve>(new CommandDefinition(
+                    "SELECT TOP 1 id, credit_code FROM dbo.platform_enterprise_version WHERE ref_ent_id=@ref ORDER BY observed_at DESC, id DESC",
+                    new { @ref = req.TargetId }, tx, cancellationToken: ct));
+                if (ev is null) return (422, Err(ctx, "VALIDATION", "目标企业不存在"));
+                if (string.IsNullOrEmpty(map.sup_credit) || string.IsNullOrEmpty(ev.credit_code)
+                    || !string.Equals(map.sup_credit, ev.credit_code, StringComparison.Ordinal))
+                    return (422, Err(ctx, "CREDIT_MISMATCH", "统一社会信用代码不一致，禁止改绑"));
+                var actor = ctx.User.Identity!.Name!;
+                try
+                {
+                    await conn.ExecuteAsync(new CommandDefinition(@"
+UPDATE dbo.supplier_mapping SET enterprise_version_id=@ev, state=N'MANUAL_CONFIRMED', is_locked=1, version=version+1
+WHERE id=@id", new { id, ev = ev.id }, tx, cancellationToken: ct));
+                }
+                catch (SqlException ex) when (ex.Number is 2601 or 2627)
+                {
+                    return (409, Err(ctx, "MAPPING_ACTIVE_CONFLICT", "该企业版本已被其他有效映射占用（双向唯一）"));
+                }
+                var (newVer, newVersion) = await ReadMappingVersionAsync(conn, tx, "supplier_mapping", id, ct);
+                await conn.ExecuteAsync(new CommandDefinition(@"
+INSERT INTO dbo.supplier_mapping_history(mapping_id,supplier_id,enterprise_version_id,state,evidence_json,changed_by,reason)
+SELECT @id,supplier_id,enterprise_version_id,N'MANUAL_CONFIRMED',evidence_json,@by,@reason FROM dbo.supplier_mapping WHERE id=@id",
+                    new { id, by = actor, reason = req.Reason }, tx, cancellationToken: ct));
+                await new AuditLog().AppendAsync(conn, tx, new AuditEntry(actor, "User", "master.mapping.resolve", "supplier_mapping",
+                    id.ToString(), req.Reason, JsonSerializer.Serialize(new { state = map.state }),
+                    JsonSerializer.Serialize(new { state = "MANUAL_CONFIRMED", targetId = req.TargetId }), null, null, "LIVE"));
+                return (200, JsonSerializer.Serialize(new { data = new { mappingId = id.ToString(), state = "MANUAL_CONFIRMED", version = newVer, mappingVersion = newVersion }, requestId = ctx.TraceIdentifier }));
+            })).WithMetadata(new RequirePermissionAttribute(PermissionCatalog.MasterMatch));
+
         app.MapPost("/api/v1/product-mappings/{id:long}/disable", (HttpContext ctx, long id, IdempotencyExecutor idem) =>
             idem.RunAsync(ctx, async (conn, tx, ct) =>
             {
@@ -303,7 +411,7 @@ WHERE pm.id=@id", new { id }, tx, cancellationToken: ct));
 SELECT COUNT(DISTINCT t.id) FROM dbo.upload_task t
 JOIN dbo.source_snapshot ss ON ss.id=t.source_snapshot_id
 JOIN dbo.source_line sl ON sl.snapshot_id=ss.id
-WHERE ss.org_id=@org AND ss.source_system_id=@sys AND sl.product_source_id=@spid AND t.state NOT IN (N'Succeeded',N'Failed')",
+WHERE ss.org_id=@org AND ss.source_system_id=@sys AND sl.product_source_id=@spid AND t.state NOT IN (N'Succeeded',N'Failed',N'Cancelled')",
                     new { org = map.org_id, sys = map.source_system_id, spid = map.spid }, tx, cancellationToken: ct));
                 if (inflight > 0) return (409, Err(ctx, "TASKS_IN_FLIGHT", $"存在 {inflight} 个非终态上传任务，禁止解除"));
                 var actor = ctx.User.Identity!.Name!;
@@ -327,15 +435,21 @@ SELECT @id,product_id,platform_drug_id,N'DISABLED',rule_version,evidence_json,@b
                 var req = await JsonSerializer.DeserializeAsync<DisableMappingRequest>(ctx.Request.Body, Web, ct);
                 if (req is null || string.IsNullOrEmpty(req.ExpectedVersion) || string.IsNullOrWhiteSpace(req.Reason) || req.Reason.Length > 500)
                     return (422, Err(ctx, "VALIDATION", "expectedVersion 必填，reason 必填且不超过 500 字"));
-                var map = await conn.QuerySingleOrDefaultAsync<SMapDisable>(new CommandDefinition(
-                    "SELECT id,org_id,state,ver FROM dbo.supplier_mapping WITH (UPDLOCK, HOLDLOCK) WHERE id=@id", new { id }, tx, cancellationToken: ct));
+                var map = await conn.QuerySingleOrDefaultAsync<SMapDisable>(new CommandDefinition(@"
+SELECT sm.id, sm.org_id, sm.state, sm.ver, s.dwbh
+FROM dbo.supplier_mapping sm WITH (UPDLOCK, HOLDLOCK)
+JOIN dbo.supplier s ON s.id=sm.supplier_id
+WHERE sm.id=@id", new { id }, tx, cancellationToken: ct));
                 if (map is null) return (404, Err(ctx, "NOT_FOUND", "映射不存在"));
                 if (!map.ver.SequenceEqual(RowVer.FromHex(req.ExpectedVersion)))
                     throw new SettingVersionException("映射版本冲突，请刷新后重试");
-                // M1 保守守卫：org 下任何在途采购类任务都阻断供应商解除（M2 细化到 dwbh 级关联）
-                var inflight = await conn.ExecuteScalarAsync<int>(new CommandDefinition(
-                    "SELECT COUNT(*) FROM dbo.upload_task WHERE org_id=@org AND task_type IN (N'PURCHASE_IN_102',N'PURCHASE_RETURN_202') AND state NOT IN (N'Succeeded',N'Failed')",
-                    new { org = map.org_id }, tx, cancellationToken: ct));
+                // R11d：守卫细化到 dwbh 级——仅该供应商关联的非终态采购任务阻断解除
+                var inflight = await conn.ExecuteScalarAsync<int>(new CommandDefinition(@"
+SELECT COUNT(*) FROM dbo.upload_task t
+JOIN dbo.inbound_match m ON m.source_snapshot_id=t.source_snapshot_id AND m.org_id=t.org_id AND m.env=t.env
+WHERE t.org_id=@org AND t.task_type IN (N'PURCHASE_IN_102',N'PURCHASE_RETURN_202')
+  AND m.supplier_dwbh=@dwbh AND t.state NOT IN (N'Succeeded',N'Failed',N'Cancelled')",
+                    new { org = map.org_id, dwbh = map.dwbh }, tx, cancellationToken: ct));
                 if (inflight > 0) return (409, Err(ctx, "TASKS_IN_FLIGHT", $"存在 {inflight} 个非终态采购任务，禁止解除"));
                 var actor = ctx.User.Identity!.Name!;
                 await conn.ExecuteAsync(new CommandDefinition(
@@ -368,7 +482,10 @@ SELECT @id,supplier_id,enterprise_version_id,N'DISABLED',evidence_json,@by,@reas
     public sealed record PMapFull(long id, string state, int version, byte[] ver, string drug_key);
     public sealed record SMapFull(long id, string state, int version, byte[] ver, string ent_key);
     public sealed record PMapDisable(long id, long org_id, string state, byte[] ver, string spid, long source_system_id);
-    public sealed record SMapDisable(long id, long org_id, string state, byte[] ver);
+    public sealed record SMapDisable(long id, long org_id, string state, byte[] ver, string dwbh);
+    public sealed record SMapResolve(long id, string state, int version, byte[] ver, string? sup_credit);
+    public sealed record EvResolve(long id, string? credit_code);
+    private sealed record AffectedTaskRow(long id, string env, string state, long source_snapshot_id);
     private sealed record VerRow(byte[] ver, int version);
 
     public sealed record TracePolicyRequest(string? Classification, string? Reason, string? ExpectedVersion);

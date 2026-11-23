@@ -52,6 +52,9 @@ public static class UploadStateMachine
         [(UploadState.ManualAction, UploadEvent.QueryAllSuccess)] = UploadState.Succeeded,
         [(UploadState.ManualAction, UploadEvent.QueryPartial)] = UploadState.PartialSuccess,
         [(UploadState.ManualAction, UploadEvent.QueryFailed)] = UploadState.Failed,
+        // IN-09：从未发起网络调用的冻结任务可原子取消；发送后任何状态不可达 Cancelled
+        [(UploadState.Blocked, UploadEvent.AllocationCancelled)] = UploadState.Cancelled,
+        [(UploadState.Ready, UploadEvent.AllocationCancelled)] = UploadState.Cancelled,
     };
 
     public static IReadOnlyList<(UploadState From, UploadEvent Event, UploadState To)> AllTransitions { get; } =

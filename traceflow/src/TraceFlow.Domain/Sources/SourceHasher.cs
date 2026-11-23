@@ -17,6 +17,10 @@ public static class SourceHasher
         => Sha(Esc(docKey) + "|" + Esc(businessUtc?.ToString("yyyy-MM-ddTHH:mm:ss.fff", CultureInfo.InvariantCulture))
             + "|" + string.Join(";", sortedLineHashes));
 
+    /// <summary>码集摘要（upload_part.code_set_hash）：Ordinal 排序→转义→";" 拼接，顺序无关。</summary>
+    public static string CodeSetHash(IReadOnlyList<string> normalizedCodes)
+        => Sha(string.Join(";", normalizedCodes.OrderBy(c => c, StringComparer.Ordinal).Select(Esc)));
+
     // 自由文本可能含 "|" 或 "\"：先加倍反斜杠再转义竖线，杜绝字段边界挪移碰撞（所有拼接段统一转义）。
     private static string Esc(string? s) => (s ?? "").Replace("\\", "\\\\").Replace("|", "\\|");
 

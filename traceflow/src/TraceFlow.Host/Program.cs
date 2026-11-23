@@ -9,6 +9,7 @@ using TraceFlow.Infrastructure.Security;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Host.UseWindowsService();
+builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 104_857_600); // 100 MiB，与 import.maxFileBytes 上界一致（R11e）
 
 if (args.Contains("--init-admin"))
     return await AdminInitializer.RunAsync(args, builder.Configuration);
@@ -41,6 +42,33 @@ builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Jo
 var sourceMode = builder.Configuration["TraceFlow:SourceMode"] ?? "fixture";
 builder.Services.AddSingleton<ISourceAdapter>(TraceFlow.Infrastructure.Sources.SourceAdapterFactory.Create(
     sourceMode, Path.Combine(AppContext.BaseDirectory, "fixtures", "ksoa")));
+var topMode = builder.Configuration["TraceFlow:TopMode"] ?? "fixture";
+builder.Services.AddSingleton<ITopGateway>(TraceFlow.Infrastructure.Top.TopGatewayFactory.Create(
+    topMode, Path.Combine(AppContext.BaseDirectory, "fixtures", "top")));
+builder.Services.AddSingleton<TraceFlow.Infrastructure.Top.RateBudgetService>();
+builder.Services.AddSingleton<TraceFlow.Infrastructure.Top.ChannelPauseService>();
+builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Top.TopClientService(
+    connectionString, sp.GetRequiredService<ITopGateway>(),
+    sp.GetRequiredService<TraceFlow.Infrastructure.Top.RateBudgetService>(),
+    sp.GetRequiredService<TraceFlow.Infrastructure.Top.ChannelPauseService>(),
+    sp.GetRequiredService<IAuditLog>()));
+builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Upstream.UpstreamDownloadService(
+    connectionString, sp.GetRequiredService<TraceFlow.Infrastructure.Top.TopClientService>(),
+    sp.GetRequiredService<IJobQueue>(), sp.GetRequiredService<IAuditLog>()));
+builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Jobs.UpstreamDownloadJobHandler(
+    sp.GetRequiredService<TraceFlow.Infrastructure.Upstream.UpstreamDownloadService>()));
+builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Upstream.EnterpriseSyncService(
+    connectionString, sp.GetRequiredService<TraceFlow.Infrastructure.Top.TopClientService>(), sp.GetRequiredService<IAuditLog>()));
+builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Jobs.EnterpriseSyncJobHandler(
+    sp.GetRequiredService<TraceFlow.Infrastructure.Upstream.EnterpriseSyncService>()));
+builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Inbound.InboundTaskFactory(
+    sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(), sp.GetRequiredService<IJobQueue>()));
+builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Inbound.InboundMatchService(
+    connectionString, sp.GetRequiredService<TraceFlow.Infrastructure.Inbound.InboundTaskFactory>(), sp.GetRequiredService<IAuditLog>()));
+builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Jobs.InboundMatchJobHandler(
+    sp.GetRequiredService<TraceFlow.Infrastructure.Inbound.InboundMatchService>()));
+builder.Services.AddSingleton<TraceFlow.Infrastructure.Inbound.AllocationService>(sp =>
+    new TraceFlow.Infrastructure.Inbound.AllocationService(sp.GetRequiredService<IAuditLog>()));
 builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Sources.SyncScheduler(
     connectionString, sp.GetRequiredService<IJobQueue>(),
     sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(), env));
@@ -98,10 +126,12 @@ if (!workerOnly)
     });
     app.MapAuthEndpoints(connectionString);
     app.MapAdminEndpoints(connectionString);
-    app.MapSettingsEndpoints(connectionString);
+    app.MapSettingsEndpoints(connectionString, env);
     app.MapImportEndpoints(connectionString, env);
     app.MapMasterEndpoints(connectionString);
     app.MapOpsEndpoints(connectionString, env);
+    app.MapInboundEndpoints(connectionString, env);
+    app.MapUpstreamEndpoints(connectionString, env);
     app.MapDashboardEndpoints(connectionString, env);
     app.MapHealthEndpoints(connectionString, env);
     app.MapFallbackToFile("index.html");

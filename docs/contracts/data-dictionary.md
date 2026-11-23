@@ -51,6 +51,20 @@
 
 CodeFormat token 映射由 `TraceFlow.Domain.Codes.CodeFormatStorage` 统一（禁 enum.ToString 落库）；rowversion 经 `TraceFlow.Domain.Versioning.RowVer.ToHex/FromHex`（16 位大写 hex）。
 
+## 0008 迁移增量（M2，`0008_m2_upstream_allocation.sql`）
+
+不修改 0001–0007 任何字节；0008 以 CREATE/ALTER 增量演进：
+
+| 对象 | 变更 | 用途/约束 |
+| --- | --- | --- |
+| inbound_match | 新表 | 入库单匹配维度（IN-01..09）：`UQ_inbound_match`(org_id,env,source_snapshot_id)；match_state CHECK NOT_REQUIRED/UNMATCHED/PARTIAL/AMBIGUOUS/CONFLICT/COMPLETE；version int 乐观锁（AT-067）；supplier_dwbh BIN2 NULL；evidence_json 留证 |
+| top_rate_budget | 新表 | 持久限流预算（JOB-03/05）：`UQ_rate_budget`(env,budget_key BIN2)；日/分/秒计数+窗口起点+next_allowed_at；limit NULL=本地不设帽（G-TOP 取证前不猜平台限值）；重启不清零 |
+| top_channel_pause | 新表 | 授权范围暂停（FAIL_BIZ_AUTH_ERROR→按接口/主体/凭证暂停）：`UX_pause_active`(env,scope_key) WHERE is_active=1；恢复须人工动作留 resumed_by |
+| download_progress.window_start/window_end | datetime2(3) NULL | 上游下载按窗口记录列表/详情分页进度（SYNC-03/04；详情未全部成功不得 COMPLETE） |
+| upload_task.CK_task_state / upload_part.CK_part_state | CHECK 增加 N'Cancelled' | 行政终态（IN-09）：仅 (Blocked|Ready, AllocationCancelled)→Cancelled；任何 UPLOAD 尝试后不可达；不计入平台成功/失败口径 |
+
+Cancelled 为纯本地行政终态，非平台状态；`UploadStateMachine` 仅增两条边（UploadStateMachineTests 全边覆盖含新边）。
+
 ## 环境隔离（Live/Mock）
 
 `upstream_bill`、`download_progress`、`code_event`、`code_claim`、`inbound_allocation`、`verification`、`upload_task`、`upload_part`、`upload_attempt`、`outbox_job`、`reconciliation_run`、`audit_log` 均含 `env` 列（LIVE/MOCK，多数有 CHECK）；Mock 与 Live 数据互不串扰（CodeConstraintTests.Mock_and_live_claims_isolated、UploadConstraintTests.Mock_task_with_same_event_key_isolated、JobQueueTests.Claim_only_returns_jobs_of_requested_env）。宿主配置 `TraceFlow:Env` 大小写不敏感、启动规范化为 LIVE/MOCK（默认 MOCK；非法值启动失败），LIVE 须门禁后显式开启。

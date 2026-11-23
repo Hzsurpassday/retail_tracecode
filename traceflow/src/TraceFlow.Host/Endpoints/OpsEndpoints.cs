@@ -19,8 +19,8 @@ public static class OpsEndpoints
             {
                 ctx.Request.Body.Position = 0;
                 var req = await JsonSerializer.DeserializeAsync<SyncJobRequest>(ctx.Request.Body, Web, ct);
-                if (req is null || req.Entity is not ("sale" or "purchase-in"))
-                    return Err(ctx, 422, "VALIDATION", "entity 须为 sale 或 purchase-in");
+                if (req is null || req.Entity is not ("sale" or "purchase-in" or "upstream" or "enterprise"))
+                    return Err(ctx, 422, "VALIDATION", "entity 须为 sale/purchase-in/upstream/enterprise");
                 var start = NormalizeUtc(req.Start);
                 var end = NormalizeUtc(req.End);
                 var now = DateTime.UtcNow;
@@ -31,14 +31,19 @@ public static class OpsEndpoints
                 if ((end - start).TotalDays > 90)
                     return Err(ctx, 422, "VALIDATION", "手动窗口不得超过 90 天");
                 if (env != "MOCK")
-                    return Err(ctx, 422, "ERP_NOT_CERTIFIED", "LIVE 通道须 G-ERP 取证门禁通过后开启");
+                    return Err(ctx, 422, req.Entity is "upstream" or "enterprise" ? "TOP_NOT_CERTIFIED" : "ERP_NOT_CERTIFIED",
+                        req.Entity is "upstream" or "enterprise" ? "LIVE 通道须 G-TOP 取证门禁通过后开启" : "LIVE 通道须 G-ERP 取证门禁通过后开启");
                 if (await settings.IsChannelPausedAsync(ct))
                     return Err(ctx, 422, "CHANNEL_PAUSED", "同步通道已暂停，请先恢复");
                 var orgId = await conn.ExecuteScalarAsync<long>(new CommandDefinition(
                     "SELECT id FROM dbo.organization WHERE is_active=1", transaction: tx, cancellationToken: ct));
-                var intent = $"manual:{req.Entity}:{start:yyyyMMddHHmmss}:{end:yyyyMMddHHmmss}";
-                var payload = JsonSerializer.Serialize(new { orgId, env, entity = req.Entity, trigger = "manual", startUtc = start, endUtc = end });
-                var jobId = await queue.EnqueueAsync(conn, tx, orgId, env, "source-sync", intent, payload, now, ct);
+                var jobKind = req.Entity switch { "upstream" => "upstream-download", "enterprise" => "enterprise-sync", _ => "source-sync" };
+                // upstream/enterprise 手动意图含 nonce：同窗口补拉不被 DONE 终态挡死（幂等由 Idempotency-Key 层保证）
+                var intent = req.Entity is "upstream" or "enterprise"
+                    ? $"manual:{req.Entity}:{start:yyyyMMddHHmmss}:{end:yyyyMMddHHmmss}:{Guid.NewGuid():N}"
+                    : $"manual:{req.Entity}:{start:yyyyMMddHHmmss}:{end:yyyyMMddHHmmss}";
+                var payload = JsonSerializer.Serialize(new { orgId, env, entity = req.Entity, trigger = "manual", startUtc = start, endUtc = end, start, end });
+                var jobId = await queue.EnqueueAsync(conn, tx, orgId, env, jobKind, intent, payload, now, ct);
                 await audit.AppendAsync(conn, tx, new AuditEntry(ctx.User.Identity!.Name!, "User", "sync.manual",
                     "outbox_job", jobId.ToString(), null, null,
                     JsonSerializer.Serialize(new { entity = req.Entity, start, end }), ctx.TraceIdentifier, null, "LIVE"));

@@ -15,6 +15,7 @@ export default function SuppliersPage() {
   const [error, setError] = useState('');
   const [confirmTarget, setConfirmTarget] = useState<Supplier | null>(null);
   const [disableTarget, setDisableTarget] = useState<Supplier | null>(null);
+  const [resolveTarget, setResolveTarget] = useState<Supplier | null>(null);
   // 请求序号守卫：每次 load 递增；await 后若已有更新的请求则丢弃本次结果，防止旧响应覆盖新数据
   const seqRef = useRef(0);
 
@@ -59,6 +60,8 @@ export default function SuppliersPage() {
                   <td>{s.mapping?.auditStatus ?? '—'}</td>
                   <td style={{ whiteSpace: 'nowrap' }}>
                     {s.mapping && s.mappingState !== 'DISABLED' && <button onClick={() => setConfirmTarget(s)}>确认映射</button>}{' '}
+                    {s.mapping && ['CONFLICT', 'REVIEW_REQUIRED', 'CANDIDATE', 'UNRESOLVED'].includes(s.mappingState) &&
+                      <button onClick={() => setResolveTarget(s)}>改绑</button>}{' '}
                     {s.mapping && (s.mappingState === 'AUTO_CONFIRMED' || s.mappingState === 'MANUAL_CONFIRMED') &&
                       <button onClick={() => setDisableTarget(s)}>解除</button>}
                   </td>
@@ -75,6 +78,7 @@ export default function SuppliersPage() {
       )}
       {confirmTarget && confirmTarget.mapping && <ConfirmDialog supplier={confirmTarget} onClose={() => setConfirmTarget(null)} onDone={() => { setConfirmTarget(null); void load(); }} />}
       {disableTarget && disableTarget.mapping && <DisableDialog supplier={disableTarget} onClose={() => setDisableTarget(null)} onDone={() => { setDisableTarget(null); void load(); }} />}
+      {resolveTarget && resolveTarget.mapping && <ResolveDialog supplier={resolveTarget} onClose={() => setResolveTarget(null)} onDone={() => { setResolveTarget(null); void load(); }} />}
     </section>
   );
 }
@@ -115,6 +119,38 @@ function ConfirmDialog({ supplier, onClose, onDone }: { supplier: Supplier; onCl
         <textarea value={reason} onChange={(e) => setReason(e.target.value)} maxLength={500} rows={2} style={{ width: '100%', marginTop: 8 }} placeholder="确认理由（必填）" />
         {error && <p role="alert">{error}</p>}
         <div style={{ marginTop: 8 }}><button disabled={busy} onClick={submit}>确认（锁定）</button> <button onClick={onClose}>取消</button></div>
+      </div>
+    </div>
+  );
+}
+
+function ResolveDialog({ supplier, onClose, onDone }: { supplier: Supplier; onClose: () => void; onDone: () => void }) {
+  const m = supplier.mapping!;
+  const [targetId, setTargetId] = useState(m.refEntId);
+  const [reason, setReason] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  async function submit() {
+    if (!targetId.trim()) { setError('请填写目标 ref_ent_id'); return; }
+    if (!reason.trim()) { setError('请填写改绑理由'); return; }
+    setBusy(true); setError('');
+    try {
+      await api(`/api/v1/supplier-mappings/${m.mappingId}/resolve`, {
+        method: 'POST', headers: idem(),
+        body: JSON.stringify({ targetId: targetId.trim(), expectedVersion: m.version, reason }),
+      });
+      onDone();
+    } catch (e) { setError(errMsg(e)); setBusy(false); }
+  }
+  return (
+    <div style={overlay}>
+      <div style={panel}>
+        <h3>改绑供应商映射 · {supplier.name}</h3>
+        <p>当前状态 {m.state} · 当前 ref_ent_id {m.refEntId}。改绑目标为同一 ref_ent_id 的最新企业版本；<strong>统一社会信用代码必须精确一致</strong>（否则 422 CREDIT_MISMATCH）；成功后锁定 MANUAL_CONFIRMED。</p>
+        <input value={targetId} onChange={(e) => setTargetId(e.target.value)} style={{ width: '100%' }} placeholder="目标 ref_ent_id（稳定主体键）" />
+        <textarea value={reason} onChange={(e) => setReason(e.target.value)} maxLength={500} rows={2} style={{ width: '100%', marginTop: 8 }} placeholder="改绑理由（必填，留审计）" />
+        {error && <p role="alert">{error}</p>}
+        <div style={{ marginTop: 8 }}><button disabled={busy} onClick={submit}>改绑（锁定）</button> <button onClick={onClose}>取消</button></div>
       </div>
     </div>
   );

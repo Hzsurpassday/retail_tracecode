@@ -19,6 +19,7 @@ export default function ProductsPage() {
   const [classifyTarget, setClassifyTarget] = useState<Product | null>(null);
   const [confirmTarget, setConfirmTarget] = useState<Product | null>(null);
   const [disableTarget, setDisableTarget] = useState<Product | null>(null);
+  const [resolveTarget, setResolveTarget] = useState<Product | null>(null);
   // 请求序号守卫：每次 load 递增；await 后若已有更新的请求则丢弃本次结果，防止旧响应覆盖新数据
   const seqRef = useRef(0);
 
@@ -71,6 +72,8 @@ export default function ProductsPage() {
                   <td style={{ whiteSpace: 'nowrap' }}>
                     <button onClick={() => setClassifyTarget(p)}>分类</button>{' '}
                     {p.mapping && p.mappingState !== 'DISABLED' && <button onClick={() => setConfirmTarget(p)}>确认映射</button>}{' '}
+                    {p.mapping && ['CONFLICT', 'REVIEW_REQUIRED', 'CANDIDATE', 'UNRESOLVED'].includes(p.mappingState) &&
+                      <button onClick={() => setResolveTarget(p)}>改绑</button>}{' '}
                     {p.mapping && (p.mappingState === 'AUTO_CONFIRMED' || p.mappingState === 'MANUAL_CONFIRMED') &&
                       <button onClick={() => setDisableTarget(p)}>解除</button>}
                   </td>
@@ -88,6 +91,7 @@ export default function ProductsPage() {
       {classifyTarget && <ClassifyDialog product={classifyTarget} onClose={() => setClassifyTarget(null)} onDone={() => { setClassifyTarget(null); void load(); }} />}
       {confirmTarget && confirmTarget.mapping && <ConfirmDialog product={confirmTarget} onClose={() => setConfirmTarget(null)} onDone={() => { setConfirmTarget(null); void load(); }} />}
       {disableTarget && disableTarget.mapping && <DisableDialog product={disableTarget} onClose={() => setDisableTarget(null)} onDone={() => { setDisableTarget(null); void load(); }} />}
+      {resolveTarget && resolveTarget.mapping && <ResolveDialog product={resolveTarget} onClose={() => setResolveTarget(null)} onDone={() => { setResolveTarget(null); void load(); }} />}
     </section>
   );
 }
@@ -173,6 +177,38 @@ function ConfirmDialog({ product, onClose, onDone }: { product: Product; onClose
         <textarea value={reason} onChange={(e) => setReason(e.target.value)} maxLength={500} rows={2} style={{ width: '100%', marginTop: 8 }} placeholder="确认理由（必填）" />
         {error && <p role="alert">{error}</p>}
         <div style={{ marginTop: 8 }}><button disabled={busy} onClick={submit}>确认（锁定）</button> <button onClick={onClose}>取消</button></div>
+      </div>
+    </div>
+  );
+}
+
+function ResolveDialog({ product, onClose, onDone }: { product: Product; onClose: () => void; onDone: () => void }) {
+  const m = product.mapping!;
+  const [targetId, setTargetId] = useState(m.platformDrugId);
+  const [reason, setReason] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  async function submit() {
+    if (!targetId.trim()) { setError('请填写目标平台药 ID'); return; }
+    if (!reason.trim()) { setError('请填写改绑理由'); return; }
+    setBusy(true); setError('');
+    try {
+      await api(`/api/v1/product-mappings/${m.mappingId}/resolve`, {
+        method: 'POST', headers: idem(),
+        body: JSON.stringify({ targetId: targetId.trim(), expectedVersion: m.version, reason }),
+      });
+      onDone();
+    } catch (e) { setError(errMsg(e)); setBusy(false); }
+  }
+  return (
+    <div style={overlay}>
+      <div style={panel}>
+        <h3>改绑映射 · {product.name}</h3>
+        <p>当前状态 {m.state} · 当前平台药 {m.platformDrugId}。改绑成功后锁定为 MANUAL_CONFIRMED；目标已被其他有效映射占用时返回 409（双向唯一）。</p>
+        <input value={targetId} onChange={(e) => setTargetId(e.target.value)} style={{ width: '100%' }} placeholder="目标平台药 platform_drug_id" />
+        <textarea value={reason} onChange={(e) => setReason(e.target.value)} maxLength={500} rows={2} style={{ width: '100%', marginTop: 8 }} placeholder="改绑理由（必填，留审计）" />
+        {error && <p role="alert">{error}</p>}
+        <div style={{ marginTop: 8 }}><button disabled={busy} onClick={submit}>改绑（锁定）</button> <button onClick={onClose}>取消</button></div>
       </div>
     </div>
   );
