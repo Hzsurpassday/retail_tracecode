@@ -31,3 +31,8 @@ export interface JobStatus {
   jobId: string; jobKind: string; intentKey: string; jobState: string; attemptCount: number;
   nextRunAtUtc: string; lastError: string | null; leaseOwner: string | null; fencingToken: number;
 }
+export interface SettingView {
+  id: number; key: string; valueJson: string | null; isSecret: boolean; hasSecretValue: boolean;
+  version: string; updatedBy: string | null; updatedAtUtc: string | null; reason: string | null;
+}
+export interface ConnectionTestResult { ok: boolean; message: string; }

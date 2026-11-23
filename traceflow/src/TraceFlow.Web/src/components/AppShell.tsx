@@ -7,7 +7,7 @@ const NAV = [
   { to: '/', label: '工作台', ready: true },
   { to: '/products', label: '商品映射', ready: true },
   { to: '/imports', label: '主数据导入', ready: true },
-  { to: '/suppliers', label: '供应商映射', ready: false },
+  { to: '/suppliers', label: '供应商映射', ready: true },
   { to: '/upstream', label: '上游出库单', ready: false },
   { to: '/inbounds', label: '入库关联', ready: false },
   { to: '/sales', label: 'POS 销售', ready: false },
@@ -15,7 +15,7 @@ const NAV = [
   { to: '/codes', label: '码台账', ready: false },
   { to: '/uploads', label: '上报对账', ready: false },
   { to: '/exceptions', label: '人工补配与异常', ready: false },
-  { to: '/settings', label: '设置', ready: false },
+  { to: '/settings', label: '设置', ready: true },
   { to: '/audit', label: '审计', ready: false },
 ];
 
@@ -24,12 +24,17 @@ export default function AppShell({ session, onLoggedOut, children }: {
 }) {
   const [env, setEnv] = useState('');
   useEffect(() => {
-    api<{ env: string }>('/api/v1/health').then((h) => setEnv(h.env)).catch(() => setEnv('?'));
+    let active = true;
+    api<{ env: string }>('/api/v1/health')
+      .then((h) => { if (active) setEnv(h.env); })
+      .catch(() => { if (active) setEnv('?'); });
+    return () => { active = false; };
   }, []);
 
   async function handleLogout() {
-    await api('/api/v1/auth/logout', { method: 'POST' });
-    await onLoggedOut();
+    try { await api('/api/v1/auth/logout', { method: 'POST' }); }
+    catch { /* 登出请求失败也回到登录页 */ }
+    finally { await onLoggedOut(); }
   }
 
   return (
