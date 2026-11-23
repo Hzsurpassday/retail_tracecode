@@ -50,9 +50,32 @@ public static class SettingsEndpoints
         app.MapGet("/api/v1/top-budgets", async (HttpContext ctx, ChannelPauseService pauses) =>
         {
             await using var conn = new SqlConnection(connectionString);
-            var budgets = await conn.QueryAsync<BudgetRow>(new CommandDefinition(
-                "SELECT budget_key AS budgetKey, day_count AS dayCount, day_limit AS dayLimit, minute_count AS minuteCount, minute_limit AS minuteLimit, second_count AS secondCount, second_limit AS secondLimit, next_allowed_at AS nextAllowedAtUtc FROM dbo.top_rate_budget WHERE env=@env ORDER BY budget_key",
+            var rows = await conn.QueryAsync<BudgetRow>(new CommandDefinition(
+                "SELECT budget_key AS budgetKey, day_count AS dayCount, day_window_start AS dayWindowStart, day_limit AS dayLimit, minute_count AS minuteCount, minute_window_start AS minuteWindowStart, minute_limit AS minuteLimit, second_count AS secondCount, second_window_start AS secondWindowStart, second_limit AS secondLimit, next_allowed_at AS nextAllowedAtUtc FROM dbo.top_rate_budget WHERE env=@env ORDER BY budget_key",
                 new { env }, cancellationToken: ctx.RequestAborted));
+            // 读时评估有效用量（只读）：与 RateBudgetService.Roll 同规则，窗口起点缺失或已过期 → 计数视为 0、窗口起点为空；
+            // 否则会把「下次获取必然被清零」的陈旧计数当成当前用量展示。库内计数原样保留，仍由获取路径推进。
+            var nowUtc = DateTime.UtcNow;
+            var budgets = rows.Select(b =>
+            {
+                var dayActive = WindowActive(b.dayWindowStart, nowUtc, TimeSpan.FromDays(1));
+                var minuteActive = WindowActive(b.minuteWindowStart, nowUtc, TimeSpan.FromMinutes(1));
+                var secondActive = WindowActive(b.secondWindowStart, nowUtc, TimeSpan.FromSeconds(1));
+                return new
+                {
+                    budgetKey = b.budgetKey,
+                    dayCount = dayActive ? b.dayCount : 0,
+                    dayWindowStart = dayActive ? b.dayWindowStart : null,
+                    dayLimit = b.dayLimit,
+                    minuteCount = minuteActive ? b.minuteCount : 0,
+                    minuteWindowStart = minuteActive ? b.minuteWindowStart : null,
+                    minuteLimit = b.minuteLimit,
+                    secondCount = secondActive ? b.secondCount : 0,
+                    secondWindowStart = secondActive ? b.secondWindowStart : null,
+                    secondLimit = b.secondLimit,
+                    nextAllowedAtUtc = b.nextAllowedAtUtc,
+                };
+            }).ToList();
             var pauseList = await pauses.ListAsync(conn, env, ctx.RequestAborted);
             // M2 约定：实体 id 以字符串出网（PauseView.Id 为 bigint）
             return Results.Json(new { data = new { budgets, pauses = pauseList.Select(p => new { id = p.Id.ToString(),
@@ -64,14 +87,21 @@ public static class SettingsEndpoints
     public sealed record SettingUpdateRequest(string? ValueJson, string? SecretValue, string? ExpectedVersion, string? Reason);
     public sealed record ConnectionTestRequest(long ConfigId);
 
+    // 与 RateBudgetService.Roll 同规则：仅当 now < start + period 才算当前窗口（相等即过期）。
+    private static bool WindowActive(DateTime? start, DateTime nowUtc, TimeSpan period)
+        => start is DateTime s && nowUtc < s + period;
+
     private sealed class BudgetRow
     {
         public string budgetKey { get; set; } = "";
         public int dayCount { get; set; }
+        public DateTime? dayWindowStart { get; set; }
         public int? dayLimit { get; set; }
         public int minuteCount { get; set; }
+        public DateTime? minuteWindowStart { get; set; }
         public int? minuteLimit { get; set; }
         public int secondCount { get; set; }
+        public DateTime? secondWindowStart { get; set; }
         public int? secondLimit { get; set; }
         public DateTime? nextAllowedAtUtc { get; set; }
     }

@@ -84,9 +84,10 @@ IF NOT EXISTS (SELECT 1 FROM dbo.user_permission WHERE user_id=@id AND permissio
     public async Task Top_budgets_endpoint_lists_usage_and_pauses()
     {
         await using var c = await _fx.OpenAsync();
+        // 三个窗口起点都设为 now：计数属当前窗口，端点的读时评估须原样报出（起点缺失=过期，会被视为 0）
         await c.ExecuteAsync(@"
-INSERT INTO dbo.top_rate_budget(env,budget_key,day_count,minute_count,second_count)
-VALUES(N'MOCK',N'appkey:total',3,1,0)");
+INSERT INTO dbo.top_rate_budget(env,budget_key,day_count,day_window_start,minute_count,minute_window_start,second_count,second_window_start)
+VALUES(N'MOCK',N'appkey:total',3,@now,1,@now,0,@now)", new { now = DateTime.UtcNow });
         await c.ExecuteAsync(@"
 INSERT INTO dbo.top_channel_pause(env,scope_key,reason,paused_by)
 VALUES(N'MOCK',N'appkey:total',N'限流暂停',N'test')");
@@ -101,6 +102,44 @@ VALUES(N'MOCK',N'appkey:total',N'限流暂停',N'test')");
         var pause = body.Data.Pauses.Single(p => p.ScopeKey == "appkey:total");
         Assert.True(pause.IsActive);
         Assert.True(long.TryParse(pause.Id, out var pauseId) && pauseId > 0);
+    }
+
+    [Fact]
+    public async Task Top_budgets_reports_effective_usage_not_stale_counters()
+    {
+        await using var c = await _fx.OpenAsync();
+        var nowUtc = DateTime.UtcNow;
+        // 过期窗口：day_window_start 早于 now-1d → RateBudgetService.Roll 下次获取时必然把 day_count 清零
+        await c.ExecuteAsync(@"
+INSERT INTO dbo.top_rate_budget(env,budget_key,day_count,day_window_start)
+VALUES(N'MOCK',N'appkey:stale-day',5,@staleDay)", new { staleDay = nowUtc.AddDays(-1).AddMinutes(-5) });
+        // 有效窗口：minute_window_start = now → 计数仍属当前窗口，须原样报出
+        await c.ExecuteAsync(@"
+INSERT INTO dbo.top_rate_budget(env,budget_key,minute_count,minute_window_start)
+VALUES(N'MOCK',N'appkey:fresh-minute',3,@now)", new { now = nowUtc });
+
+        var client = await LoginAsync();
+        var resp = await client.GetAsync("/api/v1/top-budgets");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var body = await resp.Content.ReadFromJsonAsync<BudgetResp>();
+
+        var stale = body!.Data.Budgets.Single(b => b.BudgetKey == "appkey:stale-day");
+        Assert.Equal(0, stale.DayCount);              // 有效用量为 0，而非库里的 5
+        Assert.Null(stale.DayWindowStart);            // 过期窗口未开启：起点为空
+        Assert.Equal(0, stale.MinuteCount);
+        Assert.Equal(0, stale.SecondCount);
+
+        var fresh = body.Data.Budgets.Single(b => b.BudgetKey == "appkey:fresh-minute");
+        Assert.Equal(3, fresh.MinuteCount);
+        Assert.NotNull(fresh.MinuteWindowStart);      // 有效窗口回报其起点
+
+        // 只读：端点不得改库（陈旧计数原样保留，由获取路径负责清零）
+        var storedDay = await c.ExecuteScalarAsync<int>(
+            "SELECT day_count FROM dbo.top_rate_budget WHERE env=N'MOCK' AND budget_key=N'appkey:stale-day'");
+        Assert.Equal(5, storedDay);
+        var storedStart = await c.ExecuteScalarAsync<DateTime?>(
+            "SELECT day_window_start FROM dbo.top_rate_budget WHERE env=N'MOCK' AND budget_key=N'appkey:fresh-minute'");
+        Assert.Null(storedStart); // 新鲜行的 day 窗口未被写入
     }
 
     private async Task<string> VersionAsync(HttpClient client, string key)
@@ -180,7 +219,9 @@ VALUES(N'MOCK',N'appkey:total',N'限流暂停',N'test')");
     private sealed record AccountData(string ServiceAccount, string MachineName);
     private sealed record BudgetResp(BudgetData Data);
     private sealed record BudgetData(BudgetRow[] Budgets, PauseRow[] Pauses);
-    private sealed record BudgetRow(string BudgetKey, int DayCount, int? DayLimit, int MinuteCount, int? MinuteLimit, int SecondCount, int? SecondLimit, DateTime? NextAllowedAtUtc);
+    private sealed record BudgetRow(string BudgetKey, int DayCount, DateTime? DayWindowStart, int? DayLimit,
+        int MinuteCount, DateTime? MinuteWindowStart, int? MinuteLimit, int SecondCount, DateTime? SecondWindowStart,
+        int? SecondLimit, DateTime? NextAllowedAtUtc);
     private sealed record PauseRow(string Id, string ScopeKey, bool IsActive);
     private sealed record SettingsListResp(SettingRow[] Data);
     private sealed record SettingRow(long Id, string Key, string? ValueJson, string Version);
