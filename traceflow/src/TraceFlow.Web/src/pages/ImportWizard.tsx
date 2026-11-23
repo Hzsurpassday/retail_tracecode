@@ -39,6 +39,12 @@ export default function ImportWizard() {
     } catch (e) { setError(errMsg(e)); }
   }
 
+  // 拉取批次详情并进入预览（正常暂存完成与 jobId="0" 复用同一路径）；失败由 upload 的 catch 统一处理
+  async function showPreview(batchId: string) {
+    const d = await api<ImportDetail>(`/api/v1/imports/${batchId}?page=1&pageSize=50`);
+    setBatch(d.batch); setDetail(d); setPhase('preview');
+  }
+
   async function upload() {
     if (!file) { setError('请先选择 CSV 文件'); return; }
     setPhase('staging'); setError('');
@@ -47,6 +53,9 @@ export default function ImportWizard() {
         method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() },
         body: JSON.stringify({ fileKind: kind, fileHash: file.hash, content: file.content, fileName: file.name }),
       });
+      // 同 (org,fileKind,fileHash) 批次已处于 COMMITTED/FAILED：后端不产生作业（jobId="0"），
+      // 跳过轮询直接展示既有批次详情（含 ERROR 行预览；提交按钮仍按 status==='STAGED' 门禁）
+      if (accepted.jobId === '0') { await showPreview(accepted.batchId); return; }
       // 轮询暂存作业至终态（DONE/FAILED/CANCELLED），最多 60 次 × 1s
       let job: JobStatus | null = null;
       for (let i = 0; i < 60; i++) {
@@ -56,8 +65,7 @@ export default function ImportWizard() {
       }
       if (!job || job.jobState !== 'DONE') { setError(`暂存未完成：${job?.jobState ?? '超时'} ${job?.lastError ?? ''}`); setPhase('select'); return; }
       const b = await api<ImportBatch>(`/api/v1/imports?fileKind=${kind}&fileHash=${file.hash}`);
-      const d = await api<ImportDetail>(`/api/v1/imports/${b.batchId}?page=1&pageSize=50`);
-      setBatch(b); setDetail(d); setPhase('preview');
+      await showPreview(b.batchId);
     } catch (e) { setError(errMsg(e)); setPhase('select'); }
   }
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type CSSProperties } from 'react';
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
 import { api, ApiError } from '../api';
 import type { Page, Product } from '../m1types';
 
@@ -19,14 +19,23 @@ export default function ProductsPage() {
   const [classifyTarget, setClassifyTarget] = useState<Product | null>(null);
   const [confirmTarget, setConfirmTarget] = useState<Product | null>(null);
   const [disableTarget, setDisableTarget] = useState<Product | null>(null);
+  // 请求序号守卫：每次 load 递增；await 后若已有更新的请求则丢弃本次结果，防止旧响应覆盖新数据
+  const seqRef = useRef(0);
 
   const load = useCallback(async () => {
+    const seq = ++seqRef.current;
     const qs = new URLSearchParams({ page: String(page), pageSize: String(PAGE_SIZE) });
     if (keyword.trim()) qs.set('keyword', keyword.trim());
     if (classification !== 'ALL') qs.set('classification', classification);
     if (mappingState !== 'ALL') qs.set('mappingState', mappingState);
-    try { setData(await api<Page<Product>>(`/api/v1/products?${qs.toString()}`)); setError(''); }
-    catch (e) { setError(errMsg(e)); }
+    try {
+      const res = await api<Page<Product>>(`/api/v1/products?${qs.toString()}`);
+      if (seq !== seqRef.current) return;
+      setData(res); setError('');
+    } catch (e) {
+      if (seq !== seqRef.current) return;
+      setError(errMsg(e));
+    }
   }, [keyword, classification, mappingState, page]);
 
   useEffect(() => { let active = true; (async () => { if (active) await load(); })(); return () => { active = false; }; }, [load]);
