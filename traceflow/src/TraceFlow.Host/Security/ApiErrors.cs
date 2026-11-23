@@ -20,6 +20,9 @@ public static class ApiErrors
             TopNotCertifiedException => (422, "TOP_NOT_CERTIFIED", false),
             AllocationConflictException => (409, "ALLOCATION_CONFLICT", false),
             AllocationValidationException => (422, "ALLOCATION_INVALID", false),
+            // M3 UI-06/07/09：未知资源 404；受控重试合同门禁 422（拒绝即零写入，见 UploadManualService）
+            ResourceNotFoundException => (404, "NOT_FOUND", false),
+            RetryPathNotCertifiedException => (422, "RETRY_PATH_NOT_CERTIFIED", false),
             FormatException => (422, "VALIDATION", false), // RowVer.FromHex 等格式校验（全局约束：FormatException→端点 422）
             Microsoft.AspNetCore.Antiforgery.AntiforgeryValidationException => (400, "CSRF_INVALID", false),
             BadHttpRequestException => (400, "BAD_REQUEST", false),
@@ -42,7 +45,8 @@ public static class ApiErrors
                 or AdapterNotCertifiedException or SettingValidationException
                 or SettingVersionException or ImportBoundsException or FormatException
                 or TopRateLimitedException or ChannelPausedException or TopNotCertifiedException
-                or AllocationConflictException or AllocationValidationException => ex.Message,
+                or AllocationConflictException or AllocationValidationException
+                or ResourceNotFoundException or RetryPathNotCertifiedException => ex.Message,
             Microsoft.AspNetCore.Antiforgery.AntiforgeryValidationException => "CSRF 令牌缺失或无效",
             BadHttpRequestException or System.Text.Json.JsonException => "请求参数或格式无效",
             _ => "服务内部错误",

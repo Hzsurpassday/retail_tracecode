@@ -8,6 +8,7 @@ public static class PermissionCatalog
     public const string InboundAllocate = "inbound:allocate";
     public const string JobRematch = "job:rematch";
     public const string UploadQuery = "upload:query";
+    public const string UploadVerify = "upload:verify"; // UI-09 受理未知人工核对（ManualAction 决策）
     public const string UploadRetry = "upload:retry";
     public const string ReturnConfirm = "return:confirm";
     public const string DataExport = "data:export";
@@ -19,6 +20,6 @@ public static class PermissionCatalog
     public static readonly IReadOnlyList<string> All = new[]
     {
         TraceRead, MasterMatch, MasterClassify, InboundAllocate, JobRematch, UploadQuery,
-        UploadRetry, ReturnConfirm, DataExport, AuditRead, AuditExport, SystemManage, CodeRelease
+        UploadVerify, UploadRetry, ReturnConfirm, DataExport, AuditRead, AuditExport, SystemManage, CodeRelease
     };
 }

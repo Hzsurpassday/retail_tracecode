@@ -48,3 +48,18 @@ public sealed class AllocationValidationException : Exception
         FieldErrors = fieldErrors;
     }
 }
+
+/// <summary>读数/命令目标不存在：端点与服务统一映射 404 NOT_FOUND（不用 KeyNotFoundException 掩盖字典缺陷）。</summary>
+public sealed class ResourceNotFoundException : Exception
+{
+    public ResourceNotFoundException(string message) : base(message) { }
+}
+
+/// <summary>
+/// 受控重试合同门禁未取证（top.retryPathCertified=false）：422 RETRY_PATH_NOT_CERTIFIED。
+/// 调用方必须在任何写入前抛出（事务回滚 + 不落幂等记录），保证「拒绝即零写入」。
+/// </summary>
+public sealed class RetryPathNotCertifiedException : Exception
+{
+    public RetryPathNotCertifiedException(string message) : base(message) { }
+}

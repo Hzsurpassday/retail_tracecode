@@ -63,6 +63,15 @@ builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Sales.SaleVerif
     sp.GetRequiredService<TraceFlow.Infrastructure.Top.TopClientService>(),
     sp.GetRequiredService<TraceFlow.Infrastructure.Sales.RetailTaskFactory>(),
     sp.GetRequiredService<IJobQueue>(), sp.GetRequiredService<IAuditLog>()));
+// 退货首次人工确认（RET-02/DEF-02）：端点直接调用（服务内部自带 rc: 命名空间幂等，不能叠加 HTTP IdempotencyExecutor 事务）。
+builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Sales.ReturnConfirmService(
+    connectionString, env, sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(),
+    sp.GetRequiredService<TraceFlow.Infrastructure.Sales.RetailTaskFactory>(),
+    sp.GetRequiredService<IIdempotencyStore>(), sp.GetRequiredService<IAuditLog>()));
+// 上传中心人工核对/受控重试（UI-09/IDEM-05）：在端点幂等事务内推进状态机并复位发送作业。
+builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Uploads.UploadManualService(
+    sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(),
+    sp.GetRequiredService<IJobQueue>(), sp.GetRequiredService<IAuditLog>()));
 builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Jobs.SaleVerifyJobHandler(
     sp.GetRequiredService<TraceFlow.Infrastructure.Sales.SaleVerificationService>(),
     sp.GetRequiredService<IJobQueue>(), connectionString));
@@ -158,6 +167,8 @@ if (!workerOnly)
     app.MapMasterEndpoints(connectionString);
     app.MapOpsEndpoints(connectionString, env);
     app.MapInboundEndpoints(connectionString, env);
+    app.MapSalesEndpoints(connectionString, env);
+    app.MapUploadEndpoints(connectionString, env);
     app.MapUpstreamEndpoints(connectionString, env);
     app.MapDashboardEndpoints(connectionString, env);
     app.MapHealthEndpoints(connectionString, env);
