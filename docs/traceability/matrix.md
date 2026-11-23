@@ -1,10 +1,10 @@
 # TraceFlow 需求追踪矩阵（M0–M2）
 
-基线：PRD V1.0（`docs/PRD-TraceFlow-单门店-V1.0.md`）+ 验收清单（AT-*）+ 开发交接说明。代码基线：分支 `m2-upstream-allocation`（自 m1-source-master），HEAD 以 M2 末提交为准（Task 1–15）。
+基线：PRD V1.0（`docs/PRD-TraceFlow-单门店-V1.0.md`）+ 验收清单（AT-*）+ 开发交接说明。代码基线：分支 `m2-upstream-allocation`（自 m1-source-master），代码提交 `2000f14`（Task 1–15 + 终审合并修复轮 F1/F2/F3）。
 
 **门禁证据口径（用户授权降级裁决）**：M0 集成测试运行于本地 SQL Server 2019（15.0.2000.5），经 `TRACEFLOW_TEST_DB_ALLOW_NEWER=1` 显式授权降级；**2008 R2 真实实例验证未完成，交付前必须真实 2008 R2 补验全部集成测试（AT-070）**。因此凡涉及数据库集成的证据一律标注"SQL 2019 集成（授权降级；2008 R2 待补验）"，不声称 2008 R2 运行记录。`Sql2008CompatibilityTests` 静态语法门禁已运行并通过（语法层通过，运行时 2008 R2 待补验）。
 
-验证运行（详见 `docs/delivery/M1-gate-report.md`、`docs/delivery/M2-gate-report.md`）：Release 构建 0 警告 0 错误；单元测试 168/168 通过；集成测试默认 collation 287/287 通过 + BIN2 变体 287/287 通过（2019 降级）；前端 `tsc -b && vite build` 0 错误（44 modules）。
+验证运行（详见 `docs/delivery/M1-gate-report.md`、`docs/delivery/M2-gate-report.md`）：Release 构建 0 警告 0 错误；单元测试 168/168 通过；集成测试默认 collation 288/288 通过 + BIN2 变体 288/288 通过（2019 降级；含终审修复 F1 新增的空转重扫回归 1 例）；前端 `tsc -b && vite build` 0 错误（44 modules）。
 
 测试名均为实际存在的测试（`traceflow/tests/TraceFlow.UnitTests`、`traceflow/tests/TraceFlow.IntegrationTests`）；AT-* 为验收清单用例编号，"计划"表示该用例尚未实现。文件路径相对仓库根。
 

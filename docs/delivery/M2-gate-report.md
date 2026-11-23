@@ -1,6 +1,6 @@
 # M2 门禁报告（TraceFlow 上游单据下载与入库码级分配）
 
-日期：2026-11-23。分支：`m2-upstream-allocation`，代码基线 HEAD `66cb33d`（Task 1–15；本报告全部运行即在该 HEAD 上执行，本报告随 docs 提交入库，提交发生在运行之后）。
+日期：2026-11-23。分支：`m2-upstream-allocation`，代码基线 HEAD `2000f14`（终审合并修复轮：F1 空转重扫短路、F2 匹配/任务锁序统一、F3 预算面板错误可见；本报告 ② 的全部运行即在该代码提交上执行，本报告随 docs 提交入库，docs 提交发生在运行之后）。原 Task 1–15 版的运行基线为 `66cb33d`，本版已按其后的修复代码重跑并替换 ② 的全部实测尾部。
 配套：docs/contracts/openapi.yaml（M2 回写）、data-dictionary.md（0008 增量）、ksoa-adapter-contract.md（§5 ywdjbh）、top-contract.md（M2 定稿状态）、docs/traceability/matrix.md（M0–M2）、docs/delivery/M2-rulings-and-carryforwards.md（34 条裁决与携带项）。
 
 ## 结论（不标记 M2 全门禁通过）
@@ -53,7 +53,7 @@ dotnet build traceflow/TraceFlow.sln -c Release
     0 个警告
     0 个错误
 
-已用时间 00:00:03.13
+已用时间 00:00:03.70
 ```
 
 **结果：0 警告 0 错误（TreatWarningsAsErrors 生效），全部项目编译。**
@@ -67,10 +67,10 @@ dotnet test traceflow/tests/TraceFlow.UnitTests -c Release --no-build
 真实输出：
 
 ```
-已通过! - 失败: 0，通过: 168，已跳过: 0，总计: 168，持续时间: 181 ms - TraceFlow.UnitTests.dll (net8.0)
+已通过! - 失败: 0，通过: 168，已跳过: 0，总计: 168，持续时间: 136 ms - TraceFlow.UnitTests.dll (net8.0)
 ```
 
-**结果：168/168 通过**（M1 为 136，M2 净增 32）。M2 相关新增/扩充单元类（逐类用例数经 `dotnet test --list-tests` 实测核对，Theory 按 `InlineData` 展开后的用例数计；全部单元类合计 168，与上条汇总一致）：TopResponseParserTests 13、RateBackoffTests 2 methods / 6 cases（1 Theory×5 + 1 Fact）、TopGatewayTests 5（源码在 `traceflow/tests/TraceFlow.UnitTests/Top/TopGatewayTests.cs`）、SourceValueObjectTests 扩充至 25 用例（含 Daily_window/Gap_backfill/Code_set_hash 等 M2 值对象用例）。
+**结果：168/168 通过**（M1 为 136，M2 净增 32；终审修复轮只增集成用例，单元用例数仍为 168）。M2 相关新增/扩充单元类（逐类用例数经 `dotnet test --list-tests` 实测核对，Theory 按 `InlineData` 展开后的用例数计；全部单元类合计 168，与上条汇总一致）：TopResponseParserTests 13、RateBackoffTests 2 methods / 6 cases（1 Theory×5 + 1 Fact）、TopGatewayTests 5（源码在 `traceflow/tests/TraceFlow.UnitTests/Top/TopGatewayTests.cs`）、SourceValueObjectTests 扩充至 25 用例（含 Daily_window/Gap_backfill/Code_set_hash 等 M2 值对象用例）。
 
 ### 3. 集成测试（授权降级，默认 collation）
 
@@ -83,11 +83,11 @@ dotnet test traceflow/tests/TraceFlow.IntegrationTests -c Release --no-build
 真实输出：
 
 ```
-已通过! - 失败: 0，通过: 287，已跳过: 0，总计: 287，持续时间: 1 m 27 s - TraceFlow.IntegrationTests.dll (net8.0)
+已通过! - 失败: 0，通过: 288，已跳过: 0，总计: 288，持续时间: 1 m 10 s - TraceFlow.IntegrationTests.dll (net8.0)
 ```
 
-**结果：287/287 通过（SQL Server 2019 15.0.2000.5，授权降级；2008 R2 待补验）。** M1 为 180，M2 净增 107。
-M2 新增/扩充集成类（逐类用例数经 `dotnet test --list-tests` 实测核对，测试名与 matrix.md 一致）：AllocationServiceTests 11、AllocationConfirmTests 7、ClaimAndCancelTests 6、InboundMatchTests 12、InboundTaskFactoryTests 4、BillContractTests 3、UpstreamDownloadTests 10、EnterpriseSyncTests 7、InboundApiTests 8、M2ApiGateTests 4、M2CarryforwardApiTests 7、SettingsScopeApiTests 7、RateBudgetTests 5、TopClientServiceTests 4、ChannelPauseTests 1（`TraceFlow.IntegrationTests/Top/ChannelPauseTests.cs`）、Migration0008Tests 5；SettingsFailClosedTests 3 为存量类在 M2 口径下的复跑。
+**结果：288/288 通过（SQL Server 2019 15.0.2000.5，授权降级；2008 R2 待补验）。** M1 为 180，M2 净增 108（其中 107 为 M2 新增/扩充类用例、1 为存量类扩充；本轮终审修复新增 1 例空转重扫回归，已计入 InboundMatchTests 13 之中）。
+M2 新增/扩充集成类（逐类用例数经 `dotnet test --list-tests` 实测核对；类集合取自 M1 基线 `0a144c0` 之后新增/改动的测试文件，Theory 按 `InlineData` 展开后的用例数计）：AllocationServiceTests 11、AllocationConfirmTests 7、ClaimAndCancelTests 6、InboundMatchTests 13（含本轮终审修复 F1 的空转重扫回归 1 例）、InboundTaskFactoryTests 4、BillContractTests 3（与 InboundTaskFactoryTests 同文件的两个类）、UpstreamDownloadTests 10、EnterpriseSyncTests 7、InboundApiTests 8、M2ApiGateTests 4、M2CarryforwardApiTests 7、SettingsScopeApiTests 7、RateBudgetTests 5、RateBudgetConcurrencyTests 2（2 个 Fact：并发首触只落单行、同范围暂停幂等——上一版清单遗漏本类，本版补入并按实测计 2 例）、TopClientServiceTests 4、ChannelPauseTests 1（`TraceFlow.IntegrationTests/Top/ChannelPauseTests.cs`）、Migration0008Tests 5、SettingsFailClosedTests 3（M2 新增类）。上列 18 类合计 107 用例；另有存量类扩充 SettingsServiceTests 12→13（+1，账单前缀字符集写入门禁），故净增 107+1=108，180+108=288 与本条汇总一致。`SyncSchedulerTests`（4）与 `SettingsApiTests`（7）在 M2 期间仅做等价改写/断言收紧，用例数未变，不计入净增。`Sql2008CompatibilityTests`（3）在本次 288 中通过（目录级扫描已覆盖本轮新增的 `inbound_match` 加锁读取与取消路径 SQL）。
 每个测试类经 `Sql2008Fixture` 自建 `TraceFlow_Test_<guid>` 临时库并在 Dispose 时 DROP（见 ③ 末尾残留核查）。
 
 ### 4. 集成测试（授权降级，BIN2 变体）
@@ -97,10 +97,10 @@ M2 新增/扩充集成类（逐类用例数经 `dotnet test --list-tests` 实测
 真实输出：
 
 ```
-已通过! - 失败: 0，通过: 287，已跳过: 0，总计: 287，持续时间: 1 m 11 s - TraceFlow.IntegrationTests.dll (net8.0)
+已通过! - 失败: 0，通过: 288，已跳过: 0，总计: 288，持续时间: 1 m 11 s - TraceFlow.IntegrationTests.dll (net8.0)
 ```
 
-**结果：287/287 通过，与默认 collation 变体用例数一致，两变体均全绿**（码/外部 ID 的 BIN2 语义在 M2 的分配占用、上游单据 identity、企业改名版本化用例上同样成立）。默认 collation 轮尾部为其自身运行的记录（287/287 全部通过，数字正确）；上一版两轮粘贴的耗时同为 1 m 27 s 系同一机器连续运行的巧合，本轮仅将 BIN2 轮按重新实测的尾部校正为 1 m 11 s，其余数字未动。
+**结果：288/288 通过，与默认 collation 变体用例数一致，两变体均全绿**（码/外部 ID 的 BIN2 语义在 M2 的分配占用、上游单据 identity、企业改名版本化用例上同样成立）。两轮耗时分别为 1 m 10 s（默认）与 1 m 11 s（BIN2），尾部均为各自本轮运行的实测记录。
 
 ### 5. 前端构建
 
@@ -112,18 +112,18 @@ cd traceflow/src/TraceFlow.Web && npm run build   # tsc -b && vite build
 
 ```
 ✓ 44 modules transformed.
-../TraceFlow.Host/wwwroot/assets/index-CmtvQHZt.js 214.99 kB │ gzip: 67.45 kB
-✓ built in 1.07s
+../TraceFlow.Host/wwwroot/assets/index-MDZ-lfom.js 215.09 kB │ gzip: 67.51 kB
+✓ built in 837ms
 ```
 
-**结果：tsc 0 错误，vite 产物输出至 TraceFlow.Host/wwwroot（M1 为 42 modules，M2 新增上游单据页、入库页、改绑对话框等模块）。**
+**结果：tsc 0 错误，vite 产物输出至 TraceFlow.Host/wwwroot（M1 为 42 modules，M2 新增上游单据页、入库页、改绑对话框等模块）。** 本轮 F3 只改设置页预算面板的错误呈现（新增 `budgetsError` 状态与 `role="alert"` 行），模块数与产物名随之由上一版的 `index-CmtvQHZt.js`（214.99 kB）变为本版实测值。
 
 ### 6. 浏览器端验证（控制器执行；本次 Task 15 未重跑）
 
 M2 的页面级验证**已执行**，由控制器以 chrome-devtools MCP 在 `TraceFlow_M2Manual` 库上完成，非本报告作者在 Task 15 新增执行，本报告据实引用、不重复声称：
 
 - **Task 13 流程 1–8**（上游单据导航与徽标、列表/详情码级数量、入库列表过滤、DJ-MAN-C 单据 分配→确认→建任务 TF2、双会话 409、已发送冻结只读、取消、控制台无错误），截图 `t13-shots/` 01–15；记录见 `.superpowers/sdd/2026-11-23-m2-upstream-allocation/task-13-report.md`。
-- **Task 13-fix1**（上海时区格式修复后复验；44 modules 构建、287 集成、168 单元），记录见同目录 `task-13-fix1-report.md`。
+- **Task 13-fix1**（上海时区格式修复后复验；44 modules 构建、287 集成、168 单元——该 287 为其时点运行的实测值，早于本轮新增用例，非当前总数），记录见同目录 `task-13-fix1-report.md`。
 - **Task 14 核验清单 1–6/§8 增补 1–7**（设置页服务账号与 DPAPI 面板、NULL 限值显示 `—（不设帽）`、预算/暂停只读视图、appsecret 掩码与 protectionScope=CurrentUser、商品/供应商改绑 422/REBIND、控制台干净），记录见 `task-14-report.md` §8，截图 `t14-shots/`。
 
 **边界：浏览器验证覆盖的是本地 UI 与本地 API 行为，不涉及任何真实 TOP 调用；上述报告中的 409/422/冻结/取消均为本地链路证据。**
@@ -164,7 +164,7 @@ version|name|checksum|applied_at|success
 8|0008_m2_upstream_allocation.sql|F3DC59F6F51AAAB2F07AA1B09C46A36B59896EEDC51794163784F5CA166C6EF0|2026-11-23 14:36:26.020|1
 ```
 
-checksum 为迁移文件字节 SHA-256（MigrationRunner 计算）。**时区说明**：`applied_at` 由 `MigrationRunner` 以 `SYSUTCDATETIME()` 写入（UTC，见 `traceflow/db/tools/TraceFlow.DbMigrator/MigrationRunner.cs`），而上表对照的 `sys.databases.create_date`（22:36:06）为服务器本地时间（UTC+8），故 14:36 与 22:36 相差 8 小时属预期时区偏移，不是账本被篡改。**与 M1 报告快照的差异说明**：0001–0007 的 checksum 与 M1 报告完全一致（0002–0005 的 EOF 换行变更已在 M1 说明并入库）；0008 为 M2 新增增量迁移，其 checksum 为首次登记。二次运行幂等跳过与 checksum 不一致即停由 `MigratorTests.Second_run_is_idempotent_skip`、`Checksum_mismatch_stops_and_does_not_partially_apply` 覆盖（本次 287/287 中通过）。
+checksum 为迁移文件字节 SHA-256（MigrationRunner 计算）。**时区说明**：`applied_at` 由 `MigrationRunner` 以 `SYSUTCDATETIME()` 写入（UTC，见 `traceflow/db/tools/TraceFlow.DbMigrator/MigrationRunner.cs`），而上表对照的 `sys.databases.create_date`（22:36:06）为服务器本地时间（UTC+8），故 14:36 与 22:36 相差 8 小时属预期时区偏移，不是账本被篡改。**与 M1 报告快照的差异说明**：0001–0007 的 checksum 与 M1 报告完全一致（0002–0005 的 EOF 换行变更已在 M1 说明并入库）；0008 为 M2 新增增量迁移，其 checksum 为首次登记。二次运行幂等跳过与 checksum 不一致即停由 `MigratorTests.Second_run_is_idempotent_skip`、`Checksum_mismatch_stops_and_does_not_partially_apply` 覆盖（本次 288/288 中通过）。
 
 4. 残留与保留核查（真实查询）：
    - `SELECT name, create_date FROM sys.databases WHERE name LIKE 'TraceFlow%'` → `TraceFlow_Dev`（11:29:06）、`TraceFlow_M2Gate`（22:36:06）、`TraceFlow_M2Manual`（21:35:21），另有 **29 个 `TraceFlow_Test_<guid>`**，其 `create_date` **全部为 2026-11-23 17:37:39**。
@@ -186,7 +186,7 @@ checksum 为迁移文件字节 SHA-256（MigrationRunner 计算）。**时区说
 
 ### 运行时门禁
 
-- **2008 R2 真实实例验证未完成（AT-070）**：全部 DB 证据来自 SQL 2019（授权降级，双 collation 变体）。交付前必须在真实 10.50.x 实例重跑全部 287 集成用例并替换本报告 ①③ 证据。静态语法门禁（`Sql2008CompatibilityTests`，目录级扫描覆盖 0008）通过不能替代运行时验证。
+- **2008 R2 真实实例验证未完成（AT-070）**：全部 DB 证据来自 SQL 2019（授权降级，双 collation 变体）。交付前必须在真实 10.50.x 实例重跑全部 288 集成用例并替换本报告 ①③ 证据。静态语法门禁（`Sql2008CompatibilityTests`，目录级扫描覆盖 0008）通过不能替代运行时验证。
 
 ### M2 范围内未满足/未闭环项
 
@@ -205,3 +205,4 @@ checksum 为迁移文件字节 SHA-256（MigrationRunner 计算）。**时区说
 - **DB-03 语法门禁口径**：0008 已进入 `Sql2008CompatibilityTests` 的目录级逐词扫描，但"必须存在"的 presence 白名单仍为 0001–0007，矩阵按实际测试代码如实标注。
 - **遗留测试库**：29 个 `TraceFlow_Test_*`（2026-11-23 17:37:39 批次）为前次会话遗留，本次未清理、未新增，已如实声明。
 - **连续运行/备份恢复/性能基准**属 M4，M2 不声称；`TraceFlow_M2Manual`／`TraceFlow_M2Gate` 按约束保留。
+- **终审修复轮的回归观察（如实记录）**：F1（非 COMPLETE 快照空转重扫短路，回归用例 `InboundMatchTests.Noop_rescan_keeps_version_and_audit_changed_rescan_bumps`）与 F2（match→task 统一锁序）随本轮 288 全绿。BIN2 变体首跑曾有一次 `ImportApiTests.Get_import_detail_shape_and_pagination` 失败于 `successRows` 断言——该用例的轮询只等行写入（`total=2`）不等后台作业回写批次计数，属时序竞态；隔离重跑 3/3 与整轮重跑均通过，该用例属 M1 存量类、与本轮改动无关，按约束未修改测试，列为观察项。
