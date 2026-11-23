@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Dapper;
 using Microsoft.Data.SqlClient;
 using TraceFlow.Application.Abstractions;
@@ -155,6 +156,9 @@ WHERE setting_key=@k AND ver=@ver",
             case "string":
                 if (e.ValueKind != JsonValueKind.String || e.GetString()!.Length is < 1 or > 200)
                     throw new SettingValidationException($"配置 {def.Key} 须为 1..200 字符字符串");
+                // 账单码生成器只接受大写字母数字（BillCodeGenerator），非法前缀会让之后每次建单抛未映射异常
+                if (def.Key == "top.billPrefix" && !Regex.IsMatch(e.GetString()!, "^[A-Z0-9]{1,16}$"))
+                    throw new SettingValidationException("配置 top.billPrefix 须为 1..16 位大写字母或数字（A-Z0-9）");
                 break;
         }
     }

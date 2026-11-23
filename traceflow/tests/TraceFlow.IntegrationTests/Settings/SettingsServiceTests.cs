@@ -66,6 +66,18 @@ public class SettingsServiceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Bill_prefix_charset_validated_at_write_and_valid_value_reads_back()
+    {
+        foreach (var bad in new[] { "\"tf\"", "\"T-F\"", "\"\"" }) // 小写/符号会被账单码生成器拒绝；空串由长度校验拦截
+            await Assert.ThrowsAsync<SettingValidationException>(() => UpdateAsync("top.billPrefix", bad, null, "0"));
+        await UpdateAsync("top.billPrefix", "\"AB9\"", null, "0");
+        Assert.Equal("AB9", (await NewSvc().GetBillContractAsync(CancellationToken.None)).Prefix);
+        var ver = (await NewSvc().ListAsync(CancellationToken.None)).Single(v => v.Key == "top.billPrefix").Version;
+        await UpdateAsync("top.billPrefix", "\"TF\"", null, ver); // 复原默认，避免影响其他用例
+        Assert.Equal("TF", (await NewSvc().GetBillContractAsync(CancellationToken.None)).Prefix);
+    }
+
+    [Fact]
     public async Task Secret_is_write_only_never_echoed_and_audit_has_no_plaintext()
     {
         await UpdateAsync("top.appsecret", null, "super-secret-value-123", "0");
