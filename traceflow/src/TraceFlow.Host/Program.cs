@@ -60,6 +60,12 @@ builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Upstream.Enterp
     connectionString, sp.GetRequiredService<TraceFlow.Infrastructure.Top.TopClientService>(), sp.GetRequiredService<IAuditLog>()));
 builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Jobs.EnterpriseSyncJobHandler(
     sp.GetRequiredService<TraceFlow.Infrastructure.Upstream.EnterpriseSyncService>()));
+builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Inbound.InboundTaskFactory(
+    sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(), sp.GetRequiredService<IJobQueue>()));
+builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Inbound.InboundMatchService(
+    connectionString, sp.GetRequiredService<TraceFlow.Infrastructure.Inbound.InboundTaskFactory>(), sp.GetRequiredService<IAuditLog>()));
+builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Jobs.InboundMatchJobHandler(
+    sp.GetRequiredService<TraceFlow.Infrastructure.Inbound.InboundMatchService>()));
 builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Sources.SyncScheduler(
     connectionString, sp.GetRequiredService<IJobQueue>(),
     sp.GetRequiredService<TraceFlow.Infrastructure.Settings.SettingsService>(), env));

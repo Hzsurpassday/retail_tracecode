@@ -66,6 +66,11 @@ public sealed class SyncScheduler
         await _queue.EnqueueAsync(c, tx, orgId.Value, _env, "master-match",
             $"match:periodic:{unix / 300}", matchPayload, nowUtc, ct);
         n++;
+        // 入库自动匹配为本地计算（不入渠道），暂停通道时仍须周期兜底新 COMPLETE 快照（R8b/R8c）。
+        var inboundPayload = JsonSerializer.Serialize(new { orgId = orgId.Value, env = _env, snapshotId = (long?)null, trigger = "periodic" });
+        await _queue.EnqueueAsync(c, tx, orgId.Value, _env, "inbound-match",
+            $"inbound:periodic:{unix / 300}", inboundPayload, nowUtc, ct);
+        n++;
         await tx.CommitAsync(ct);
         return n;
     }
