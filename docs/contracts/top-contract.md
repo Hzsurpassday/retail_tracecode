@@ -32,3 +32,10 @@ M2 真实通道（env=LIVE）一律禁用（RealTopGateway 占位拒绝，422 TO
 - 预算键：`appkey:total`、`method:{method}`、`ent:{refEntId}:method:{method}`（门店 ref_ent_id 已知时）。
 - 门禁检查范围 = `method:{method}`、`credential:top`、`ent:{refEntId}`（有主体时）；授权错误自动暂停写入范围 = 仅 `method:{method}`（+`ent:{refEntId}`），`credential:top` 仅人工全局暂停使用。
 - 平台明确等待秒数优先；否则 30s×2^min(attempt,5)（上限 600s）+0..5s 抖动。
+
+## M2 定稿状态（Task 15）
+
+- 本文件所列接口入参/签名/限流限值/回执语义仍为**候选（_verified:false）**，M2 全程 fixture 通道验证，未取得平台合同证据（G-TOP）。
+- M2 新增消费面：listupout / listupout.detail（上游下载，Task 5）、query.getbyrefentid / query.getentinfo（企业同步，Task 6）；fixture 见 `docs/contracts/fixtures/top/`。
+- uploadinoutbill 102 载荷组装（Task 7 InboundTaskFactory）按候选合同生成并持久化；真实发送在 M3 upload-dispatch 落地且 G-TOP 取证前保持 TOP_NOT_CERTIFIED 禁用。
+- 定稿条件：按设计附录 B 清单逐项平台测试工具核实并留存证据后，将对应行 _verified 置 true 并记录取证日期；未核实项不得进入 LIVE。

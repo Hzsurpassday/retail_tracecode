@@ -56,22 +56,22 @@ components:
         expectedVersion: { type: string }
     AllocationRequest:
       type: object
-      required: [lines, expectedVersion, reason]
+      required: [expectedMatchVersion, lines]
       properties:
+        expectedMatchVersion: { type: string, description: 'inbound_match.version 整数字符串（AT-067）；不匹配→409 VERSION_CONFLICT' }
         lines:
           type: array
+          minItems: 1
           items:
             type: object
-            required: [sourceLineKey, upstreamLineId, codes, quantity]
+            required: [sourceLineId, upstreamLineId, quantity, unitRatio, codes]
             properties:
-              sourceLineKey: { type: string }
-              upstreamLineId: { type: string }
-              codes: { type: array, items: { type: string } }
-              quantity: { type: string, description: decimal(18,6) 字符串 }
-              unitRatio: { type: string, description: "分子/分母" }
-              conversionEvidence: { type: string }
-        expectedVersion: { type: string }
-        reason: { type: string }
+              sourceLineId: { type: integer, format: int64, description: 本地 source_line.id（内部 int64 代理，JSON number） }
+              upstreamLineId: { type: integer, format: int64 }
+              quantity: { type: number, description: 'decimal(18,6) JSON number；>6 位小数或 |v|≥10^12→422 QTY_DOMAIN；非正→QTY_NONPOSITIVE' }
+              unitRatio: { type: string, description: '"n/d" 正整数；换算不精确→CONVERSION_INEXACT；换算后数量≠码数→QTY 校验失败' }
+              conversionEvidence: { type: string, nullable: true, description: 比例≠1/1 时必填（CONVERSION_EVIDENCE_REQUIRED） }
+              codes: { type: array, items: { type: string }, description: 须属该上游行、全 MIN、S8P20、集合内无重复/父子关系；大码→BIG_CODE_BLOCKED }
     ReturnConfirmRequest:
       type: object
       required: [originalEventKey, codes, expectedVersion, reason]
@@ -193,17 +193,15 @@ components:
       type: object
       required: [entity, start, end]
       properties:
-        entity: { type: string, description: 同步实体（有界枚举，拒绝任意目标） }
+        entity: { type: string, enum: [sale, purchase-in, upstream, enterprise], description: 同步实体（有界枚举；upstream/enterprise 为 M2 新增） }
         start: { type: string, format: date-time, description: 窗口起点（有界参数，超限 422） }
         end: { type: string, format: date-time }
         filters: { type: object, description: 可选过滤条件 }
     ConfirmAllocationRequest:
       type: object
-      required: [allocationVersion, expectedVersion, reason]
+      required: [expectedMatchVersion]
       properties:
-        allocationVersion: { type: string, description: 分配版本字符串 }
-        expectedVersion: { type: string, description: rowversion 字符串 }
-        reason: { type: string }
+        expectedMatchVersion: { type: string, description: inbound_match.version 整数字符串 }
     ReconciliationRequest:
       type: object
       required: [windowStart, windowEnd, businessType]
@@ -234,6 +232,108 @@ components:
           properties:
             jobId: { type: string, description: 'outbox_job 作业 ID 字符串；GET /jobs/{id} 查询进度' }
         requestId: { type: string }
+    # ---- M2 已实现端点真实响应形状（T15 回写） ----
+    AllocationSaveResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [matchVersion, allocationsSaved, allRequiredCovered]
+          properties:
+            matchVersion: { type: integer, description: 保存后 inbound_match.version }
+            allocationsSaved: { type: integer }
+            allRequiredCovered: { type: boolean, description: 全部 REQUIRED 行覆盖→COMPLETE，否则 PARTIAL }
+        requestId: { type: string }
+    ConfirmAllocationResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [taskId, billCode, matchVersion, reused, message]
+          properties:
+            taskId: { type: string, description: upload_task.id 字符串 }
+            billCode: { type: string, description: 平台单据号（top.billPrefix 前缀，默认 TF；复用/重激活时不变） }
+            matchVersion: { type: integer }
+            reused: { type: boolean, description: true=复用既有任务或 Cancelled 重激活（单据号不变） }
+            message: { type: string, description: 固定文案"符合资格后将自动上传" }
+        requestId: { type: string }
+    CancelAllocationRequest:
+      type: object
+      required: [reason]
+      properties:
+        allocationId: { type: integer, format: int64, nullable: true, description: null=取消全部暂存分配并回退发送前任务；单行 COMMITTED=整单发送前取消 }
+        reason: { type: string }
+    CancelAllocationResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [cancelled]
+          properties:
+            cancelled: { type: integer }
+        requestId: { type: string }
+    MappingResolveResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [mappingId, state, version, mappingVersion]
+          properties:
+            mappingId: { type: string }
+            state: { type: string, description: 改绑成功恒 MANUAL_CONFIRMED（is_locked=1） }
+            version: { type: string, description: 新 rowversion hex }
+            mappingVersion: { type: integer }
+        requestId: { type: string }
+    ServiceAccountResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [serviceAccount, machineName]
+          properties:
+            serviceAccount: { type: string, description: '进程身份 DOMAIN\user（Windows 服务即运行账号，§4.7）' }
+            machineName: { type: string }
+        requestId: { type: string }
+    TopBudgetsResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [budgets, pauses]
+          properties:
+            budgets:
+              type: array
+              items:
+                type: object
+                properties:
+                  budgetKey: { type: string, description: 'appkey:total / method:{m} / ent:{ref}:method:{m}' }
+                  dayCount: { type: integer }
+                  dayLimit: { type: integer, nullable: true, description: null=本地不设帽（G-TOP 未取证不虚构限值） }
+                  minuteCount: { type: integer }
+                  minuteLimit: { type: integer, nullable: true }
+                  secondCount: { type: integer }
+                  secondLimit: { type: integer, nullable: true }
+                  nextAllowedAtUtc: { type: string, format: date-time, nullable: true }
+            pauses:
+              type: array
+              items:
+                type: object
+                properties:
+                  id: { type: integer, format: int64 }
+                  scopeKey: { type: string }
+                  reason: { type: string }
+                  isActive: { type: boolean }
+                  pausedAtUtc: { type: string, format: date-time }
+                  pausedBy: { type: string }
+                  resumedAtUtc: { type: string, format: date-time, nullable: true }
+                  resumedBy: { type: string, nullable: true }
+        requestId: { type: string }
     # ---- M1 已实现端点真实响应形状（T16 回写） ----
     SettingView:
       type: object
@@ -248,6 +348,7 @@ components:
         updatedBy: { type: string, nullable: true }
         updatedAtUtc: { type: string, format: date-time, nullable: true }
         reason: { type: string, nullable: true }
+        protectionScope: { type: string, nullable: true, description: DPAPI 保护作用域；密钥保存后为 CurrentUser，非密钥 null（§4.7） }
     SettingsListResponse:
       type: object
       required: [data, requestId]
@@ -481,7 +582,7 @@ components:
             nextRunAtUtc: { type: string, format: date-time }
             lastError: { type: string, nullable: true }
             leaseOwner: { type: string, nullable: true }
-            fencingToken: { type: integer, format: int64, description: JSON number（int64 内部代理；API-01 字符串约定仅适用外部平台 ID/rowversion，裁决 #9） }
+            fencingToken: { type: integer, format: int64, description: 'JSON number（int64 内部代理；API-01 字符串约定仅适用外部平台 ID/rowversion，裁决 #9）' }
         requestId: { type: string }
   responses:
     Unauthorized: { description: 未登录, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
@@ -749,10 +850,48 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { description: 版本冲突/在途任务, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '422': { $ref: '#/components/responses/Unprocessable' }
+  /product-mappings/{id}/resolve:
+    post:
+      x-phase: M2
+      description: 商品映射改绑（权限 master:match，M1 T12c 携带项）。仅 CONFLICT/REVIEW_REQUIRED/CANDIDATE/UNRESOLVED 可改绑；targetId=platform_drug_id；成功→MANUAL_CONFIRMED+is_locked=1+历史+审计 master.mapping.resolve；双向唯一冲突→409 MAPPING_ACTIVE_CONFLICT。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ConfirmMappingRequest' } } }
+      responses:
+        '200': { description: 改绑成功（锁定）, content: { application/json: { schema: { $ref: '#/components/schemas/MappingResolveResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: 版本冲突/目标已被有效映射占用（MAPPING_ACTIVE_CONFLICT）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: STATE_NOT_RESOLVABLE/目标平台药不存在/参数缺失, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /supplier-mappings/{id}/resolve:
+    post:
+      x-phase: M2
+      description: 供应商映射改绑（权限 master:match）。targetId=ref_ent_id（稳定主体键），取最新企业版本；统一社会信用代码须精确一致（否则 422 CREDIT_MISMATCH）；成功→MANUAL_CONFIRMED+锁定+历史+审计。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ConfirmMappingRequest' } } }
+      responses:
+        '200': { description: 改绑成功（锁定）, content: { application/json: { schema: { $ref: '#/components/schemas/MappingResolveResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: 版本冲突/企业版本已被有效映射占用（MAPPING_ACTIVE_CONFLICT）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: STATE_NOT_RESOLVABLE/CREDIT_MISMATCH/目标企业不存在/参数缺失, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
   /settings:
     get:
       x-phase: M1
-      description: 设置列表（权限 system:manage，UI-10）。密钥键仅返回 isSecret/hasSecretValue，绝不回显明文（NFR-05）；含未持久化键默认值（id=0, version="0"）。响应 camelCase。
+      description: 设置列表（权限 system:manage，UI-10）。密钥键仅返回 isSecret/hasSecretValue，绝不回显明文（NFR-05）；含未持久化键默认值（id=0, version="0"）。响应 camelCase。M2 起含 protectionScope（密钥=CurrentUser）。
       responses:
         '200': { description: 设置列表, content: { application/json: { schema: { $ref: '#/components/schemas/SettingsListResponse' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -760,13 +899,10 @@ paths:
   /upstream-bills:
     get:
       x-phase: M2
-      description: 上游出库单列表（权限 trace:read，UP-01/02）。下载完整性、行/码与占用；列表不提供"视为已入库"。
+      description: 上游出库单列表（权限 trace:read，UP-01/02）。实现过滤：billNo 精确、completeness；按 fetched_at DESC,id DESC 排序。列表不提供"视为已入库"。
       parameters: [{ $ref: '#/components/parameters/Page' }, { $ref: '#/components/parameters/PageSize' },
-        { name: upstreamRefEntId, in: query, schema: { type: string }, description: 上游主体平台稳定 ID },
-        { name: billNo, in: query, schema: { type: string } },
-        { name: completeness, in: query, schema: { type: string, enum: [LIST_ONLY, DETAIL_PARTIAL, COMPLETE, INCOMPLETE] } },
-        { name: dateStart, in: query, schema: { type: string, format: date } },
-        { name: dateEnd, in: query, schema: { type: string, format: date } }]
+        { name: billNo, in: query, schema: { type: string }, description: 单号精确等值 },
+        { name: completeness, in: query, schema: { type: string, enum: [COMPLETE, INCOMPLETE] } }]
       responses:
         '200': { description: 分页上游单, content: { application/json: { schema: { $ref: '#/components/schemas/PageMeta' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -774,17 +910,32 @@ paths:
   /upstream-bills/{id}:
     get:
       x-phase: M2
-      description: 上游单详情（权限 trace:read）。行/码集合、包装层级、父子关系、来源版本与获取时间；缺字段标明缺失。
+      description: 上游单详情（权限 trace:read）。行含 allocatedQuantity/remainingQuantity（RESERVED+COMMITTED 分配聚合，SQL 计算）；码含 codeNormalized/packageLevel（MIN=最小包装）。
       parameters: [{ $ref: '#/components/parameters/ResourceId' }]
       responses:
         '200': { description: 上游单详情（行/码/占用）, content: { application/json: { schema: { type: object, properties: { data: { type: object }, requestId: { type: string } } } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+  /upstream-bills/{id}/redownload:
+    post:
+      x-phase: M2
+      description: 按条件补拉（权限 job:rematch，UI-04）。固定窗口 now-90d..now + billId（R10d）；202 入队 upstream-download；LIVE 环境 422 TOP_NOT_CERTIFIED（G-TOP 未取证）；意图含 nonce 避免终态重入队缺陷。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      responses:
+        '202': { description: 补拉作业已入队, content: { application/json: { schema: { $ref: '#/components/schemas/JobAccepted' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { description: LIVE 未取证（TOP_NOT_CERTIFIED）/缺幂等键（VALIDATION）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
   /sync-jobs:
     post:
       x-phase: M1
-      description: 触发有界同步作业（权限 job:rematch）。有界参数（entity 限 sale/purchase-in；窗口 end>start、end≤now+5min、跨度≤90 天），202 入队（data.jobId 字符串）；LIVE 环境 422 ERP_NOT_CERTIFIED（G-ERP 未取证）；通道暂停 422 CHANNEL_PAUSED；不同步等待全部 TOP；无条件补拉拒绝（UI-13）。
+      description: 触发有界同步作业（权限 job:rematch）。entity 限 sale/purchase-in/upstream/enterprise；窗口 end>start、end≤now+5min、跨度≤90 天；202 入队（data.jobId 字符串）；LIVE 环境 sale/purchase-in→422 ERP_NOT_CERTIFIED、upstream/enterprise→422 TOP_NOT_CERTIFIED；通道暂停 422 CHANNEL_PAUSED；控制面审计 env=LIVE（T9 裁定）。
       parameters:
         - { $ref: '#/components/parameters/IdempotencyKey' }
         - { $ref: '#/components/parameters/CsrfToken' }
@@ -801,13 +952,10 @@ paths:
   /inbounds:
     get:
       x-phase: M2
-      description: 入库单列表（权限 trace:read）。匹配态/供应商/时间/单号筛选；本地/上游/差异/资格及上传态。
+      description: 入库单列表（权限 trace:read）。每 docKey 取最新快照版本（ROW_NUMBER PARTITION）；含匹配态/匹配版本/原因/供应商 dwbh/任务态。
       parameters: [{ $ref: '#/components/parameters/Page' }, { $ref: '#/components/parameters/PageSize' },
         { name: matchState, in: query, schema: { type: string, enum: [NOT_REQUIRED, UNMATCHED, PARTIAL, AMBIGUOUS, CONFLICT, COMPLETE] } },
-        { name: supplierId, in: query, schema: { type: string }, description: 本地 dwbh 字符串 },
-        { name: billNo, in: query, schema: { type: string }, description: djbh },
-        { name: dateStart, in: query, schema: { type: string, format: date } },
-        { name: dateEnd, in: query, schema: { type: string, format: date } }]
+        { name: docKey, in: query, schema: { type: string }, description: 单据编号 djbh 精确等值 }]
       responses:
         '200': { description: 分页入库单, content: { application/json: { schema: { $ref: '#/components/schemas/PageMeta' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -815,7 +963,7 @@ paths:
   /inbounds/{id}:
     get:
       x-phase: M2
-      description: 入库单详情（权限 trace:read）。逐行本地/平台商品、批号、单位、数量、码及证据，差异高亮（UI-11）；冻结后不可编辑。
+      description: 入库单详情（权限 trace:read）。snapshot/lines（含 classification 与 allocatedQuantity）/match（matchState/version/reason）/allocations（RESERVED+COMMITTED，含码）/task（taskId/state/billCode）；冻结后前端只读（UI-05/11）。
       parameters: [{ $ref: '#/components/parameters/ResourceId' }]
       responses:
         '200': { description: 入库单详情（行/分配/资格/上传态）, content: { application/json: { schema: { type: object, properties: { data: { type: object }, requestId: { type: string } } } } } }
@@ -831,8 +979,8 @@ paths:
         - { $ref: '#/components/parameters/IdempotencyKey' }
         - { $ref: '#/components/parameters/CsrfToken' }
       requestBody:
-        required: true
-        content: { application/json: { schema: { $ref: '#/components/schemas/TaskActionRequest' } } }
+        required: false
+        content: { application/json: { schema: { type: object, description: 实现不读取请求体；空对象即可 } } }
       responses:
         '202': { description: 重新匹配作业已入队, content: { application/json: { schema: { $ref: '#/components/schemas/JobAccepted' } } } }
         '400': { $ref: '#/components/responses/BadRequest' }
@@ -852,12 +1000,12 @@ paths:
         required: true
         content: { application/json: { schema: { $ref: '#/components/schemas/AllocationRequest' } } }
       responses:
-        '200': { description: 分配已保存（TENTATIVE/RESERVED）, content: { application/json: { schema: { $ref: '#/components/schemas/EmptyDataResponse' } } } }
+        '200': { description: 分配已保存（全量替换；RESERVED 暂存，不建任务）, content: { application/json: { schema: { $ref: '#/components/schemas/AllocationSaveResponse' } } } }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
-        '409': { description: 码占用争用/版本冲突, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
-        '422': { description: 换算不明/超精度/数量非正/AMBIGUOUS 多解, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: 'VERSION_CONFLICT（expectedMatchVersion 过期，AT-067）/FROZEN（已发送）/CODE_CONTENDED（码占用争用，AT-032）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: 'ALLOCATION_INVALID（fieldErrors 逐行 {sourceLineId,code,message}）：大码/换算不精确/缺证据/药冲突/批号冲突/供应商不符/码不属于行/格式/父子关系/数量域/重复行/上游行复用等；VALIDATION：空 lines', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
   /inbounds/{id}/confirm-allocation:
     post:
       x-phase: M2
@@ -870,12 +1018,30 @@ paths:
         required: true
         content: { application/json: { schema: { $ref: '#/components/schemas/ConfirmAllocationRequest' } } }
       responses:
-        '200': { description: 资格复查结果；ELIGIBLE 时自动建任务并提示自动上传, content: { application/json: { schema: { $ref: '#/components/schemas/EmptyDataResponse' } } } }
+        '200': { description: 资格复核通过→COMMITTED+任务创建/复用/重激活；提示"符合资格后将自动上传", content: { application/json: { schema: { $ref: '#/components/schemas/ConfirmAllocationResponse' } } } }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
-        '422': { description: 资格不满足（阻断原因逐项返回）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: 'ALLOCATION_INVALID：复核失败逐项（LINE_UNCOVERED/QTY_COVERAGE/CLAIM_LOST 等，AT-031）；VALIDATION：缺 expectedMatchVersion', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /inbounds/{id}/cancel-allocation:
+    post:
+      x-phase: M2
+      description: 取消分配（权限 inbound:allocate，IN-09）。allocationId=null→取消全部 RESERVED 并回退发送前任务；单行 RESERVED→取消该行释放占用；单行 COMMITTED→整单发送前取消。已发送/发送流程中→409 FROZEN（AT-034）；任务/分配/占用/outbox 同事务回退（AT-033）。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/CancelAllocationRequest' } } }
+      responses:
+        '200': { description: 取消完成, content: { application/json: { schema: { $ref: '#/components/schemas/CancelAllocationResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: FROZEN（已发送或进入发送流程）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: VALIDATION（reason 必填/分配不属于该快照）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
   /sales:
     get:
       x-phase: M3
@@ -1106,3 +1272,19 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
         '422': { $ref: '#/components/responses/Unprocessable' }
+  /settings/service-account:
+    get:
+      x-phase: M2
+      description: 服务运行账号与机器名（权限 system:manage，§4.7）。进程身份 Environment.UserDomainName\UserName；换机/恢复备份后 DPAPI 密钥不可解密须重新录入。
+      responses:
+        '200': { description: 运行账号, content: { application/json: { schema: { $ref: '#/components/schemas/ServiceAccountResponse' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /top-budgets:
+    get:
+      x-phase: M2
+      description: 限流预算用量与授权暂停只读视图（权限 system:manage，§4.7/JOB-03/05）。限值 null=本地不设帽；暂停恢复须人工动作（M3 交付入口）。
+      responses:
+        '200': { description: 预算与暂停, content: { application/json: { schema: { $ref: '#/components/schemas/TopBudgetsResponse' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
