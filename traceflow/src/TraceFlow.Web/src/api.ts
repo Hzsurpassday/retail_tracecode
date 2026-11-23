@@ -5,8 +5,11 @@ export interface SessionData {
   csrfToken: string;
 }
 
+export interface FieldError { sourceLineId?: number; code?: string; message?: string; }
+
 export class ApiError extends Error {
-  constructor(public status: number, public code: string, message: string, public retryable: boolean) {
+  constructor(public status: number, public code: string, message: string, public retryable: boolean,
+    public fieldErrors?: FieldError[]) {
     super(message);
   }
 }
@@ -32,8 +35,8 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   if (resp.status === 401) unauthorizedHandler?.();
   const json: unknown = await resp.json().catch(() => null);
   if (!resp.ok) {
-    const e = json as { code?: string; message?: string; retryable?: boolean } | null;
-    throw new ApiError(resp.status, e?.code ?? 'HTTP_' + resp.status, e?.message ?? '请求失败', e?.retryable ?? false);
+    const e = json as { code?: string; message?: string; retryable?: boolean; fieldErrors?: FieldError[] } | null;
+    throw new ApiError(resp.status, e?.code ?? 'HTTP_' + resp.status, e?.message ?? '请求失败', e?.retryable ?? false, e?.fieldErrors);
   }
   if (json === null || typeof json !== 'object') {
     throw new ApiError(resp.status, 'NON_JSON', '成功响应不是合法 JSON', false);

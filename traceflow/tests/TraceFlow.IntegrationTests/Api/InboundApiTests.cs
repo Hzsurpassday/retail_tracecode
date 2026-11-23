@@ -264,6 +264,47 @@ VALUES(@taskId,1,N'UPLOAD',N'MOCK',0,SYSUTCDATETIME())", new { taskId });
         return await c.ExecuteScalarAsync<int>("SELECT version FROM dbo.inbound_match WHERE source_snapshot_id=@id AND env=N'MOCK'", new { id = snapId });
     }
 
+    // UI-04/UI-05（R13a）：已配/剩余量由后端 SQL 聚合，前端不参与资格判定。
+    [Fact]
+    public async Task Upstream_detail_shows_allocated_and_remaining()
+    {
+        var s = await SeedAsync("F7", 70);
+        var client = await LoginAsync();
+        var detail = await client.GetAsync($"/api/v1/upstream-bills/{s.BillId}");
+        using (var doc = System.Text.Json.JsonDocument.Parse(await detail.Content.ReadAsStringAsync()))
+        {
+            var line = doc.RootElement.GetProperty("data").GetProperty("lines")[0];
+            Assert.Equal("0", line.GetProperty("allocatedQuantity").GetString());
+            Assert.Equal("2", line.GetProperty("remainingQuantity").GetString());
+        }
+        NewKey(client);
+        (await client.PostAsJsonAsync($"/api/v1/inbounds/{s.SnapId}/allocations", new
+        {
+            expectedMatchVersion = "1",
+            lines = new[] { new { sourceLineId = s.LineId, upstreamLineId = s.UpLineId, quantity = 1m, unitRatio = "1/1", conversionEvidence = (string?)null, codes = new[] { s.Code1 } } },
+        })).EnsureSuccessStatusCode();
+        detail = await client.GetAsync($"/api/v1/upstream-bills/{s.BillId}");
+        using (var doc = System.Text.Json.JsonDocument.Parse(await detail.Content.ReadAsStringAsync()))
+        {
+            var line = doc.RootElement.GetProperty("data").GetProperty("lines")[0];
+            Assert.Equal("1", line.GetProperty("allocatedQuantity").GetString());
+            Assert.Equal("1", line.GetProperty("remainingQuantity").GetString());
+        }
+    }
+
+    [Fact]
+    public async Task Inbound_detail_line_shows_allocated_quantity()
+    {
+        var s = await SeedAsync("F8", 80);
+        var client = await LoginAsync();
+        NewKey(client);
+        (await client.PostAsJsonAsync($"/api/v1/inbounds/{s.SnapId}/allocations", SaveBody(s, "1"))).EnsureSuccessStatusCode();
+        var detail = await client.GetAsync($"/api/v1/inbounds/{s.SnapId}");
+        using var doc = System.Text.Json.JsonDocument.Parse(await detail.Content.ReadAsStringAsync());
+        var line = doc.RootElement.GetProperty("data").GetProperty("lines")[0];
+        Assert.Equal("2", line.GetProperty("allocatedQuantity").GetString());
+    }
+
     private sealed record SaveResp(SaveData Data);
     private sealed record SaveData(int MatchVersion, int AllocationsSaved, bool AllRequiredCovered);
     private sealed record ConfirmResp(ConfirmData Data);

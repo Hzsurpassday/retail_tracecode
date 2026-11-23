@@ -79,10 +79,12 @@ SELECT snapshotId,docKey,version,businessDatetimeUtc,completeness,matchState,mat
                 return Results.Json(new { code = "NOT_FOUND", message = "入库快照不存在", retryable = false, requestId = ctx.TraceIdentifier }, statusCode: 404);
             var lines = await conn.QueryAsync<LineDetailRow>(new CommandDefinition(@"
 SELECT l.id AS lineId, l.source_line_key AS sourceLineKey, l.product_source_id AS productSourceId, l.quantity_original AS quantity,
-       l.unit_original AS unit, l.batch_raw AS batchRaw, p.trace_classification AS classification
+       l.unit_original AS unit, l.batch_raw AS batchRaw, p.trace_classification AS classification,
+       ISNULL((SELECT SUM(a.quantity) FROM dbo.inbound_allocation a
+               WHERE a.org_id=@orgId AND a.env=@env AND a.source_line_id=l.id AND a.state IN (N'RESERVED',N'COMMITTED')),0) AS allocatedQuantity
 FROM dbo.source_line l
 LEFT JOIN dbo.product p ON p.org_id=@orgId AND p.source_system_id=(SELECT source_system_id FROM dbo.source_snapshot WHERE id=@id) AND p.spid=l.product_source_id
-WHERE l.snapshot_id=@id AND l.event_kind=N'PURCHASE_IN' ORDER BY l.id", new { id, orgId }, cancellationToken: ctx.RequestAborted));
+WHERE l.snapshot_id=@id AND l.event_kind=N'PURCHASE_IN' ORDER BY l.id", new { id, orgId, env }, cancellationToken: ctx.RequestAborted));
             var match = await conn.QuerySingleOrDefaultAsync<MatchDetailRow>(new CommandDefinition(
                 "SELECT match_state AS matchState, version, reason FROM dbo.inbound_match WHERE org_id=@orgId AND env=@env AND source_snapshot_id=@id",
                 new { orgId, env, id }, cancellationToken: ctx.RequestAborted));
@@ -105,7 +107,8 @@ WHERE t.org_id=@orgId AND t.env=@env AND t.source_snapshot_id=@id AND t.task_typ
                 snapshot = new { snapshotId = snap.id.ToString(), docKey = snap.source_document_key, snap.version,
                     businessDatetimeUtc = snap.business_datetime, completeness = snap.completeness_status, contentHash = snap.content_hash },
                 lines = lines.Select(l => new { lineId = l.lineId.ToString(), l.sourceLineKey, l.productSourceId,
-                    quantity = Qty(l.quantity), l.unit, l.batchRaw, l.classification }),
+                    quantity = Qty(l.quantity), l.unit, l.batchRaw, l.classification,
+                    allocatedQuantity = Qty(l.allocatedQuantity) }),
                 match = match is null ? null : new { match.matchState, match.version, match.reason },
                 allocations = allocs.Select(a => new { allocationId = a.allocationId.ToString(),
                     sourceLineId = a.sourceLineId.ToString(), upstreamLineId = a.upstreamLineId.ToString(),
@@ -214,6 +217,7 @@ WHERE t.org_id=@orgId AND t.env=@env AND t.source_snapshot_id=@id AND t.task_typ
         public string? unit { get; set; }
         public string? batchRaw { get; set; }
         public string? classification { get; set; }
+        public decimal allocatedQuantity { get; set; }
     }
     private sealed class MatchDetailRow
     {

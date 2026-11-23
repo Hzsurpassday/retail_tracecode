@@ -62,9 +62,14 @@ SELECT id AS billId, platform_bill_id AS platformBillId, bill_no AS billNo, bill
 FROM dbo.upstream_bill WHERE id=@id AND org_id=@orgId AND env=@env", new { id, orgId, env }, cancellationToken: ctx.RequestAborted));
             if (bill is null)
                 return Results.Json(new { code = "NOT_FOUND", message = "上游单据不存在", retryable = false, requestId = ctx.TraceIdentifier }, statusCode: 404);
+            // UI-04（R13a）：已配/剩余量由 SQL 聚合 RESERVED+COMMITTED 分配得出，前端不做资格判定
             var lines = (await conn.QueryAsync<LineRow>(new CommandDefinition(@"
-SELECT id AS lineId, platform_line_id AS platformLineId, platform_drug_id AS platformDrugId, batch_no AS batchNo, quantity, unit
-FROM dbo.upstream_bill_line WHERE bill_id=@id ORDER BY id", new { id }, cancellationToken: ctx.RequestAborted))).ToList();
+SELECT l.id AS lineId, l.platform_line_id AS platformLineId, l.platform_drug_id AS platformDrugId, l.batch_no AS batchNo, l.quantity, l.unit,
+       ISNULL((SELECT SUM(a.quantity) FROM dbo.inbound_allocation a
+               WHERE a.org_id=@orgId AND a.env=@env AND a.upstream_line_id=l.id AND a.state IN (N'RESERVED',N'COMMITTED')),0) AS allocatedQuantity,
+       CASE WHEN l.quantity IS NULL THEN NULL ELSE l.quantity - ISNULL((SELECT SUM(a.quantity) FROM dbo.inbound_allocation a
+               WHERE a.org_id=@orgId AND a.env=@env AND a.upstream_line_id=l.id AND a.state IN (N'RESERVED',N'COMMITTED')),0) END AS remainingQuantity
+FROM dbo.upstream_bill_line l WHERE l.bill_id=@id ORDER BY l.id", new { id, orgId, env }, cancellationToken: ctx.RequestAborted))).ToList();
             var codes = lines.Count == 0 ? new List<CodeRow>() : (await conn.QueryAsync<CodeRow>(new CommandDefinition(@"
 SELECT line_id AS lineId, code_normalized AS codeNormalized, package_level AS packageLevel
 FROM dbo.upstream_bill_code WHERE line_id IN @ids", new { ids = lines.Select(l => l.lineId).ToList() }, cancellationToken: ctx.RequestAborted))).ToList();
@@ -73,6 +78,8 @@ FROM dbo.upstream_bill_code WHERE line_id IN @ids", new { ids = lines.Select(l =
                     bill.toEntId, bill.completeness, bill.sourceVersion, bill.fetchedAtUtc },
                 lines = lines.Select(l => new { lineId = l.lineId.ToString(), l.platformLineId, l.platformDrugId, l.batchNo,
                     quantity = l.quantity is null ? null : Qty(l.quantity.Value), l.unit,
+                    allocatedQuantity = Qty(l.allocatedQuantity),
+                    remainingQuantity = l.remainingQuantity is null ? null : Qty(l.remainingQuantity.Value),
                     codes = codes.Where(k => k.lineId == l.lineId).Select(k => new { k.codeNormalized, k.packageLevel }) }) },
                 requestId = ctx.TraceIdentifier });
         }).WithMetadata(new RequirePermissionAttribute(PermissionCatalog.TraceRead));
@@ -123,6 +130,8 @@ FROM dbo.upstream_bill_code WHERE line_id IN @ids", new { ids = lines.Select(l =
         public string? batchNo { get; set; }
         public decimal? quantity { get; set; }
         public string? unit { get; set; }
+        public decimal allocatedQuantity { get; set; }
+        public decimal? remainingQuantity { get; set; }
     }
     private sealed class CodeRow
     {
