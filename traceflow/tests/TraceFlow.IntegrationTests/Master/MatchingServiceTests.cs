@@ -80,6 +80,10 @@ OUTPUT inserted.id VALUES(@pdid,@an,@mi,@df,@st,@ps,N'MANUAL')",
         Assert.Contains("\"bidirectionalUnique\":true", await ScalarAsync<string>("SELECT evidence_json FROM dbo.product_mapping WHERE product_id=@pid", new { pid }));
         Assert.Equal(1, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.product_mapping_history WHERE product_id=@pid AND state=N'AUTO_CONFIRMED'", new { pid }));
         Assert.Equal(1, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'master.match.auto'"));
+        // 裁决修复 2：afterDigest 不得把值元组序列化成 {}——必须携带具名计数（本场景 products.auto=1、suppliers.auto=0）
+        var digest = await ScalarAsync<string>("SELECT after_digest FROM dbo.audit_log WHERE action=N'master.match.auto'");
+        Assert.Contains("\"products\":{\"auto\":1", digest);
+        Assert.Contains("\"suppliers\":{\"auto\":0", digest);
     }
 
     [Fact]
@@ -188,5 +192,38 @@ VALUES(@snap,N'2',N'MP9B',1,REPLICATE(N'c',64),N'SALE',N'81111119999888877776',N
         Assert.Equal(2, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.drug_prefix_index WHERE prefix=N'8111111' AND conflict_state=N'CONFLICT'"));
         Assert.Equal(1, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.drug_prefix_index WHERE prefix=N'8111111' AND platform_drug_id=@d", new { d = d1 }));
         Assert.Equal(1, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.drug_prefix_index WHERE prefix=N'8111111' AND platform_drug_id=@d", new { d = d2 }));
+    }
+
+    [Fact]
+    public async Task Prefix_index_only_from_complete_snapshots()
+    {
+        // 裁决修复 1（T7 承接闭合）：INVALID 版本保留可插入 source_line（raw 保留），
+        // 但前缀索引只允许 COMPLETE 快照参与——否则废弃版本的码前缀会污染索引。
+        var pid = await SeedProductAsync("MP10");
+        var drugId = await SeedDrugAsync("PD-M10");
+        var (org, sys) = await SeedAsync();
+        await ExecAsync(@"
+INSERT INTO dbo.product_mapping(org_id,product_id,platform_drug_id,state,version)
+VALUES(@org,@pid,@drug,N'MANUAL_CONFIRMED',1)", new { org, pid, drug = drugId });
+        // COMPLETE 快照：S8P20 行前缀 AAAAAAA
+        await ExecAsync(@"
+INSERT INTO dbo.source_snapshot(org_id,source_system_id,source_document_key,document_type,version,content_hash,completeness_status)
+VALUES(@org,@sys,N'PM-DOC-C',N'sale',1,REPLICATE(N'a',64),N'COMPLETE')", new { org, sys });
+        var completeId = await ScalarAsync<long>("SELECT id FROM dbo.source_snapshot WHERE source_document_key=N'PM-DOC-C'");
+        await ExecAsync(@"
+INSERT INTO dbo.source_line(snapshot_id,source_line_key,product_source_id,quantity_original,line_hash,event_kind,trace_code_normalized,code_format)
+VALUES(@snap,N'1',N'MP10',1,REPLICATE(N'b',64),N'SALE',N'AAAAAAA1111222233334',N'S8P20')", new { snap = completeId });
+        // INVALID 快照（不同 docKey）：T7 保留行，直接插入；前缀 BBBBBBB 绝不能进索引
+        await ExecAsync(@"
+INSERT INTO dbo.source_snapshot(org_id,source_system_id,source_document_key,document_type,version,content_hash,completeness_status)
+VALUES(@org,@sys,N'PM-DOC-I',N'sale',1,REPLICATE(N'd',64),N'INVALID')", new { org, sys });
+        var invalidId = await ScalarAsync<long>("SELECT id FROM dbo.source_snapshot WHERE source_document_key=N'PM-DOC-I'");
+        await ExecAsync(@"
+INSERT INTO dbo.source_line(snapshot_id,source_line_key,product_source_id,quantity_original,line_hash,event_kind,trace_code_normalized,code_format)
+VALUES(@snap,N'1',N'MP10',1,REPLICATE(N'e',64),N'SALE',N'BBBBBBB1111222233334',N'S8P20')", new { snap = invalidId });
+        var result = await RunAsync();
+        Assert.Equal(1, result.PrefixRows); // 仅 COMPLETE 行入选
+        Assert.Equal(1, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.drug_prefix_index WHERE prefix=N'AAAAAAA' AND platform_drug_id=@d", new { d = drugId }));
+        Assert.Equal(0, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.drug_prefix_index WHERE prefix=N'BBBBBBB'"));
     }
 }

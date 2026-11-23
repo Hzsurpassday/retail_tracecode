@@ -18,7 +18,7 @@ FROM dbo.source_line sl
 JOIN dbo.source_snapshot ss ON ss.id=sl.snapshot_id
 JOIN dbo.product p ON p.org_id=ss.org_id AND p.source_system_id=ss.source_system_id AND p.spid=sl.product_source_id
 JOIN dbo.product_mapping pm ON pm.product_id=p.id AND pm.state IN (N'AUTO_CONFIRMED',N'MANUAL_CONFIRMED')
-WHERE ss.org_id=@org AND sl.code_format=N'S8P20' AND sl.trace_code_normalized IS NOT NULL
+WHERE ss.org_id=@org AND ss.completeness_status=N'COMPLETE' AND sl.code_format=N'S8P20' AND sl.trace_code_normalized IS NOT NULL
 GROUP BY LEFT(sl.trace_code_normalized,7), pm.platform_drug_id",
             new { org = orgId }, tx, cancellationToken: ct))).ToList();
         await conn.ExecuteAsync(new CommandDefinition("DELETE FROM dbo.drug_prefix_index", null, tx, cancellationToken: ct));

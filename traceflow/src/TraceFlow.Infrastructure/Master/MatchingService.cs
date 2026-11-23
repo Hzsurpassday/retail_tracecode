@@ -35,7 +35,13 @@ public sealed class MatchingService
         var (prefixRows, prefixConflicts) = await PrefixIndexService.RebuildAsync(conn, tx, orgId, ct);
         await _audit.AppendAsync(conn, tx, new AuditEntry("SYSTEM", "Worker", "master.match.auto", "organization",
             orgId.ToString(), null, null,
-            JsonSerializer.Serialize(new { products = p, suppliers = s, prefixRows, prefixConflicts }),
+            // 值元组被 System.Text.Json 序列化为 {}（字段非属性）→投影为具名匿名对象，保留计数信息
+            JsonSerializer.Serialize(new
+            {
+                products = new { auto = p.auto, candidate = p.candidate, conflict = p.conflict, unresolved = p.unresolved, review = p.review },
+                suppliers = new { auto = s.auto, candidate = s.candidate, conflict = s.conflict, unresolved = s.unresolved, review = s.review },
+                prefixRows, prefixConflicts
+            }),
             null, "match-1", env));
         await tx.CommitAsync(ct);
         return new MatchResult(p.auto, p.candidate, p.conflict, p.unresolved, p.review,
