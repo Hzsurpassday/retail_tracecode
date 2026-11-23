@@ -374,6 +374,7 @@ UPDATE dbo.source_line SET event_kind=N'CONSUMER_RETURN', quantity_original=-1, 
             predecessorEventIds = new[] { scenario.SaleEventId },
             evidence = new { reason = "原码退回" },
             idemKey = Guid.NewGuid().ToString(),
+            firstReportDeclared = true,
         });
         Assert.Equal(HttpStatusCode.Forbidden, resp.StatusCode);
         await using var c = await _fx.OpenAsync();
@@ -381,6 +382,38 @@ UPDATE dbo.source_line SET event_kind=N'CONSUMER_RETURN', quantity_original=-1, 
             "SELECT state FROM dbo.upload_task WHERE id=@id", new { id = scenario.ReturnTaskId }));
         Assert.Equal(0, await c.ExecuteScalarAsync<int>(
             "SELECT COUNT(*) FROM dbo.return_confirmation WHERE task_id=@id", new { id = scenario.ReturnTaskId }));
+    }
+
+    /// <summary>
+    /// 终审修复（DEF-02）：CONFIRMED 必须携带 firstReportDeclared=true（服务端强制，不接受仅前端勾选）；
+    /// 缺失 → 422 FIRST_REPORT_NOT_DECLARED 且零写入。REJECTED 不要求该字段（见服务层用例）。
+    /// </summary>
+    [Fact]
+    public async Task Return_confirm_without_first_report_declaration_is_422()
+    {
+        var scenario = await SeedConfirmableReturnAsync("D1", 41);
+        var client = await LoginAsync("sales-admin", AdminPassword);
+        NewIdemKey(client);
+        var resp = await client.PostAsJsonAsync($"/api/v1/returns/{scenario.ReturnTaskId}/confirm", new
+        {
+            expectedVersion = scenario.ReturnVersion,
+            decision = "CONFIRMED",
+            predecessorEventIds = new[] { scenario.SaleEventId },
+            evidence = new { reason = "原码退回" },
+            idemKey = Guid.NewGuid().ToString(),
+        });
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
+        var text = await resp.Content.ReadAsStringAsync();
+        Assert.Contains("FIRST_REPORT_NOT_DECLARED", text);
+        Assert.Contains("首次上报声明必须勾选", text);
+        await using var c = await _fx.OpenAsync();
+        Assert.Equal("Blocked", await c.ExecuteScalarAsync<string>(
+            "SELECT state FROM dbo.upload_task WHERE id=@id", new { id = scenario.ReturnTaskId }));
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.return_confirmation WHERE task_id=@id", new { id = scenario.ReturnTaskId }));
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.audit_log WHERE action IN (N'task.return.confirmed',N'task.return.rejected')"));
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.idempotency_record"));
     }
 
     [Fact]
@@ -397,6 +430,7 @@ UPDATE dbo.source_line SET event_kind=N'CONSUMER_RETURN', quantity_original=-1, 
             predecessorEventIds = new[] { scenario.SaleEventId },
             evidence = new { reason = "原码退回", actor = "tester" },
             idemKey,
+            firstReportDeclared = true,
         };
         var first = await client.PostAsJsonAsync($"/api/v1/returns/{scenario.ReturnTaskId}/confirm", Body());
         Assert.Equal(HttpStatusCode.OK, first.StatusCode);
@@ -455,6 +489,7 @@ UPDATE dbo.source_line SET event_kind=N'CONSUMER_RETURN', quantity_original=-1, 
             predecessorEventIds = Array.Empty<long>(),
             evidence = new { reason = "原码退回" },
             idemKey = Guid.NewGuid().ToString(),
+            firstReportDeclared = true,
         });
         Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
         Assert.Contains("NOT_FOUND", await resp.Content.ReadAsStringAsync());
@@ -490,6 +525,7 @@ VALUES(@orgId,N'MOCK',@key,N'CONSUMER_RETURN_116',@hash,@payload,@hash,N'Blocked
             predecessorEventIds = Array.Empty<long>(),
             evidence = new { reason = "原码退回" },
             idemKey = Guid.NewGuid().ToString(),
+            firstReportDeclared = true,
         });
         Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
         Assert.Contains("NOT_RETURNABLE", await resp.Content.ReadAsStringAsync());

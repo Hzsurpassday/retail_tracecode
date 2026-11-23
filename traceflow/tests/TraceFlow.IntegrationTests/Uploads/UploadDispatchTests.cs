@@ -321,7 +321,7 @@ OUTPUT inserted.id VALUES(@taskId,@partId,1,N'UPLOAD',N'MOCK',@w,@token)",
 
         // 租约过期后由发送恢复接管：受理未知 + 先回查，绝不再次上传（JOB-02）
         var recovery = new SendRecoveryService(_fx.ConnectionString, new JobQueue(_fx.ConnectionString, new AuditLog()));
-        var recovered = await recovery.RecoverAsync(default);
+        var recovered = await recovery.RecoverAsync("MOCK", default);
 
         Assert.True(recovered >= 1);
         Assert.Equal("AcceptanceUnknown", await PartStateAsync(seed.PartId));

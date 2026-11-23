@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Dapper;
 using Microsoft.Data.SqlClient;
 using TraceFlow.Application.Abstractions;
@@ -16,9 +17,11 @@ namespace TraceFlow.Infrastructure.Sales;
 /// 首次退货人工确认命令（RET-02/DEF-02）：ExpectedVersion 为 upload_task.version 的乐观锁；
 /// PredecessorEventIds 只是「回显」，服务端必须以锁定后重新解析的结果为准（决策 8）；
 /// EvidenceJson 必填并落 return_confirmation.evidence_json；IdemKey 由端点传入（服务内命名空间化落幂等表）。
+/// FirstReportDeclared 为「首次上报」声明：CONFIRMED 必须为 true（否则 422），REJECTED 一律忽略。
 /// </summary>
 public sealed record ReturnConfirmCommand(long ExpectedVersion, string Decision,
-    IReadOnlyList<long> PredecessorEventIds, string EvidenceJson, string IdemKey, string Actor);
+    IReadOnlyList<long> PredecessorEventIds, string EvidenceJson, string IdemKey, string Actor,
+    bool FirstReportDeclared);
 
 /// <summary>确认结果：State 为确认后的任务状态（拒绝仍为 Blocked）。Idempotent 表示命中幂等重放。</summary>
 public sealed record ReturnConfirmResult(long TaskId, string State, bool Idempotent);
@@ -28,6 +31,8 @@ public sealed record ReturnConfirmResult(long TaskId, string State, bool Idempot
 /// 占位任务（Blocked + RETURN_CONFIRM_REQUIRED）就地经 <see cref="RetailTaskFactory"/> 提升
 /// （分片/占用/CONSUMER_RETURN|PURCHASE_RETURN 事件/outbox），再走状态机 Blocked→Ready（EligibilitySatisfied），
 /// 同事务写 return_confirmation 与审计；拒绝则保持 Blocked 并改写原因 RETURN_CONFIRM_REJECTED。
+/// 确认必须携带首次上报声明（firstReportDeclared=true，否则 422 FIRST_REPORT_NOT_DECLARED），
+/// 声明并入 evidence_json 并进入审计 before/after；审计 env 恒 LIVE。
 /// 拒绝对「该来源版本」终态（R-M3-16）：后续新快照/退货行消失时由 <see cref="SaleVerificationService"/>
 /// 把占位撤销为 Cancelled + RETURN_CONFIRM_REJECTED_SUPERSEDED，本服务不提供重开（v1 无 reopen 流程）。
 /// 前序语义（决策 4）：每码唯一未退货前序事件（116=SALE，202=PURCHASE_IN），0 条 MISSING、多条 AMBIGUOUS、
@@ -45,10 +50,14 @@ public sealed class ReturnConfirmService
     public const string ErrorNotReturnable = "NOT_RETURNABLE";
     public const string ErrorVersionConflict = "VERSION_CONFLICT";
     public const string ErrorPredecessorMismatch = "PREDECESSOR_MISMATCH";
+    /// <summary>CONFIRMED 缺「首次上报」声明（或为 false）：422，零写入。</summary>
+    public const string ErrorFirstReportNotDeclared = "FIRST_REPORT_NOT_DECLARED";
     public const string ActionConfirmed = "task.return.confirmed";
     public const string ActionRejected = "task.return.rejected";
 
     private const int BatchSize = 500;
+    /// <summary>控制面/人工操作审计 env 恒 LIVE（全局约束）；任务/确认行自身 env 不变。</summary>
+    private const string AuditEnv = "LIVE";
     /// <summary>return_confirmation 的唯一约束（一任务一决定）；用于区分重复键来源（F6）。</summary>
     private const string ReturnConfirmationTaskConstraint = "UQ_retconf_task";
     /// <summary>幂等表的唯一约束（idem_key + user_id）；用于区分重复键来源（F6）。</summary>
@@ -77,7 +86,13 @@ public sealed class ReturnConfirmService
         ArgumentNullException.ThrowIfNull(cmd);
         var decision = NormalizeDecision(cmd.Decision);
         var predecessors = NormalizePredecessors(cmd.PredecessorEventIds);
+        // 首次上报声明：CONFIRMED 必须在服务端落实（不接受"仅前端勾选"），REJECTED 忽略该字段。
+        if (decision == DecisionConfirmed && !cmd.FirstReportDeclared)
+            throw new AllocationValidationException(ErrorFirstReportNotDeclared,
+                "首次上报声明必须勾选（firstReportDeclared=true）才能确认退货");
         var evidence = RequireEvidence(cmd.EvidenceJson);
+        if (decision == DecisionConfirmed)
+            evidence = WithFirstReportDeclaration(evidence);
         var actor = RequireActor(cmd.Actor);
         if (string.IsNullOrWhiteSpace(cmd.IdemKey))
             throw new AllocationValidationException("VALIDATION", "IdemKey 必填");
@@ -108,7 +123,9 @@ public sealed class ReturnConfirmService
         EnsureConfirmableState(task);
 
         var ruleVersion = ResolveRuleVersion(task, fallbackRuleVersion);
-        var beforeDigest = Digest(task.version, task.state, task.state_reason, predecessors);
+        // 声明是本次决定的持久事实：before 记提交值（CONFIRMED 恒 true），after 记最终确认值；REJECTED 记 null（不适用）。
+        bool? declaredDigest = decision == DecisionConfirmed ? true : null;
+        var beforeDigest = Digest(task.version, task.state, task.state_reason, predecessors, declaredDigest);
         ReturnConfirmResult result;
         string afterDigest;
         string auditAction;
@@ -130,7 +147,7 @@ WHERE id=@id AND state=N'Blocked' AND version=@ver",
             await InsertReturnConfirmationAsync(conn, tx, task, DecisionRejected, evidence, actor,
                 task.predecessor_task_id, ct);
             result = new ReturnConfirmResult(taskId, "Blocked", false);
-            afterDigest = Digest(task.version + 1, "Blocked", ReasonRejected, predecessors);
+            afterDigest = Digest(task.version + 1, "Blocked", ReasonRejected, predecessors, null);
             auditAction = ActionRejected;
         }
         else
@@ -176,14 +193,15 @@ WHERE id=@id AND state=N'Blocked'",
             await InsertReturnConfirmationAsync(conn, tx, task, DecisionConfirmed, evidence, actor,
                 lockedPredecessors.SingleTaskId, ct);
             result = new ReturnConfirmResult(taskId, next.ToString(), false);
-            afterDigest = Digest(finalVersion, next.ToString(), ReasonConfirmed, predecessors);
+            afterDigest = Digest(finalVersion, next.ToString(), ReasonConfirmed, predecessors, true);
             auditAction = ActionConfirmed;
         }
 
+        // 控制面/人工操作审计 env 恒 LIVE（全局约束）；被操作任务/确认行自身 env 仍是任务 env。
         await _audit.AppendAsync(conn, tx, new AuditEntry(actor, "User", auditAction, "upload_task",
             taskId.ToString(CultureInfo.InvariantCulture),
             decision == DecisionConfirmed ? "首次退货人工确认通过" : "首次退货人工确认拒绝",
-            beforeDigest, afterDigest, null, ruleVersion, _env));
+            beforeDigest, afterDigest, null, ruleVersion, AuditEnv));
 
         try
         {
@@ -253,6 +271,21 @@ WHERE id=@id AND state=N'Blocked'",
     }
 
     /// <summary>
+    /// 首次上报声明并入证据（落 return_confirmation.evidence_json）：对象形状补 <c>firstReportDeclared=true</c>；
+    /// 数组/标量形状包一层对象保留原证据（绝不丢弃操作员提交的内容）。RequireEvidence 已保证是合法 JSON。
+    /// </summary>
+    private static string WithFirstReportDeclaration(string evidenceJson)
+    {
+        var node = JsonNode.Parse(evidenceJson);
+        if (node is JsonObject obj)
+        {
+            obj["firstReportDeclared"] = true;
+            return obj.ToJsonString();
+        }
+        return new JsonObject { ["firstReportDeclared"] = true, ["evidence"] = node }.ToJsonString();
+    }
+
+    /// <summary>
     /// 任务必须存在且属于退货类型：不存在（含跨环境 id）→ 404 <see cref="ResourceNotFoundException"/>；
     /// 存在但类型不支持 → 422 NOT_RETURNABLE（未知资源与业务不可退货必须区分，避免把 404 说成 422）。
     /// </summary>
@@ -306,10 +339,12 @@ WHERE id=@id AND state=N'Blocked'",
         }
     }
 
-    private static string Digest(int version, string state, string? reason, IReadOnlyList<long> predecessorIds)
+    private static string Digest(int version, string state, string? reason, IReadOnlyList<long> predecessorIds,
+        bool? firstReportDeclared)
         => JsonSerializer.Serialize(new
         {
-            version, state, reason, predecessorEventIds = predecessorIds.OrderBy(id => id).ToArray(),
+            version, state, reason, firstReportDeclared,
+            predecessorEventIds = predecessorIds.OrderBy(id => id).ToArray(),
         });
 
     // ---------- 读取 ----------

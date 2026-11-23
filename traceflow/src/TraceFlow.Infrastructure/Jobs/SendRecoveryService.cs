@@ -6,29 +6,39 @@ using TraceFlow.Infrastructure.Uploads;
 
 namespace TraceFlow.Infrastructure.Jobs;
 
+/// <summary>
+/// 发送恢复（JOB-02）：只处理本机环境（<c>RecoverAsync(env)</c>）的 Dispatching 分片，
+/// 失租 → AcceptanceUnknown → 只回查；审计/入队 env 与被处理分片一致。
+/// </summary>
 public sealed class SendRecoveryService : ISendRecoveryService
 {
     private readonly string _conn;
     private readonly IJobQueue _queue;
     public SendRecoveryService(string connectionString, IJobQueue queue) { _conn = connectionString; _queue = queue; }
 
-    public async Task<int> RecoverAsync(CancellationToken ct)
+    public async Task<int> RecoverAsync(string env, CancellationToken ct)
     {
         if (!UploadStateMachine.TryGetNext(UploadState.Dispatching, UploadEvent.LeaseLost, out var next) ||
             next != UploadState.AcceptanceUnknown)
             throw new InvalidOperationException("状态机缺少 LeaseLost 恢复边");
+
+        // 环境定界（与 Worker 认领同一口径）：MOCK worker 绝不能把 LIVE 分片改成受理未知、
+        // 也不能失败 LIVE 派发作业或入队 LIVE 回查。空/非法 env → 零候选（fail-closed，不跨环境兜底）。
+        var scope = (env ?? "").Trim().ToUpperInvariant();
+        if (scope is not ("MOCK" or "LIVE"))
+            return 0;
 
         await using var conn = new SqlConnection(_conn);
         await conn.OpenAsync(ct);
         var candidates = (await conn.QueryAsync<(long PartId, long TaskId, string Env, long OrgId)>(@"
 SELECT p.id AS PartId, p.task_id AS TaskId, p.env AS Env, p.org_id AS OrgId
 FROM dbo.upload_part p
-WHERE p.state = N'Dispatching'
+WHERE p.state = N'Dispatching' AND p.env = @env
   AND NOT EXISTS (
     SELECT 1 FROM dbo.outbox_job j
-    WHERE j.job_kind = N'upload-dispatch' AND j.job_state = N'RUNNING'
+    WHERE j.env = @env AND j.job_kind = N'upload-dispatch' AND j.job_state = N'RUNNING'
       AND j.lease_until >= SYSUTCDATETIME()
-      AND j.intent_key = N'part:' + CAST(p.id AS nvarchar(20)))")).ToList();
+      AND j.intent_key = N'part:' + CAST(p.id AS nvarchar(20)))", new { env = scope })).ToList();
 
         var recovered = 0;
         foreach (var c in candidates)

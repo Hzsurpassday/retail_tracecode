@@ -279,7 +279,7 @@ WHERE v.id=@id", new { id = verificationId, taskId = returnTaskId });
         var scenario = await SeedConfirmableAsync(c, "SALE-T6-C1", "RET-T6-C1", code);
 
         var result = await NewConfirmService().ConfirmAsync(scenario.ReturnTaskId,
-            new ReturnConfirmCommand(1, "CONFIRMED", new[] { scenario.SaleEventId }, Evidence, "idem-t6-c1", "tester"),
+            new ReturnConfirmCommand(1, "CONFIRMED", new[] { scenario.SaleEventId }, Evidence, "idem-t6-c1", "tester", FirstReportDeclared: true),
             default);
 
         Assert.False(result.Idempotent);
@@ -315,12 +315,66 @@ SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'upload-dispatch' AND intent
             "SELECT predecessor_task_id FROM dbo.return_confirmation WHERE task_id=@id", new { id = scenario.ReturnTaskId }));
         Assert.Equal("tester", await ScalarAsync<string>(c,
             "SELECT confirmed_by FROM dbo.return_confirmation WHERE task_id=@id", new { id = scenario.ReturnTaskId }));
-        Assert.Equal(Evidence, await ScalarAsync<string>(c,
-            "SELECT evidence_json FROM dbo.return_confirmation WHERE task_id=@id", new { id = scenario.ReturnTaskId }));
+        // 首次上报声明并入证据落库（保留操作员原证据），并以 firstReportDeclared=true 固化。
+        var storedEvidence = await ScalarAsync<string>(c,
+            "SELECT evidence_json FROM dbo.return_confirmation WHERE task_id=@id", new { id = scenario.ReturnTaskId });
+        using (var evidenceDoc = JsonDocument.Parse(storedEvidence))
+        {
+            Assert.Equal("原码退回", evidenceDoc.RootElement.GetProperty("reason").GetString());
+            Assert.Equal("tester", evidenceDoc.RootElement.GetProperty("operator").GetString());
+            Assert.True(evidenceDoc.RootElement.GetProperty("firstReportDeclared").GetBoolean());
+        }
         Assert.Equal(1, await ScalarAsync<int>(c,
-            "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'task.return.confirmed' AND object_id=@id",
+            "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'task.return.confirmed' AND object_id=@id AND env=N'LIVE'",
             new { id = scenario.ReturnTaskId.ToString(CultureInfo.InvariantCulture) }));
+        // 审计 env 恒 LIVE（控制面/人工操作），但被操作任务与确认行自身 env 原样保留（MOCK）。
+        Assert.Equal("MOCK", await ScalarAsync<string>(c, "SELECT env FROM dbo.upload_task WHERE id=@id",
+            new { id = scenario.ReturnTaskId }));
+        Assert.Equal("MOCK", await ScalarAsync<string>(c,
+            "SELECT env FROM dbo.return_confirmation WHERE task_id=@id", new { id = scenario.ReturnTaskId }));
         Assert.Equal(1, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.idempotency_record"));
+    }
+
+    /// <summary>
+    /// 终审修复（DEF-02 服务端落实）：CONFIRMED 必须携带 firstReportDeclared=true；
+    /// 缺失或 false 一律 422 FIRST_REPORT_NOT_DECLARED，且零写入（无确认行/占用/事件/outbox/审计/幂等）。
+    /// </summary>
+    [Fact]
+    public async Task Confirm_without_first_report_declaration_is_422_and_writes_nothing()
+    {
+        await using var c = await _fx.OpenAsync();
+        var code = Code(13);
+        var scenario = await SeedConfirmableAsync(c, "SALE-T6-D1", "RET-T6-D1", code);
+
+        var (result, failure) = await AttemptAsync(() => NewConfirmService().ConfirmAsync(scenario.ReturnTaskId,
+            new ReturnConfirmCommand(1, "CONFIRMED", new[] { scenario.SaleEventId }, Evidence, "idem-t6-d1", "tester",
+                FirstReportDeclared: false), default));
+
+        Assert.Null(result);
+        var validation = Assert.IsType<AllocationValidationException>(failure);
+        Assert.Equal(ReturnConfirmService.ErrorFirstReportNotDeclared, validation.ErrorCode);
+        Assert.Contains("首次上报声明必须勾选", validation.Message);
+
+        Assert.Equal("Blocked", await ScalarAsync<string>(c, "SELECT state FROM dbo.upload_task WHERE id=@id",
+            new { id = scenario.ReturnTaskId }));
+        Assert.Equal("RETURN_CONFIRM_REQUIRED", await ScalarAsync<string>(c,
+            "SELECT state_reason FROM dbo.upload_task WHERE id=@id", new { id = scenario.ReturnTaskId }));
+        Assert.Equal(1, await ScalarAsync<int>(c, "SELECT version FROM dbo.upload_task WHERE id=@id",
+            new { id = scenario.ReturnTaskId }));
+        Assert.Equal(0, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.return_confirmation"));
+        Assert.Equal(0, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.upload_part WHERE task_id=@id",
+            new { id = scenario.ReturnTaskId }));
+        Assert.Equal(0, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.code_claim WHERE upload_task_id=@id",
+            new { id = scenario.ReturnTaskId }));
+        Assert.Equal(0, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.code_event WHERE upload_task_id=@id",
+            new { id = scenario.ReturnTaskId }));
+        Assert.Equal(0, await ScalarAsync<int>(c, @"
+SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'upload-dispatch' AND payload_json LIKE @p",
+            new { p = "%" + scenario.ReturnTaskId + "%" }));
+        Assert.Equal(0, await ScalarAsync<int>(c, @"
+SELECT COUNT(*) FROM dbo.audit_log WHERE action LIKE N'task.return.%' AND object_id=@id",
+            new { id = scenario.ReturnTaskId.ToString(CultureInfo.InvariantCulture) }));
+        Assert.Equal(0, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.idempotency_record"));
     }
 
     [Fact]
@@ -331,7 +385,7 @@ SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'upload-dispatch' AND intent
         var scenario = await SeedConfirmableAsync(c, "SALE-T6-R1", "RET-T6-R1", code);
 
         var result = await NewConfirmService().ConfirmAsync(scenario.ReturnTaskId,
-            new ReturnConfirmCommand(1, "REJECTED", new[] { scenario.SaleEventId }, Evidence, "idem-t6-r1", "tester"),
+            new ReturnConfirmCommand(1, "REJECTED", new[] { scenario.SaleEventId }, Evidence, "idem-t6-r1", "tester", FirstReportDeclared: false),
             default);
 
         Assert.False(result.Idempotent);
@@ -371,7 +425,7 @@ SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'upload-dispatch' AND payloa
         var code = Code(12);
         var scenario = await SeedConfirmableAsync(c, "SALE-T6-S1", "RET-T6-S1", code);
         await NewConfirmService().ConfirmAsync(scenario.ReturnTaskId,
-            new ReturnConfirmCommand(1, "REJECTED", new[] { scenario.SaleEventId }, Evidence, "idem-t6-s1", "tester"),
+            new ReturnConfirmCommand(1, "REJECTED", new[] { scenario.SaleEventId }, Evidence, "idem-t6-s1", "tester", FirstReportDeclared: false),
             default);
         Assert.Equal("RETURN_CONFIRM_REJECTED", await ScalarAsync<string>(c,
             "SELECT state_reason FROM dbo.upload_task WHERE id=@id", new { id = scenario.ReturnTaskId }));
@@ -409,7 +463,7 @@ SELECT after_digest FROM dbo.audit_log WHERE action=N'task.return_placeholder.ca
         var code = Code(3);
         var scenario = await SeedConfirmableAsync(c, "SALE-T6-I1", "RET-T6-I1", code);
         var svc = NewConfirmService();
-        var cmd = new ReturnConfirmCommand(1, "CONFIRMED", new[] { scenario.SaleEventId }, Evidence, "idem-t6-i1", "tester");
+        var cmd = new ReturnConfirmCommand(1, "CONFIRMED", new[] { scenario.SaleEventId }, Evidence, "idem-t6-i1", "tester", FirstReportDeclared: true);
 
         var first = await svc.ConfirmAsync(scenario.ReturnTaskId, cmd, default);
         var second = await svc.ConfirmAsync(scenario.ReturnTaskId, cmd, default);
@@ -438,11 +492,11 @@ SELECT after_digest FROM dbo.audit_log WHERE action=N'task.return_placeholder.ca
         var second = await SeedConfirmableAsync(c, "SALE-T6-K2", "RET-T6-K2", Code(11));
         var svc = NewConfirmService();
         await svc.ConfirmAsync(first.ReturnTaskId,
-            new ReturnConfirmCommand(1, "CONFIRMED", new[] { first.SaleEventId }, Evidence, "idem-t6-shared", "tester"),
+            new ReturnConfirmCommand(1, "CONFIRMED", new[] { first.SaleEventId }, Evidence, "idem-t6-shared", "tester", FirstReportDeclared: true),
             default);
 
         await Assert.ThrowsAsync<IdempotencyConflictException>(() => svc.ConfirmAsync(second.ReturnTaskId,
-            new ReturnConfirmCommand(1, "CONFIRMED", new[] { second.SaleEventId }, Evidence, "idem-t6-shared", "tester"),
+            new ReturnConfirmCommand(1, "CONFIRMED", new[] { second.SaleEventId }, Evidence, "idem-t6-shared", "tester", FirstReportDeclared: true),
             default));
 
         Assert.Equal("Blocked", await ScalarAsync<string>(c, "SELECT state FROM dbo.upload_task WHERE id=@id",
@@ -466,7 +520,7 @@ SELECT after_digest FROM dbo.audit_log WHERE action=N'task.return_placeholder.ca
         var code = Code(4);
         var scenario = await SeedConfirmableAsync(c, "SALE-T6-V1", "RET-T6-V1", code);
         var svc = NewConfirmService();
-        var cmd = new ReturnConfirmCommand(1, "CONFIRMED", new[] { scenario.SaleEventId }, Evidence, "idem-t6-v1", "tester");
+        var cmd = new ReturnConfirmCommand(1, "CONFIRMED", new[] { scenario.SaleEventId }, Evidence, "idem-t6-v1", "tester", FirstReportDeclared: true);
         await svc.ConfirmAsync(scenario.ReturnTaskId, cmd, default);
 
         var ex = await Assert.ThrowsAsync<AllocationConflictException>(() =>
@@ -492,7 +546,7 @@ SELECT after_digest FROM dbo.audit_log WHERE action=N'task.return_placeholder.ca
 
         var ex = await Assert.ThrowsAsync<AllocationValidationException>(() =>
             NewConfirmService().ConfirmAsync(returnTaskId,
-                new ReturnConfirmCommand(1, "CONFIRMED", Array.Empty<long>(), Evidence, "idem-t6-m1", "tester"), default));
+                new ReturnConfirmCommand(1, "CONFIRMED", Array.Empty<long>(), Evidence, "idem-t6-m1", "tester", FirstReportDeclared: true), default));
 
         Assert.Equal("PREDECESSOR_MISSING", ex.ErrorCode);
         Assert.Equal("Blocked", await ScalarAsync<string>(c, "SELECT state FROM dbo.upload_task WHERE id=@id",
@@ -513,7 +567,7 @@ SELECT after_digest FROM dbo.audit_log WHERE action=N'task.return_placeholder.ca
         var scenario = await SeedConfirmableAsync(c, "SALE-T6-B1", "RET-T6-B1", code);
 
         await NewConfirmService().ConfirmAsync(scenario.ReturnTaskId,
-            new ReturnConfirmCommand(1, "CONFIRMED", new[] { scenario.SaleEventId }, Evidence, "idem-t6-b1", "tester"),
+            new ReturnConfirmCommand(1, "CONFIRMED", new[] { scenario.SaleEventId }, Evidence, "idem-t6-b1", "tester", FirstReportDeclared: true),
             default);
 
         var taskPayload = await ScalarAsync<string>(c, "SELECT payload_json FROM dbo.upload_task WHERE id=@id",
@@ -567,7 +621,7 @@ VALUES(@orgId,N'MOCK',N'KSOA:PRET-202:PURCHASE_RETURN_202',N'PURCHASE_RETURN_202
             new { orgId, hash = new string('0', 64), payload, ph = Sha256(payload) });
 
         var result = await NewConfirmService().ConfirmAsync(taskId,
-            new ReturnConfirmCommand(1, "CONFIRMED", new[] { purchaseEventId }, Evidence, "idem-t6-202", "tester"), default);
+            new ReturnConfirmCommand(1, "CONFIRMED", new[] { purchaseEventId }, Evidence, "idem-t6-202", "tester", FirstReportDeclared: true), default);
 
         Assert.Equal("Ready", result.State);
         Assert.Equal("PURCHASE_RETURN_202", await ScalarAsync<string>(c,
@@ -608,10 +662,10 @@ SELECT COUNT(*) FROM dbo.code_event WHERE upload_task_id=@id AND source_snapshot
 
         var outcomes = await Task.WhenAll(
             AttemptAsync(() => NewConfirmService().ConfirmAsync(first.ReturnTaskId,
-                new ReturnConfirmCommand(1, "CONFIRMED", new[] { first.SaleEventId }, Evidence, "idem-t6-x1", "tester"),
+                new ReturnConfirmCommand(1, "CONFIRMED", new[] { first.SaleEventId }, Evidence, "idem-t6-x1", "tester", FirstReportDeclared: true),
                 default)),
             AttemptAsync(() => NewConfirmService().ConfirmAsync(secondTaskId,
-                new ReturnConfirmCommand(1, "CONFIRMED", new[] { first.SaleEventId }, Evidence, "idem-t6-x2", "tester"),
+                new ReturnConfirmCommand(1, "CONFIRMED", new[] { first.SaleEventId }, Evidence, "idem-t6-x2", "tester", FirstReportDeclared: true),
                 default)));
 
         Assert.Single(outcomes.Where(o => o.Result is not null));
@@ -642,7 +696,7 @@ SELECT COUNT(*) FROM dbo.code_event WHERE upload_task_id=@id AND source_snapshot
 
         var ex = await Assert.ThrowsAsync<AllocationValidationException>(() =>
             NewConfirmService().ConfirmAsync(scenario.ReturnTaskId,
-                new ReturnConfirmCommand(1, "CONFIRMED", new[] { scenario.SaleEventId }, Evidence, "idem-t6-n1", "tester"),
+                new ReturnConfirmCommand(1, "CONFIRMED", new[] { scenario.SaleEventId }, Evidence, "idem-t6-n1", "tester", FirstReportDeclared: true),
                 default));
 
         Assert.Equal("PREDECESSOR_MISMATCH", ex.ErrorCode);

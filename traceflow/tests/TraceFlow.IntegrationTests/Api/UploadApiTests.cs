@@ -398,7 +398,12 @@ ELSE UPDATE dbo.app_setting SET value_json=N'true', updated_by=N'test' WHERE set
             Assert.NotNull(await c.ExecuteScalarAsync<DateTime?>(
                 "SELECT next_query_at FROM dbo.upload_part WHERE id=@id", new { id = seed.PartId }));
             Assert.Equal(1, await c.ExecuteScalarAsync<int>(
-                "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'task.upload.manual_verified' AND env=N'MOCK'"));
+                "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'task.upload.manual_verified' AND env=N'LIVE'"));
+            // 控制面/人工操作审计 env 恒 LIVE；被操作对象仍是原 env（MOCK）。
+            Assert.Equal("MOCK", await c.ExecuteScalarAsync<string>(
+                "SELECT env FROM dbo.upload_part WHERE id=@id", new { id = seed.PartId }));
+            Assert.Equal("MOCK", await c.ExecuteScalarAsync<string>(
+                "SELECT env FROM dbo.upload_task WHERE id=@id", new { id = seed.TaskId }));
         }
     }
 
@@ -601,7 +606,12 @@ ELSE UPDATE dbo.app_setting SET value_json=N'true', updated_by=N'test' WHERE set
             Assert.Equal(1, await c.ExecuteScalarAsync<int>(
                 "SELECT COUNT(*) FROM dbo.upload_attempt WHERE task_id=@id", new { id = seed.TaskId }));
             Assert.Equal(1, await c.ExecuteScalarAsync<int>(
-                "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'task.upload.controlled_retry' AND env=N'MOCK'"));
+                "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'task.upload.controlled_retry' AND env=N'LIVE'"));
+            // 控制面/人工操作审计 env 恒 LIVE；被操作对象仍是原 env（MOCK）。
+            Assert.Equal("MOCK", await c.ExecuteScalarAsync<string>(
+                "SELECT env FROM dbo.upload_part WHERE id=@id", new { id = seed.PartId }));
+            Assert.Equal("MOCK", await c.ExecuteScalarAsync<string>(
+                "SELECT env FROM dbo.upload_task WHERE id=@id", new { id = seed.TaskId }));
         }
     }
 

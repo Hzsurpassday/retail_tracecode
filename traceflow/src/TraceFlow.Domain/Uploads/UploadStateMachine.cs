@@ -59,6 +59,19 @@ public static class UploadStateMachine
         // IN-09：从未发起网络调用的冻结任务可原子取消；发送后任何状态不可达 Cancelled
         [(UploadState.Blocked, UploadEvent.AllocationCancelled)] = UploadState.Cancelled,
         [(UploadState.Ready, UploadEvent.AllocationCancelled)] = UploadState.Cancelled,
+        // 复核结论变化（SaleVerificationService）：允许来源集合与既往 SQL 守卫逐项一致——
+        // 除 Accepted/Processing/Succeeded/Failed/Cancelled 之外的任何任务态都只收敛到 ManualAction；
+        // 已受理/处理中/终态一律保留原状态（审计记 preservedState=true，只刷新核验/依赖字段）。
+        [(UploadState.Blocked, UploadEvent.VerificationChangedAfterSend)] = UploadState.ManualAction,
+        [(UploadState.Ready, UploadEvent.VerificationChangedAfterSend)] = UploadState.ManualAction,
+        [(UploadState.Dispatching, UploadEvent.VerificationChangedAfterSend)] = UploadState.ManualAction,
+        [(UploadState.AcceptanceUnknown, UploadEvent.VerificationChangedAfterSend)] = UploadState.ManualAction,
+        [(UploadState.RetryWait, UploadEvent.VerificationChangedAfterSend)] = UploadState.ManualAction,
+        [(UploadState.PartialSuccess, UploadEvent.VerificationChangedAfterSend)] = UploadState.ManualAction,
+        [(UploadState.ResultUnresolved, UploadEvent.VerificationChangedAfterSend)] = UploadState.ManualAction,
+        [(UploadState.ManualAction, UploadEvent.VerificationChangedAfterSend)] = UploadState.ManualAction,
+        // 退货占位撤销：仅从未发送的 Blocked 占位（调用方须先确认零分片零尝试）
+        [(UploadState.Blocked, UploadEvent.ReturnPlaceholderCancelled)] = UploadState.Cancelled,
     };
 
     public static IReadOnlyList<(UploadState From, UploadEvent Event, UploadState To)> AllTransitions { get; } =

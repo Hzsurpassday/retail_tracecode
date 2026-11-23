@@ -135,7 +135,15 @@ export default function SalesPage() {
     }
   }, [envFilter, dateFrom, dateTo, page]);
 
-  useEffect(() => { let active = true; (async () => { if (active) await load(); })(); return () => { active = false; }; }, [load]);
+  // 筛选/页码变化：先清空陈旧行与旧错误（与 ReturnsPage 同一模式），让加载态重新出现再按新条件取数，
+  // 绝不短暂显示上一筛选/上一页的数据或错误（load 的依赖只有筛选与页码）。
+  useEffect(() => {
+    setData(null);
+    setError('');
+    let active = true;
+    (async () => { if (active) await load(); })();
+    return () => { active = false; };
+  }, [load]);
   const totalPages = data ? Math.max(1, Math.ceil(data.total / PAGE_SIZE)) : 1;
 
   return (
@@ -148,7 +156,7 @@ export default function SalesPage() {
         <select aria-label="环境筛选" value={envFilter} onChange={(e) => { setEnvFilter(e.target.value); setPage(1); }}>
           {ENV_OPTIONS.map((v) => <option key={v} value={v}>{v === '' ? '当前环境' : v}</option>)}
         </select>
-        <button onClick={() => { setPage(1); void load(); }}>查询</button>
+        <button onClick={() => { setData(null); setError(''); setPage(1); void load(); }}>查询</button>
       </div>
       {error && <p role="alert">{error}</p>}
       {data === null ? (error ? null : <p>加载中…</p>) : data.items.length === 0 ? (

@@ -1,6 +1,6 @@
 # M3 门禁报告（TraceFlow 零售上传闭环）
 
-日期：2026-11-24。分支：`m3-sale-upload`，M3 代码基线 `0639b0d`（Task 9 故障注入修复轮；本报告 ② 的全部运行在该代码上执行，本报告随 Task 10 文档提交入库，docs 提交发生在运行之后）。
+日期：2026-11-24。分支：`m3-sale-upload`，M3 代码基线 `0639b0d`（Task 9 故障注入修复轮）+ 终审修复提交（见 §8；测试计数已按终审修复后重跑更新）。
 配套：`docs/contracts/openapi.yaml`（M3 回写）、`docs/contracts/top-contract.md`（M3 候选面）、`docs/contracts/data-dictionary.md`（0009 增量）、`docs/traceability/matrix.md`（M0–M3）、`docs/delivery/M3-rulings-and-carryforwards.md`（R-M3-1…22 与携带项）、`docs/superpowers/plans/2026-11-23-m4-closure.md`（M4 骨架）。
 
 ## 结论（不标记 M3 全门禁通过）
@@ -54,13 +54,13 @@ dotnet build traceflow/TraceFlow.sln -c Release
 dotnet test traceflow/tests/TraceFlow.UnitTests -c Release
 ```
 
-真实输出：
+真实输出（终审修复后）：
 
 ```
-已通过! - 失败:     0，通过:   251，已跳过:     0，总计:   251，持续时间: 141 ms - TraceFlow.UnitTests.dll (net8.0)
+已通过! - 失败:     0，通过:   272，已跳过:     0，总计:   272，持续时间: 254 ms - TraceFlow.UnitTests.dll (net8.0)
 ```
 
-**结果：251/251 通过（wall clock 4 秒）。** `dotnet test --list-tests` 实测：**21 个测试类、251 个用例**（Theory 按展开计）。M3 新增单元类（逐类实测）：`SaleRulesTests` 11、`ReturnRulesTests` 8、`BillStatusParserTests` 14、`TaskStateAggregatorTests` 18、`UploadDispatchTaskStateTests` 14、`TopResponseSanitizerTests` 4；另 `TopResponseParserTests` 由 13 扩至 16（R-M3-2 `model` 回退）。
+**结果：272/272 通过（终审修复前为 251，修复轮新增 21 个状态机用例）。** `dotnet test --list-tests` 实测：**21 个测试类、272 个用例**（Theory 按展开计）。M3 新增单元类（逐类实测）：`SaleRulesTests` 11、`ReturnRulesTests` 8、`BillStatusParserTests` 14、`TaskStateAggregatorTests` 18、`UploadDispatchTaskStateTests` 14、`TopResponseSanitizerTests` 4；另 `TopResponseParserTests` 由 13 扩至 16（R-M3-2 `model` 回退），`UploadStateMachineTests` 由 71 扩至 92（终审修复新增两条显式事件边）。
 
 ### 3. 集成测试（授权降级，默认 collation）
 
@@ -69,13 +69,13 @@ TRACEFLOW_TEST_DB="<本地测试实例连接串，按本地部署配置提供>" 
 dotnet test traceflow/tests/TraceFlow.IntegrationTests -c Release
 ```
 
-真实输出：
+真实输出（终审修复后）：
 
 ```
-已通过! - 失败:     0，通过:   429，已跳过:     0，总计:   429，持续时间: 3 m 7 s - TraceFlow.IntegrationTests.dll (net8.0)
+已通过! - 失败:     0，通过:   433，已跳过:     0，总计:   433，持续时间: 2 m 40 s - TraceFlow.IntegrationTests.dll (net8.0)
 ```
 
-**结果：429/429 通过（SQL 2019 15.0.2000.5，授权降级；2008 R2 待补验），wall clock 194 秒。** `--list-tests` 实测：**60 个测试类、429 个用例**。M3 新增/扩充类（逐类实测）：`SaleVerificationTests` 31、`RetailTaskTests` 17、`ReturnConfirmTests` 12、`UploadDispatchTests` 18、`BillQueryTests` 15、`FaultInjectionTests` 8、`SalesApiTests` 9、`UploadApiTests` 19、`Migration0009Tests` 5、`M3SettingsTests` 4。
+**结果：433/433 通过（SQL 2019 15.0.2000.5，授权降级；2008 R2 待补验），wall clock 160 秒；终审修复前为 429。** `--list-tests` 实测：**60 个测试类、433 个用例**。M3 新增/扩充类（逐类实测）：`SaleVerificationTests` 31、`RetailTaskTests` 17、`ReturnConfirmTests` 13（修复轮 +1）、`UploadDispatchTests` 18、`BillQueryTests` 15、`FaultInjectionTests` 8、`SalesApiTests` 10（修复轮 +1）、`UploadApiTests` 19、`Migration0009Tests` 5、`M3SettingsTests` 4、`SendRecoveryTests` 7（修复轮 env 隔离用例）。
 每个测试类经 `Sql2008Fixture` 自建 `TraceFlow_Test_<guid>` 临时库并在 Dispose 时 DROP。
 
 **首跑异常（如实记录）**：本轮首次执行时 4 个 M2 存量 Master 用例失败（`MappingConfirmTests.Confirm_candidate_sets_manual_locked`、`ClassificationTests.Products_list_includes_active_mapping_identity` 等），错误为 `SqlException: 无法获得数据库 'model' 上的排他锁`（并行 fixture 同时 `CREATE DATABASE` 的竞争，非 M3 代码失败）；随后单独重跑本轮全量，429/429 通过。该竞争为测试基础设施时序问题，已列入 M4 携带项。
@@ -84,13 +84,13 @@ dotnet test traceflow/tests/TraceFlow.IntegrationTests -c Release
 
 同上命令追加 `TRACEFLOW_TEST_DB_BIN2=1`（fixture 以 `COLLATE Latin1_General_BIN2` 建库）。
 
-真实输出（重跑）：
+真实输出（重跑，终审修复后）：
 
 ```
-已通过! - 失败:     0，通过:   429，已跳过:     0，总计:   429，持续时间: 2 m 29 s - TraceFlow.IntegrationTests.dll (net8.0)
+已通过! - 失败:     0，通过:   433，已跳过:     0，总计:   433，持续时间: 2 m 30 s - TraceFlow.IntegrationTests.dll (net8.0)
 ```
 
-**结果：429/429 通过，wall clock 155 秒；与默认 collation 用例数一致，两变体均全绿。**
+**结果：433/433 通过，wall clock 150 秒；与默认 collation 用例数一致，两变体均全绿（终审修复前为 429/429）。**
 **首跑异常（如实记录）**：BIN2 首次执行 428/429，唯一失败为 M1 存量用例 `Api.ImportApiTests.Get_import_detail_shape_and_pagination`（`successRows` 断言 1≠0，后台作业回写时序竞态，M2 门禁报告已列为观察项）；整轮重跑 429/429 通过。该失败与 M3 改动无关，按约束未修改测试。
 
 ### 5. 前端构建
@@ -189,15 +189,15 @@ SELECT version, name, checksum, success FROM dbo.schema_version ORDER BY version
 | 日对账、码台账、异常队列、导出、备份恢复、性能与 ≥7 天试运行 | M4 | 本报告不声称 |
 | 测试基础设施 flake | 已记录 | 首跑并行建库竞争（默认）与存量 ImportApi 时序竞态（BIN2）；重跑均全绿，未改测试 |
 
-## ⑥ 控制器独立复核（2026-11-24，提交前）
+## ⑥ 控制器独立复核（2026-11-24，终审修复前）
 
-在文档提交前，控制器于同一基线 `0639b0d` 独立重跑集成全量（默认 collation，命令同 ②.3）：
+在文档提交前、终审修复前，控制器于基线 `0639b0d` 独立重跑集成全量（默认 collation，命令同 ②.3）：
 
 ```
 已通过! - 失败:     0，通过:   429，已跳过:     0，总计:   429，持续时间: 2 m 28 s - TraceFlow.IntegrationTests.dll (net8.0)
 ```
 
-同时以 `--list-tests` 复核用例数（单元 251、集成 429）、以 `sha256sum` 复核 9 个迁移文件 checksum、以脚本比对矩阵引用的 147 个测试名（147/147 存在于实测测试列表）。以上均与本文 ②③ 一致。
+同时以 `--list-tests` 复核用例数（当时单元 251、集成 429）、以 `sha256sum` 复核 9 个迁移文件 checksum、以脚本比对矩阵引用的 147 个测试名（147/147 存在于实测测试列表）。以上均与本文 ②③ 一致。
 
 ## ⑦ 文档—代码差异与回写（本任务处理）
 
@@ -205,3 +205,19 @@ SELECT version, name, checksum, success FROM dbo.schema_version ORDER BY version
 - `manual-verify`/`controlled-retry` 使用 `Idempotency-Key` 头；`returns/{id}/confirm` 的幂等键在请求体 `idemKey`（契约已如实区分）。
 - 0009 不新建 `upload_task_part`/`upload_attempt`/`code_result`（实际表名为 0006 既有的 `upload_part`/`upload_attempt`/`code_result`）；`data-dictionary.md` 按实际 DDL 回写。
 - 错误体统一为 `{code, message, fieldErrors, retryable, retryAfter, requestId}`；仅 429 与 409 `RETRY_IN_FLIGHT` 的 `retryable=true`，`Retry-After` 头仅 429。
+
+## ⑧ 终审修复与重跑（2026-11-24）
+
+整分支终审（29 提交）结论 READY WITH FIXES：2 High、3 Medium、3 Low。已修复并重跑：
+
+| 发现 | 修复 |
+| --- | --- |
+| High：人工操作审计写目标 env 而非 LIVE | `UploadManualService`/`ReturnConfirmService` 的 3 处人工操作审计改字面量 `LIVE`，测试断言审计 env 与被操作对象 env 分离 |
+| High：`SendRecoveryService` 无 env 谓词，MOCK worker 会改 LIVE 分片 | `RecoverAsync(env)` + `p.env=@env`；新增 MOCK worker 不触碰 LIVE `Dispatching` 的用例 |
+| Medium：两处状态写入绕过唯一转换表 | 新增 `VerificationChangedAfterSend`/`ReturnPlaceholderCancelled` 事件边（允许来源与既往 SQL 守卫逐项一致），经 `TryGetNext` 写入 |
+| Medium：首次上报声明仅前端校验 | `returns/{id}/confirm` 强制 `firstReportDeclared=true`（422 `FIRST_REPORT_NOT_DECLARED`），并入 `evidence_json` 与审计；openapi/UI/测试同步 |
+| Medium：上传抽屉跨环境操作按钮 | 宿主 env 传入抽屉，跨环境时禁用受控重试/人工核对并显示原因 |
+| Low：筛选切换保留旧行 | 上传/销售列表查询开始时清空数据，错误与加载互斥 |
+| Low（携带 M4）：平台回传未知码入台账；`/returns` 固定宿主 env | 裁决保留现状，列入 `M3-rulings-and-carryforwards.md` |
+
+终审修复后重跑（真实输出）：build 0 警告 0 错误；单元 **272/272**；集成默认 **433/433**（2 m 40 s）；BIN2 **433/433**（2 m 30 s）；前端 `npm run build` 0 错误（vite 1.23 s）。迁移 0001–0009 逐字节未变（checksum 同 ③）。

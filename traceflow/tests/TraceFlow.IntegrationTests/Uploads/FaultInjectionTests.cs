@@ -68,7 +68,7 @@ public class FaultInjectionTests : IClassFixture<Sql2008Fixture>
     }
 
     private Task<int> RecoverAsync()
-        => new SendRecoveryService(_fx.ConnectionString, new JobQueue(_fx.ConnectionString, new AuditLog())).RecoverAsync(default);
+        => new SendRecoveryService(_fx.ConnectionString, new JobQueue(_fx.ConnectionString, new AuditLog())).RecoverAsync("MOCK", default);
 
     // ---------------------------------------------------------------- 网关应答（全 MOCK）
 

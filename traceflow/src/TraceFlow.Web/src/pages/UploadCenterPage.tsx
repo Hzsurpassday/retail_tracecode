@@ -139,7 +139,16 @@ export default function UploadCenterPage() {
     }
   }, [envFilter, state, taskType, page]);
 
-  useEffect(() => { let active = true; (async () => { if (active) await load(); })(); return () => { active = false; }; }, [load]);
+  // 筛选/页码变化：先清空陈旧行、汇总与旧错误（与 ReturnsPage 同一模式），让加载态重新出现再取数，
+  // 绝不短暂显示上一筛选/上一页的数据；加载中与错误互斥渲染（见下方 data === null 分支）。
+  useEffect(() => {
+    setData(null);
+    setSummary(null);
+    setError('');
+    let active = true;
+    (async () => { if (active) await load(); })();
+    return () => { active = false; };
+  }, [load]);
   const totalPages = data ? Math.max(1, Math.ceil(data.total / PAGE_SIZE)) : 1;
 
   function closeDrawer() {
@@ -164,7 +173,7 @@ export default function UploadCenterPage() {
         <select value={envFilter} onChange={(e) => { setEnvFilter(e.target.value); setPage(1); }}>
           <option value="">当前环境</option><option value="MOCK">MOCK</option><option value="LIVE">LIVE</option>
         </select>
-        <button onClick={() => { setPage(1); void load(); }}>查询</button>
+        <button onClick={() => { setData(null); setSummary(null); setError(''); setPage(1); void load(); }}>查询</button>
       </div>
       {error && <p role="alert">{error}</p>}
       {summary && (
@@ -222,14 +231,15 @@ export default function UploadCenterPage() {
         </>
       )}
       {openId !== null && (
-        <UploadDrawer taskId={openId} envFilter={envFilter} onClose={closeDrawer} onChanged={() => void load()} />
+        <UploadDrawer taskId={openId} envFilter={envFilter} hostEnv={env}
+          onClose={closeDrawer} onChanged={() => void load()} />
       )}
     </section>
   );
 }
 
-function UploadDrawer({ taskId, envFilter, onClose, onChanged }: {
-  taskId: string; envFilter: string; onClose: () => void; onChanged: () => void;
+function UploadDrawer({ taskId, envFilter, hostEnv, onClose, onChanged }: {
+  taskId: string; envFilter: string; hostEnv: string; onClose: () => void; onChanged: () => void;
 }) {
   const [detail, setDetail] = useState<UploadDetail | null>(null);
   const [error, setError] = useState('');
@@ -262,6 +272,14 @@ function UploadDrawer({ taskId, envFilter, onClose, onChanged }: {
   }, [taskId, envFilter, reloadKey]);
 
   const task = detail?.task ?? null;
+  // 跨环境只读（终审修复）：受控重试/人工核对请求体不含 env，服务端按宿主环境定界（跨环境 id 一律 404），
+  // 因此详情里任务 env 与宿主 env 不一致时必须禁用这两个提交按钮并说明原因，绝不让用户空点。
+  // 宿主 env 取自 /api/v1/health（与 AppShell/EnvBadge 同一来源）；健康检查失败（'?'/空）时不拦截。
+  const hostKnown = hostEnv === 'LIVE' || hostEnv === 'MOCK';
+  const crossEnv = task !== null && hostKnown && task.env !== hostEnv;
+  const crossEnvReason = crossEnv && task
+    ? `当前会话环境 ${hostEnv}，无法操作 ${task.env} 环境任务`
+    : '';
   const successCodes = detail?.codeResults.filter((c) => c.result === 'SUCCESS').length ?? 0;
   const failedCodes = detail?.codeResults.filter((c) => c.result === 'FAILED').length ?? 0;
   const unknownCodes = detail?.codeResults.filter((c) => c.result !== 'SUCCESS' && c.result !== 'FAILED').length ?? 0;
@@ -369,20 +387,21 @@ function UploadDrawer({ taskId, envFilter, onClose, onChanged }: {
             <h4>人工处置</h4>
             <p>受控重试仅在平台通道已取证（top.retryPathCertified=true）时可用；未取证会被拒绝并在此禁用按钮。</p>
             <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-              <button disabled={busy || retryBlocked !== '' || detail.task.state !== 'Failed'}
+              <button disabled={busy || crossEnv || retryBlocked !== '' || detail.task.state !== 'Failed'}
                 aria-describedby="retry-gate-reason"
-                title={retryBlocked || (detail.task.state !== 'Failed' ? '当前状态不可重试' : undefined)}
+                title={crossEnv ? crossEnvReason
+                  : retryBlocked || (detail.task.state !== 'Failed' ? '当前状态不可重试' : undefined)}
                 onClick={() => void retry()}>受控重试</button>
-              <span id="retry-gate-reason" role={retryBlocked ? 'alert' : undefined}
-                style={{ fontSize: 12, color: retryBlocked ? '#a00' : '#666' }}>
-                {retryBlocked || (detail.task.state !== 'Failed'
+              <span id="retry-gate-reason" role={crossEnv || retryBlocked ? 'alert' : undefined}
+                style={{ fontSize: 12, color: crossEnv || retryBlocked ? '#a00' : '#666' }}>
+                {crossEnv ? crossEnvReason : retryBlocked || (detail.task.state !== 'Failed'
                   ? '仅 Failed 任务可分片受控重试。'
                   : '通道取证状态由服务端门禁判定：未取证时会被拒绝并在此禁用。')}
               </span>
               <button onClick={() => setReloadKey(reloadKey + 1)}>刷新</button>
             </div>
             {detail.task.state === 'ManualAction' && (
-              <ManualVerifyForm detail={detail}
+              <ManualVerifyForm detail={detail} disabledReason={crossEnvReason}
                 onDone={(msg) => { setStatus(msg); setError(''); setReloadKey(reloadKey + 1); onChanged(); }} />
             )}
           </>
@@ -392,7 +411,9 @@ function UploadDrawer({ taskId, envFilter, onClose, onChanged }: {
   );
 }
 
-function ManualVerifyForm({ detail, onDone }: { detail: UploadDetail; onDone: (msg: string) => void }) {
+function ManualVerifyForm({ detail, disabledReason, onDone }: {
+  detail: UploadDetail; disabledReason: string; onDone: (msg: string) => void;
+}) {
   const [decision, setDecision] = useState<'ACCEPTED' | 'PROCESSING' | 'NOT_ACCEPTED'>('ACCEPTED');
   // 默认不预选账单码：必须由操作员显式选择，避免把第一片静默当成平台受理单号。
   const [billCode, setBillCode] = useState('');
@@ -453,8 +474,10 @@ function ManualVerifyForm({ detail, onDone }: { detail: UploadDetail; onDone: (m
       <textarea value={contract} onChange={(e) => setContract(e.target.value)} rows={2} maxLength={500}
         style={{ width: '100%' }} placeholder={decision === 'NOT_ACCEPTED' ? '合同/平台协作证据（必填）' : '可选补充证据（合同/协作记录）'} />
       {error && <p role="alert">{error}</p>}
+      {disabledReason && <p role="alert" style={{ color: '#a00' }}>{disabledReason}</p>}
       <div style={{ marginTop: 8 }}>
-        <button disabled={busy} onClick={() => void submit()}>提交人工核对（版本 {detail.task.version}）</button>
+        <button disabled={busy || disabledReason !== ''} onClick={() => void submit()}
+          title={disabledReason || undefined}>提交人工核对（版本 {detail.task.version}）</button>
       </div>
     </div>
   );

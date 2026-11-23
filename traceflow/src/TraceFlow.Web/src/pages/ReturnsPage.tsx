@@ -265,6 +265,9 @@ function ReturnConfirmDialog({ item, onClose, onDone }: {
           predecessorEventIds: picked.map((p) => Number(p)),
           evidence: { reason: evidence.trim() },
           idemKey,
+          // 首次上报声明：服务端对 CONFIRMED 强制校验（缺失/false→422 FIRST_REPORT_NOT_DECLARED）；
+          // 前端保留未勾选即阻止提交的即时提示（上面的 firstReport 校验），两者口径一致。
+          firstReportDeclared: decision === 'CONFIRMED' && firstReport,
         }),
       });
       onDone(r);

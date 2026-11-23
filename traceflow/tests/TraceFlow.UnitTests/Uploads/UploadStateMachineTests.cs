@@ -55,6 +55,17 @@ public class UploadStateMachineTests
         { UploadState.ManualAction, UploadEvent.QueryFailed, UploadState.Failed },
         { UploadState.Blocked, UploadEvent.AllocationCancelled, UploadState.Cancelled },
         { UploadState.Ready, UploadEvent.AllocationCancelled, UploadState.Cancelled },
+        // 复核结论变化（VerificationChangedAfterSend）：允许来源集合与既有 SQL 守卫逐项一致。
+        { UploadState.Blocked, UploadEvent.VerificationChangedAfterSend, UploadState.ManualAction },
+        { UploadState.Ready, UploadEvent.VerificationChangedAfterSend, UploadState.ManualAction },
+        { UploadState.Dispatching, UploadEvent.VerificationChangedAfterSend, UploadState.ManualAction },
+        { UploadState.AcceptanceUnknown, UploadEvent.VerificationChangedAfterSend, UploadState.ManualAction },
+        { UploadState.RetryWait, UploadEvent.VerificationChangedAfterSend, UploadState.ManualAction },
+        { UploadState.PartialSuccess, UploadEvent.VerificationChangedAfterSend, UploadState.ManualAction },
+        { UploadState.ResultUnresolved, UploadEvent.VerificationChangedAfterSend, UploadState.ManualAction },
+        { UploadState.ManualAction, UploadEvent.VerificationChangedAfterSend, UploadState.ManualAction },
+        // 退货占位撤销：仅 Blocked 占位（零分片零尝试）。
+        { UploadState.Blocked, UploadEvent.ReturnPlaceholderCancelled, UploadState.Cancelled },
     };
 
     [Theory]
@@ -81,6 +92,18 @@ public class UploadStateMachineTests
         { UploadState.Dispatching, UploadEvent.AllocationCancelled },   // 已发起发送不可行政取消（IN-09）
         { UploadState.Accepted, UploadEvent.AllocationCancelled },
         { UploadState.Cancelled, UploadEvent.Claimed },                 // Cancelled 是终态
+        // 复核结论变化绝不降级受理态/终态（与既有 SQL 守卫一致：只保留，不转人工）。
+        { UploadState.Accepted, UploadEvent.VerificationChangedAfterSend },
+        { UploadState.Processing, UploadEvent.VerificationChangedAfterSend },
+        { UploadState.Succeeded, UploadEvent.VerificationChangedAfterSend },
+        { UploadState.Failed, UploadEvent.VerificationChangedAfterSend },
+        { UploadState.Cancelled, UploadEvent.VerificationChangedAfterSend },
+        // 退货占位撤销只允许 Blocked 占位，任何发送/受理相关状态都不可达 Cancelled。
+        { UploadState.Ready, UploadEvent.ReturnPlaceholderCancelled },
+        { UploadState.Dispatching, UploadEvent.ReturnPlaceholderCancelled },
+        { UploadState.AcceptanceUnknown, UploadEvent.ReturnPlaceholderCancelled },
+        { UploadState.ManualAction, UploadEvent.ReturnPlaceholderCancelled },
+        { UploadState.Cancelled, UploadEvent.ReturnPlaceholderCancelled },
     };
 
     [Theory]
@@ -146,5 +169,34 @@ public class UploadStateMachineTests
             e => Assert.False(UploadStateMachine.TryGetNext(UploadState.Dispatching, e, out _), $"Dispatching 不应有 {e} 边"));
         Assert.DoesNotContain(UploadStateMachine.AllTransitions,
             t => t.From == UploadState.Dispatching && t.Event.ToString().StartsWith("Query", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// 转换表是唯一事实源：复核结论变化的允许来源集合必须与改造前 SQL 守卫（「非 Accepted/Processing/
+    /// Succeeded/Failed/Cancelled」）逐项一致——不多不少，且目标恒为 ManualAction。
+    /// </summary>
+    [Fact]
+    public void Verification_changed_sources_match_previous_guard_exactly()
+    {
+        var preserved = new[]
+        {
+            UploadState.Accepted, UploadState.Processing, UploadState.Succeeded, UploadState.Failed,
+            UploadState.Cancelled,
+        };
+        var expected = Enum.GetValues<UploadState>().Except(preserved).OrderBy(s => s).ToList();
+        var actual = UploadStateMachine.AllTransitions
+            .Where(t => t.Event == UploadEvent.VerificationChangedAfterSend)
+            .ToList();
+        Assert.Equal(expected, actual.Select(t => t.From).OrderBy(s => s).ToList());
+        Assert.All(actual, t => Assert.Equal(UploadState.ManualAction, t.To));
+    }
+
+    /// <summary>退货占位撤销的来源集合恒为单个 Blocked（不拓宽到 Ready/发送后状态），目标恒为 Cancelled。</summary>
+    [Fact]
+    public void Return_placeholder_cancel_source_is_blocked_only()
+    {
+        var edge = Assert.Single(UploadStateMachine.AllTransitions,
+            t => t.Event == UploadEvent.ReturnPlaceholderCancelled);
+        Assert.Equal((UploadState.Blocked, UploadState.Cancelled), (edge.From, edge.To));
     }
 }

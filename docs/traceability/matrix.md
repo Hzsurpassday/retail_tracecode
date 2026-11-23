@@ -4,7 +4,7 @@
 
 **门禁证据口径（用户授权降级裁决）**：M0–M3 集成测试运行于本地 SQL Server 2019（15.0.2000.5），经 `TRACEFLOW_TEST_DB_ALLOW_NEWER=1` 显式授权降级；**2008 R2 真实实例验证未完成，交付前必须真实 2008 R2 补验全部集成测试（AT-070）**。因此凡涉及数据库集成的证据一律标注"SQL 2019 集成（授权降级；2008 R2 待补验）"，不声称 2008 R2 运行记录。`Sql2008CompatibilityTests` 静态语法门禁已运行并通过（语法层通过，运行时 2008 R2 待补验）。
 
-验证运行（详见 `docs/delivery/M1-gate-report.md`、`docs/delivery/M2-gate-report.md`、`docs/delivery/M3-gate-report.md`）：Release 构建 0 警告 0 错误；M3 单元测试 251/251 通过；M3 集成测试默认 collation 429/429 通过 + BIN2 变体 429/429 通过（2019 降级）；故障注入定向 8/8（默认与 BIN2）；前端 `tsc -b && vite build` 0 错误（47 modules）。M2 的 288/288 为当时基线，不再代表当前总数。
+验证运行（详见 `docs/delivery/M1-gate-report.md`、`docs/delivery/M2-gate-report.md`、`docs/delivery/M3-gate-report.md`）：Release 构建 0 警告 0 错误；M3 单元测试 272/272 通过；M3 集成测试默认 collation 433/433 通过 + BIN2 变体 433/433 通过（2019 降级）；故障注入定向 8/8（默认与 BIN2）；前端 `tsc -b && vite build` 0 错误（47 modules）。M2 的 288/288 为当时基线，不再代表当前总数。
 
 测试名均为实际存在的测试（`traceflow/tests/TraceFlow.UnitTests`、`traceflow/tests/TraceFlow.IntegrationTests`，M3 行经 `dotnet test --list-tests` 逐一核对）；AT-* 为验收清单用例编号，"计划"表示该用例尚未实现。文件路径相对仓库根。
 
@@ -134,4 +134,4 @@
 - M0 已实现（含 DDL/值对象/壳层部分完成）行均给出实际文件与实际测试名；后续阶段行标注计划归属与"未实现"；门禁行全部"未取证"并写明对应真实通道禁用。
 - 未声称任何未验证能力：TOP fixture 为 Mock 形状；2008 R2 运行时兼容未验证；性能/连续运行/备份恢复属 M4，M0 不声称。
 - M2 更新 32 个既有需求行（上游下载/企业同步/限流预算/授权暂停/入库匹配/行级分配/确认冻结/取消回退/改绑/设置加固/两页 UI），均给出实际测试名；G-ERP/G-TOP 仍未取证，LIVE 通道保持禁用；2008 R2 运行时门禁（AT-070）仍未满足。
-- M3 更新 **20** 个需求行（SALE-01…05、RET-01/02/03/04、TOP-02/03/04、IDEM-03/04/05、JOB-04、UI-06/07/09、DEF-01/02）及 DB-01（0009）口径，均给出实际存在的单元/集成测试名（M3 测试经 `--list-tests` 核对：单元 251、集成 429）；UI 行附浏览器截图路径（`.superpowers/sdd/2026-11-23-m3-sale-upload/shots/`）。G-TOP/G-POS/G-RETURN/G-OPENING 仍未取证；发送/回查/逐码查询全部 MOCK；`top.retryPathCertified=false`；202 采购退货采集未接入；2008 R2 运行时门禁（AT-070）仍未满足。
+- M3 更新 **20** 个需求行（SALE-01…05、RET-01/02/03/04、TOP-02/03/04、IDEM-03/04/05、JOB-04、UI-06/07/09、DEF-01/02）及 DB-01（0009）口径，均给出实际存在的单元/集成测试名（M3 测试经 `--list-tests` 核对：单元 272、集成 433）；UI 行附浏览器截图路径（`.superpowers/sdd/2026-11-23-m3-sale-upload/shots/`）。G-TOP/G-POS/G-RETURN/G-OPENING 仍未取证；发送/回查/逐码查询全部 MOCK；`top.retryPathCertified=false`；202 采购退货采集未接入；2008 R2 运行时门禁（AT-070）仍未满足。

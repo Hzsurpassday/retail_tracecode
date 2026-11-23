@@ -268,7 +268,7 @@ FROM (
             var evidenceJson = req.Evidence is JsonElement evidence ? EvidenceText(evidence) : "";
             var cmd = new ReturnConfirmCommand(req.ExpectedVersion, req.Decision ?? "",
                 req.PredecessorEventIds ?? Array.Empty<long>(), evidenceJson, req.IdemKey ?? "",
-                ctx.User.Identity!.Name!);
+                ctx.User.Identity!.Name!, req.FirstReportDeclared == true);
             var result = await svc.ConfirmAsync(id, cmd, ctx.RequestAborted);
             return Results.Ok(new { data = new
             {
@@ -554,8 +554,12 @@ WHERE e.org_id=@orgId AND e.id IN @ids", new { orgId, ids = chunk }, cancellatio
 
     private static string Qty(decimal v) => v.ToString("0.######", CultureInfo.InvariantCulture);
 
+    /// <summary>
+    /// 退货首次确认请求体。<paramref name="FirstReportDeclared"/> 为「首次上报」声明：CONFIRMED 必须为 true
+    /// （服务端强制，缺失/false → 422 FIRST_REPORT_NOT_DECLARED），REJECTED 忽略。
+    /// </summary>
     public sealed record ReturnConfirmRequest(long ExpectedVersion, string? Decision, long[]? PredecessorEventIds,
-        JsonElement? Evidence, string? IdemKey);
+        JsonElement? Evidence, string? IdemKey, bool? FirstReportDeclared);
 
     private sealed class SaleListRow
     {

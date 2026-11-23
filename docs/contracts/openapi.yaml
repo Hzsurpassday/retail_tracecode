@@ -87,6 +87,7 @@ components:
           description: '前序 code_event.id 集合；仅回显，服务端锁定后重新解析并以服务端结论为准（与提交值不一致→422 PREDECESSOR_MISMATCH）'
         evidence: { description: '确认/驳回证据（JSON 对象、数组或字符串，必填非空；落 return_confirmation.evidence_json）' }
         idemKey: { type: string, description: '幂等键（请求体内，非 Idempotency-Key 头；按用户作用域命名空间化落 idempotency_record；同一键重放返回 Idempotent=true）' }
+        firstReportDeclared: { type: boolean, description: '首次上报声明：decision=CONFIRMED 时必填且必须为 true（否则 422 FIRST_REPORT_NOT_DECLARED）；REJECTED 忽略。服务端把 "firstReportDeclared":true 并入 evidence_json（保留原证据内容）并进入审计 before/after' }
     TaskActionRequest:
       type: object
       required: [reason]
@@ -1452,7 +1453,7 @@ paths:
   /returns/{id}/confirm:
     post:
       x-phase: M3
-      description: 退货首次人工确认/驳回（权限 return:confirm，DEF-02/RET-02/RET-04）。仅 Blocked + RETURN_CONFIRM_REQUIRED 的 116/202 占位任务可提交；前序由服务端锁定后重新解析（0 条 PREDECESSOR_MISSING、多条 PREDECESSOR_AMBIGUOUS、已退回 ALREADY_RETURNED、与提交值不一致 PREDECESSOR_MISMATCH）；CONFIRMED 同事务建占用/事件/分片/发送作业并推进 Ready，REJECTED 只写确认记录与审计（不改分片）。幂等键在请求体内（idemKey），非 Idempotency-Key 头。
+      description: 退货首次人工确认/驳回（权限 return:confirm，DEF-02/RET-02/RET-04）。仅 Blocked + RETURN_CONFIRM_REQUIRED 的 116/202 占位任务可提交；前序由服务端锁定后重新解析（0 条 PREDECESSOR_MISSING、多条 PREDECESSOR_AMBIGUOUS、已退回 ALREADY_RETURNED、与提交值不一致 PREDECESSOR_MISMATCH）；CONFIRMED 必须携带 firstReportDeclared=true（首次上报声明，服务端强制，缺失/false→422 FIRST_REPORT_NOT_DECLARED，声明并入 evidence_json 并进入审计），同事务建占用/事件/分片/发送作业并推进 Ready；REJECTED 忽略该声明，只写确认记录与审计（不改分片）。审计 env 恒 LIVE，任务/确认行 env 保持自身环境。幂等键在请求体内（idemKey），非 Idempotency-Key 头。
       parameters:
         - { $ref: '#/components/parameters/ResourceId' }
         - { $ref: '#/components/parameters/CsrfToken' }
@@ -1466,7 +1467,7 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { description: 'VERSION_CONFLICT（版本/状态已变化）或 IDEMPOTENCY_CONFLICT（同键不同请求）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
-        '422': { description: 'VALIDATION / NOT_RETURNABLE / PREDECESSOR_MISMATCH / PREDECESSOR_MISSING / PREDECESSOR_AMBIGUOUS / ALREADY_RETURNED', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: 'VALIDATION / FIRST_REPORT_NOT_DECLARED / NOT_RETURNABLE / PREDECESSOR_MISMATCH / PREDECESSOR_MISSING / PREDECESSOR_AMBIGUOUS / ALREADY_RETURNED', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
   /trace-codes/{code}/events:
     get:
       x-phase: M4

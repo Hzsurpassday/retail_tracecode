@@ -37,6 +37,7 @@ public sealed record ControlledRetryResult(long TaskId, string State, int Versio
 /// 绝不改写 upload_attempt 历史。</item>
 /// </list>
 /// 两个入口都按「活动机构 + 宿主环境」定界任务（跨环境 id → <see cref="ResourceNotFoundException"/> 404，零写入）。
+/// 审计 env 恒 <c>"LIVE"</c>（控制面/人工操作）；被操作任务/分片自身 env 原样保留。
 /// 所有写入都在调用方事务内完成（端点经 IdempotencyExecutor），审计与业务同事务；不触网。
 /// </summary>
 public sealed class UploadManualService
@@ -58,6 +59,8 @@ public sealed class UploadManualService
 
     private const string DispatchJobKind = "upload-dispatch";
     private const string DispatchIntentPrefix = "part:";
+    /// <summary>控制面/人工操作审计 env 恒 LIVE（全局约束）；被操作任务/分片自身 env 不变。</summary>
+    private const string AuditEnv = "LIVE";
 
     private readonly SettingsService _settings;
     private readonly IJobQueue _queue;
@@ -156,7 +159,8 @@ public sealed class UploadManualService
         await _audit.AppendAsync(conn, tx, new AuditEntry(actor, "User", ActionManualVerify, "upload_task",
             taskId.ToString(CultureInfo.InvariantCulture),
             $"人工核对 {decision}（{moved.Count} 个分片，复位发送作业 {jobsReset}）",
-            before, DigestWithEvidence(state, version, moved, evidenceJson), requestId, null, task.env));
+            before, DigestWithEvidence(state, version, moved, evidenceJson), requestId, null,
+            AuditEnv));
 
         return new ManualVerifyResult(taskId, state, version, decision, moved);
     }
@@ -208,7 +212,7 @@ public sealed class UploadManualService
         await _audit.AppendAsync(conn, tx, new AuditEntry(actor, "User", ActionControlledRetry, "upload_task",
             taskId.ToString(CultureInfo.InvariantCulture),
             $"受控重试（top.retryPathCertified=true，{moved.Count} 个失败分片，复位发送作业 {jobsReset}）",
-            before, Digest(state, version, moved), requestId, null, task.env));
+            before, Digest(state, version, moved), requestId, null, AuditEnv));
 
         return new ControlledRetryResult(taskId, state, version, moved, jobsReset);
     }

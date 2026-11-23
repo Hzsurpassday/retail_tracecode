@@ -9,6 +9,7 @@ using TraceFlow.Domain.Codes;
 using TraceFlow.Domain.Sales;
 using TraceFlow.Domain.Sources;
 using TraceFlow.Domain.Top;
+using TraceFlow.Domain.Uploads;
 using TraceFlow.Infrastructure.Codes;
 using TraceFlow.Infrastructure.Settings;
 using TraceFlow.Infrastructure.Top;
@@ -808,16 +809,20 @@ WHERE id=@id AND state IN (N'Ready',N'RetryWait')",
     /// <summary>
     /// 退货占位撤销（F1）：仅 Blocked 且调用方已确认零分片零 UPLOAD 尝试时置 Cancelled + reason、
     /// version+1，并审计 task.return_placeholder.cancelled（含 priorState/priorReason，绝不删除确认证据）。
-    /// 返回是否实际改写（并发下已被他人处置则为 false）。
+    /// 状态写入经唯一转换表（ReturnPlaceholderCancelled → Cancelled），非法来源零写入返回 false。
     /// </summary>
     private async Task<bool> CancelReturnPlaceholderAsync(SqlConnection conn, SqlTransaction tx, long taskId,
         string priorState, string? priorReason, string reason, int parts, int uploadAttempts, string ruleVersion,
         CancellationToken ct)
     {
+        if (!Enum.TryParse<UploadState>(priorState, ignoreCase: false, out var current)
+            || !UploadStateMachine.TryGetNext(current, UploadEvent.ReturnPlaceholderCancelled, out var next)
+            || next != UploadState.Cancelled)
+            return false;
         var updated = await conn.ExecuteAsync(new CommandDefinition(@"
-UPDATE dbo.upload_task SET state=N'Cancelled', state_reason=@reason, version=version+1
-WHERE id=@id AND state=N'Blocked'",
-            new { id = taskId, reason }, tx, cancellationToken: ct));
+UPDATE dbo.upload_task SET state=@next, state_reason=@reason, version=version+1
+WHERE id=@id AND state=@priorState",
+            new { id = taskId, next = next.ToString(), reason, priorState }, tx, cancellationToken: ct));
         if (updated == 0) return false;
         await _audit.AppendAsync(conn, tx, new AuditEntry("SYSTEM", "Worker", "task.return_placeholder.cancelled",
             "upload_task", taskId.ToString(CultureInfo.InvariantCulture), reason, null,
@@ -899,20 +904,31 @@ WHERE org_id=@orgId AND env=@env AND event_scope=N'RETAIL:321' AND claim_state=N
     }
 
     /// <summary>
-    /// 「已发送」处置（F2/F3）：state 守卫为终态/在途（Accepted/Processing/Succeeded/Failed/Cancelled）时不降级，
-    /// 仅刷新 verification_state/dependency_state 并审计 preservedState=true；否则转 ManualAction + VERIFY_CHANGED_AFTER_SEND。
-    /// 两种情况都记录 priorState/priorReason；发送在途时审计原因用 VERIFY_CHANGED_WHILE_DISPATCHING。
+    /// 「已发送」处置（F2/F3）：来源状态允许 <see cref="UploadEvent.VerificationChangedAfterSend"/> 时转 ManualAction +
+    /// VERIFY_CHANGED_AFTER_SEND；状态机无该边（Accepted/Processing/Succeeded/Failed/Cancelled）时不降级，
+    /// 仅刷新 verification_state/dependency_state 并审计 preservedState=true。两种情况都记录 priorState/priorReason；
+    /// 发送在途时审计原因用 VERIFY_CHANGED_WHILE_DISPATCHING。
     /// </summary>
     private async Task MarkManualActionAsync(SqlConnection conn, SqlTransaction tx, long taskId, string priorState,
         string? priorReason, string reason, string verificationState, string dependencyState, bool dispatching,
         int uploadAttempts, string ruleVersion, CancellationToken ct)
     {
-        var updated = await conn.ExecuteAsync(new CommandDefinition(@"
-UPDATE dbo.upload_task SET state=N'ManualAction', state_reason=@stateReason, verification_state=@vs,
+        // 目标态与允许来源集合都由唯一转换表给出（不在 SQL 里另写一份状态清单）。
+        var parsed = Enum.TryParse<UploadState>(priorState, ignoreCase: false, out var current);
+        var transitioned = parsed
+            && UploadStateMachine.TryGetNext(current, UploadEvent.VerificationChangedAfterSend, out var next)
+            && next == UploadState.ManualAction;
+        var updated = 0;
+        if (transitioned)
+            updated = await conn.ExecuteAsync(new CommandDefinition(@"
+UPDATE dbo.upload_task SET state=@next, state_reason=@stateReason, verification_state=@vs,
        dependency_state=@dep, version=version+1
-WHERE id=@id AND state NOT IN (N'Accepted',N'Processing',N'Succeeded',N'Failed',N'Cancelled')",
-            new { id = taskId, stateReason = ReasonVerifyChangedAfterSend, vs = verificationState, dep = dependencyState },
-            tx, cancellationToken: ct));
+WHERE id=@id AND state=@priorState",
+                new
+                {
+                    id = taskId, next = nameof(UploadState.ManualAction), stateReason = ReasonVerifyChangedAfterSend,
+                    vs = verificationState, dep = dependencyState, priorState,
+                }, tx, cancellationToken: ct));
         var preserved = updated == 0;
         if (preserved)
             await conn.ExecuteAsync(new CommandDefinition(@"
