@@ -4,6 +4,8 @@ import { loadSession, type SessionData } from './api';
 import AppShell from './components/AppShell';
 import LoginPage from './pages/LoginPage';
 import DashboardPage from './pages/DashboardPage';
+import ProductsPage from './pages/ProductsPage';
+import ImportWizard from './pages/ImportWizard';
 
 export default function App() {
   const [session, setSession] = useState<SessionData | null>(null);
@@ -18,6 +20,8 @@ export default function App() {
     <AppShell session={session} onLoggedOut={async () => setSession(await loadSession())}>
       <Routes>
         <Route path="/" element={<DashboardPage />} />
+        <Route path="/products" element={<ProductsPage />} />
+        <Route path="/imports" element={<ImportWizard />} />
         <Route path="*" element={<p>该模块在后续阶段交付（见路线图），当前未接入。</p>} />
       </Routes>
     </AppShell>

@@ -5,7 +5,8 @@ import EnvBadge from './EnvBadge';
 
 const NAV = [
   { to: '/', label: '工作台', ready: true },
-  { to: '/products', label: '商品映射', ready: false },
+  { to: '/products', label: '商品映射', ready: true },
+  { to: '/imports', label: '主数据导入', ready: true },
   { to: '/suppliers', label: '供应商映射', ready: false },
   { to: '/upstream', label: '上游出库单', ready: false },
   { to: '/inbounds', label: '入库关联', ready: false },
