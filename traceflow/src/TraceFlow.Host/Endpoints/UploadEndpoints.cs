@@ -7,6 +7,7 @@ using Microsoft.Data.SqlClient;
 using TraceFlow.Application.Security;
 using TraceFlow.Domain.Uploads;
 using TraceFlow.Host.Security;
+using TraceFlow.Infrastructure.Settings;
 using TraceFlow.Infrastructure.Uploads;
 
 namespace TraceFlow.Host.Endpoints;
@@ -138,7 +139,7 @@ ORDER BY p.rn2", args, cancellationToken: ctx.RequestAborted))).ToList();
         }).RequireAuthorization();
 
         // ---------------------------------------------------------------- 上传任务钻取
-        app.MapGet("/api/v1/upload-tasks/{id:long}", async (HttpContext ctx, long id) =>
+        app.MapGet("/api/v1/upload-tasks/{id:long}", async (HttpContext ctx, long id, SettingsService settings) =>
         {
             await using var conn = new SqlConnection(connectionString);
             await conn.OpenAsync(ctx.RequestAborted);
@@ -169,6 +170,8 @@ WHERE object_type=N'upload_task' AND object_id=@objectId AND env=@env ORDER BY o
                 new { objectId = id.ToString(CultureInfo.InvariantCulture), env = task.env },
                 cancellationToken: ctx.RequestAborted))).ToList();
 
+            var retryPathCertified = await settings.GetRetryPathCertifiedAsync(ctx.RequestAborted);
+
             var timeline = new List<TimelineItem> { new(task.created_at, "TASK_CREATED", null, null) };
             foreach (var attempt in attempts)
             {
@@ -185,6 +188,8 @@ WHERE object_type=N'upload_task' AND object_id=@objectId AND env=@env ORDER BY o
 
             return Results.Ok(new { data = new
             {
+                // 受控重试合同门禁：false 时前端必须禁用重试入口（fail-closed）。
+                retryPathCertified,
                 task = new
                 {
                     taskId = task.id.ToString(CultureInfo.InvariantCulture), eventKey = task.event_key,
