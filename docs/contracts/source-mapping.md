@@ -90,3 +90,9 @@
 | 商品/供应商主档表 | Product / Supplier 档案来源 | 未给出，不猜表名（SRC-03），待 G-ERP 取证 |
 
 候选组合键（SRC-02）：销售 `(source_system, lshh, plh)`、入库 `(source_system, djbh, dj_sn)`。实施先验证 NULL、重复、跨日复用和跨表关联；若不唯一，需补充有证据字段形成稳定键并更新适配合同。ID 全程字符串，无数值解析或前导零丢失。
+
+## 3. M1 落地注记
+
+- 归一化内部契约五对象已由 `SourceSyncService` + `FixtureKsoaAdapter` 落地（fixture 形状）：SourceDocument→source_snapshot、SourceLine→source_line（raw+normalized 双存、line_hash、event_kind 拆分）；Product/Supplier 档案经 CSV 导入落地（spid/dwbh 稳定键）。
+- 候选组合键 `(lshh,plh)`/`(djbh,dj_sn)` 在 fixture 中按 SRC-02 验证：plh 空→ingest_exception（不造行号）、跨日复用/跨表键碰撞→INVALID 新版本（旧快照保留）。**真实 KSOA 列名/类型/唯一性仍以 G-ERP 取证为准，上表候选状态不变。**
+- 业务时间经 `BusinessTimeParser.Shanghai`（Asia/Shanghai→UTC）；效期精度 `ExpiryParser.ParsePrecision`（DAY/MONTH/UNKNOWN）；数量 `Qty` decimal(18,6) 越界→issue（不静默舍入）。

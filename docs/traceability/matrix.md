@@ -1,56 +1,56 @@
-# TraceFlow 需求追踪矩阵（M0）
+# TraceFlow 需求追踪矩阵（M0–M1）
 
-基线：PRD V1.0（`docs/PRD-TraceFlow-单门店-V1.0.md`）+ 验收清单（AT-*）+ 开发交接说明。代码基线：分支 `m0-foundation`，HEAD `73f3d6f`（Task 1–14）+ 本 Task 15 文档。
+基线：PRD V1.0（`docs/PRD-TraceFlow-单门店-V1.0.md`）+ 验收清单（AT-*）+ 开发交接说明。代码基线：分支 `m1-source-master`（自 m0-foundation），HEAD 以 M1 末提交为准（Task 1–16）。
 
 **门禁证据口径（用户授权降级裁决）**：M0 集成测试运行于本地 SQL Server 2019（15.0.2000.5），经 `TRACEFLOW_TEST_DB_ALLOW_NEWER=1` 显式授权降级；**2008 R2 真实实例验证未完成，交付前必须真实 2008 R2 补验全部集成测试（AT-070）**。因此凡涉及数据库集成的证据一律标注"SQL 2019 集成（授权降级；2008 R2 待补验）"，不声称 2008 R2 运行记录。`Sql2008CompatibilityTests` 静态语法门禁已运行并通过（语法层通过，运行时 2008 R2 待补验）。
 
-验证运行（详见 `docs/delivery/M0-gate-report.md`）：Release 构建 0 警告 0 错误；单元测试 84/84 通过；集成测试 44/44 通过（2019 降级）；前端 `tsc -b && vite build` 0 错误。
+验证运行（详见 `docs/delivery/M1-gate-report.md`）：Release 构建 0 警告 0 错误；单元测试 136/136 通过；集成测试默认 collation 180/180 通过 + BIN2 变体 180/180 通过（2019 降级）；前端 `tsc -b && vite build` 0 错误（42 modules）。
 
 测试名均为实际存在的测试（`traceflow/tests/TraceFlow.UnitTests`、`traceflow/tests/TraceFlow.IntegrationTests`）；AT-* 为验收清单用例编号，"计划"表示该用例尚未实现。文件路径相对仓库根。
 
 | 需求 ID | 实现模块/物理对象 | 测试 | 门禁证据 | 阶段/状态 |
 | --- | --- | --- | --- | --- |
 | SCOPE-01 | 0001_core.sql organization（单 active 门店）；Host/Program.cs（--web-only/--worker-only 单 Web+Worker）；Web 壳无多门店 UI | MigratorTests.Core_tables_exist_and_single_active_org_enforced | SQL 2019 集成（授权降级；2008 R2 待补验） | M0 完成（基础） |
-| SCOPE-02 | docs/contracts/adapter-facts.md、source-mapping.md（KSOA 候选契约）；真实 ERP 连接未实现 | — | G-ERP 未取证 | M0 文档完成；真实同步 M1 未实现 |
+| SCOPE-02 | adapter-facts.md + ksoa-adapter-contract.md；ISourceAdapter + FixtureKsoaAdapter + RealKsoaAdapter（抛 AdapterNotCertifiedException）+ AdapterFactory 路由 | FixtureKsoaAdapterTests.Real_adapter_throws_not_certified_and_factory_routes_modes；SourceSyncTests.Live_env_refuses_sync_in_m1 | G-ERP 未取证（fixture-only）；SQL 2019 集成（授权降级；2008 R2 待补验） | M1 fixture 通道完成；真实 ERP 同步禁用 |
 | SCOPE-03 | db/tools/TraceFlow.DbMigrator/Program.cs（只允许连接 TraceFlow 目标库）；MigrationRunner.cs；独立业务库 DDL | MigratorTests（3 用例）；AT-001（计划） | SQL 2019 集成（授权降级；2008 R2 待补验） | M0 完成（迁移工具约束；ERP 只读账号验证 M1） |
 | SCOPE-04 | adapter-facts.md TOP 合同行（仅零售权限包）；代码无 WES/saveent/全国全量下载能力 | — | G-TOP 未取证 | M0 文档完成；平台能力 M2/M3 未实现 |
-| SCOPE-05 | Web/src/pages 仅 LoginPage/DashboardPage，无独立扫码页面 | npm run build（tsc 0 错误） | — | M0 完成（壳）；十页闭环 M4 |
+| SCOPE-05 | Web/src/pages 六页（Login/Dashboard/Products/Suppliers/Imports/Settings），无独立扫码页面 | npm run build（tsc 0 错误） | — | M1 完成（六页）；十页闭环 M4 |
 | SCOPE-06 | （M2 计划：IN-06/07 完全匹配自动上传）；upload_task PURCHASE_IN_102 类型 DDL 就绪 | AT-024/031（计划） | G-ERP/G-TOP 未取证 | 未实现（M2） |
 | SCOPE-07 | （M3 计划：支付后异步同步→核验→自动上传，查询超时等待） | AT-037/038（计划） | G-POS/G-TOP 未取证 | 未实现（M3） |
-| SCOPE-08 | 0003_master.sql product_mapping.is_locked/state CHECK；双向有效唯一索引；自动匹配与锁定逻辑未实现 | MasterConstraintTests（2 映射唯一用例） | SQL 2019 集成（授权降级；2008 R2 待补验） | M0 DDL 完成；匹配逻辑 M1/M2 未实现 |
+| SCOPE-08 | MatchingService/SupplierMatchingService + MappingEndpoints（confirm/disable）+ 0007 UX_pmap_pair/UX_smap_pair + 双向有效唯一索引 | MatchingServiceTests.Full_match_bidirectional_unique_auto_confirms、Bidirectional_unique_blocks_identical_twins；MappingConfirmTests.Confirm_active_unique_race_rejected；MasterConstraintTests（2 映射唯一用例） | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成（匹配+确认/解除）；入库分配 M2 |
 | SCOPE-09 | docs/contracts/adapter-facts.md POS 采码行 | — | G-POS 待取证 | 销售生产上报禁用 |
-| SCOPE-10 | 0002_source.sql source_snapshot 版本不可变 + completeness_status SOURCE_CHANGED；检测逻辑未实现 | MasterConstraintTests.Snapshot_version_unique_and_history_appendable | SQL 2019 集成（授权降级；2008 R2 待补验） | M0 DDL 完成；变化检测 M1 未实现 |
+| SCOPE-10 | SourceSyncService 版本不可变 + SourceStabilizationService SOURCE_CHANGED 检测 | SourceStabilizationTests.Complete_doc_changed_marks_source_changed_and_task_payload_immutable；SourceSyncTests.Cross_day_reuse_across_runs_invalidates_new_version_old_intact；MasterConstraintTests.Snapshot_version_unique_and_history_appendable | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成（变化检测） |
 | DEF-01 | （M3 计划：整任务上报，禁按正常行拆单） | AT-038（计划） | G-POS/G-TOP 未取证 | 未实现（M3） |
 | DEF-02 | （M3 计划：退货首次人工确认）；openapi.yaml /returns/{id}/confirm 契约已列 | AT-043/044（计划） | G-RETURN 未取证 | 未实现（M3） |
 | DEF-03 | adapter-facts.md 采购退货行（来源未给出，显示未接入）；upload_task CK_task_type 含 PURCHASE_RETURN_202（仅 DDL） | AT-045（计划） | G-RETURN 未取证 | M0 文档完成；首次上报禁用 |
 | DEF-04 | Domain/Uploads/UploadStateMachine.cs（无"强制成功"边）；API 无放行后门（API-03） | UploadStateMachineTests.Illegal_edge_rejected、Succeeded_is_terminal_and_every_other_state_has_exit | — | M0 完成（状态机层）；业务放行校验 M2/M3 |
 | DEF-05 | Application/Security/PermissionCatalog.cs（13 权限项模板）；Host/Security/AdminInitializer.cs（最小初始权限） | PermissionAuditTests.Grant_check_revoke_and_duplicate_grant_idempotent | SQL 2019 集成（授权降级；2008 R2 待补验） | M0 完成 |
-| DEF-06 | 0002_source.sql source_line CK_line_event（SALE/CONSUMER_RETURN/NO_EVENT）；fixtures/ksoa/sale-mixed-return.json；拆分逻辑未实现 | AT-042（计划） | G-ERP 未取证 | M0 DDL+fixture 完成；事件拆分 M3 未实现 |
+| DEF-06 | source_line CK_line_event + FixtureKsoaAdapter 正负 shl 分事件（不抵消）+ SourceSync 落库 | FixtureKsoaAdapterTests.Mixed_sign_receipt_splits_events_without_netting；SourceSyncTests.Sale_ingest_per_line_codes_utc_time_checkpoint_and_audit；AT-042（生产上报待 M3） | G-ERP/G-RETURN 未取证；SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成（fixture 事件拆分）；生产上报 M3 |
 | DEF-07 | （M4 计划：UTF-8 CSV 导出、防公式注入、权限与下载审计） | AT-074（计划） | — | 未实现（M4） |
 | AUTH-01 | Host/Security/PermissionHandler.cs + RequirePermissionAttribute.cs + Program.cs 逐请求策略 | ApiGateTests.Anonymous_mutation_rejected_401、No_permission_confirm_returns_403_and_db_unchanged（AT-065）、Dashboard_requires_trace_read_and_returns_real_counts | SQL 2019 集成（授权降级；2008 R2 待补验） | M0 完成 |
 | AUTH-02 | AdminInitializer.cs（--init-admin 交互式密码，无默认公开密码）；Program.cs Cookie .tf.auth（HttpOnly/Strict）+ 全局 CSRF 中间件；AuthEndpoints.cs 登录自验 CSRF、失败留痕 | ApiGateTests.Missing_csrf_rejected、Authenticated_mutation_without_csrf_header_rejected_400、Overlength_username_login_401_and_failure_audit_actor_clamped | SQL 2019 集成（授权降级；2008 R2 待补验） | M0 完成（初始化方式入部署文档属 G-DEPLOY/M4 缺口） |
 | AUTH-03 | Infrastructure/Security/AuditLog.cs + audit_log（actor/时间/对象/原因/前后摘要/requestId/rule_version/env）；AuthEndpoints/AdminEndpoints 全留痕 | PermissionAuditTests.Audit_append_stores_before_after_and_actor | SQL 2019 集成（授权降级；2008 R2 待补验） | M0 完成（已实现动作；全业务动作审计随 M1–M4） |
-| SRC-01 | Program.cs 连接串仅部署配置（不入 Git）；DbMigrator 只连目标库；DpapiProtector 凭据加密；源库只读适配器未实现 | DpapiProtectorTests（2 用例）；AT-001（计划） | G-ERP 未取证 | M0 部分完成（配置/工具约束）；只读同步 M1 未实现 |
-| SRC-02 | source-mapping.md 候选组合键；0002 UQ_snapshot_key_version/UQ_line_key + ingest_exception；fixtures/ksoa/sale-missing-plh.json；键唯一性取证未做 | AT-002/003（计划） | G-ERP 未取证（NULL/重复/跨日复用查询待做） | M0 DDL+文档完成；接入验证 M1 未实现 |
-| SRC-03 | source-mapping.md/adapter-facts.md（主档未给出，不猜表名）；product DF trace_classification=UNKNOWN 阻断 | AT-011（计划） | G-ERP 未取证 | 未实现（M1）；UNKNOWN 阻断 DDL 就绪 |
-| SRC-04 | Domain/Codes/TraceCodeNormalizer.cs + CodeFormat.cs（raw+normalized，不截断、非 8 开头=Unsupported） | TraceCodeNormalizerTests（7 用例：Valid_8_prefix_20_digit_supported、Leading_zeros_preserved_as_string、Edge_whitespace_and_scanner_control_chars_removed、Overlong_code_not_truncated、Non_8_prefix_is_unsupported_not_absent、Internal_control_char_unsupported_not_silently_stripped、Empty_is_empty_not_exempt） | — | M0 完成（接入在 M1） |
-| SRC-05 | Domain/Quantities/Qty.cs + UnitRatio.cs（decimal(18,6)、精确有向换算、超域抛错）；source_line expiry_precision CHECK DAY/MONTH/UNKNOWN | QtyTests（8 用例）、UnitRatioTests（5 用例） | — | M0 完成（值对象层；接入换算 M1/M2） |
-| SYNC-01 | （M1 计划：重叠窗口/稳定排序/摘要去重/回扫）；source_snapshot.content_hash、sync_checkpoint DDL 就绪 | AT-004（计划） | G-ERP 未取证 | 未实现（M1） |
-| SYNC-02 | （M1 计划：已提交读、两轮摘要一致+稳定期）；completeness_status 五态 CHECK 就绪 | AT-005（计划） | G-ERP 未取证 | 未实现（M1） |
+| SRC-01 | 连接串仅部署配置；DpapiProtector；SettingsService erp.connection 密钥只写；FixtureKsoaAdapter（真实只读未取证） | SettingsServiceTests.Secret_is_write_only_never_echoed_and_audit_has_no_plaintext；DpapiProtectorTests（2 用例）；AT-001（真实 ERP 只读账号取证待做） | G-ERP 未取证 | M1 完成（凭据管理）；只读账号取证待做 |
+| SRC-02 | SourceSyncService 键校验（plh 空→INVALID 不造行；跨类型/跨日复用→新版本旧保留）+ 0002 UQ_snapshot_key_version/UQ_line_key | SourceSyncTests.Missing_plh_doc_is_invalid_with_raw_exception_no_lines、Same_doc_key_across_document_types_is_key_reuse、Cross_day_reuse_across_runs_invalidates_new_version_old_intact；FixtureKsoaAdapterTests.Missing_plh_becomes_issue_with_raw_preserved_not_fabricated_line、Duplicate_line_key_and_orphan_line_become_issues、Same_doc_key_across_business_days_flags_cross_day_reuse | SQL 2019 集成（授权降级；2008 R2 待补验）；G-ERP 真实键唯一性取证待做 | M1 fixture 验证完成；真实取证待做 |
+| SRC-03 | ImportService（PRODUCT/SUPPLIER 主档导入，不猜 KSOA 表名）+ product UNKNOWN 阻断 + trace-policy | ImportServiceTests.Commit_product_update_never_touches_classification、Commit_supplier_and_platform_drug_upsert；ClassificationTests.Trace_policy_updates_and_audits | SQL 2019 集成（授权降级；2008 R2 待补验）；G-ERP 主档来源取证待做 | M1 导入通道完成；真实主档来源取证待做 |
+| SRC-04 | TraceCodeNormalizer + CodeFormatStorage 持久化 token（0007 code_format nvarchar(32)）+ source_line raw+normalized 双存 | TraceCodeNormalizerTests（7 用例）；CodeFormatStorageTests（4 方法/6 用例）；SourceSyncTests.Raw_codes_preserved_verbatim_leading_zeros_and_control_chars | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成（接入双存） |
+| SRC-05 | Qty/UnitRatio + ExpiryParser/BusinessTimeParser/LineHash + SourceSync 接入（越界→issue 不静默舍入） | QtyTests（8 用例）、UnitRatioTests（5 用例）；SourceValueObjectTests.Expiry_precision、Business_time_shanghai_to_utc、Line_hash_deterministic_and_sensitive；SourceSyncTests.Qty_out_of_range_becomes_issue_raw_preserved_line_not_silently_rounded | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成（接入换算；单位换算应用 M2） |
+| SYNC-01 | SourceSyncService 重叠窗口 + content_hash 摘要去重 + sync_checkpoint 持久检查点 | SourceSyncTests.Second_identical_run_dedups_by_hash_no_new_version；SourceValueObjectTests.Incremental_window_overlaps_checkpoint、Document_hash_order_insensitive_via_sorted_inputs | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成（fixture 通道） |
+| SYNC-02 | SourceStabilizationService（稳定期 10 秒/轮间隔≥5 秒/两轮摘要一致）+ 0007 stabilize_rounds/last_round_at | SourceStabilizationTests.Two_consistent_rounds_with_interval_promote_complete、Zero_line_doc_never_completes、Late_lines_new_version_resolves_empty_detail_and_completes | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成 |
 | SYNC-03 | 0004 download_progress（列表/详情分页分离，bill_id=0 列表级）DDL 就绪；分页落库同事务逻辑未实现 | AT-006/022（计划） | G-TOP 未取证 | M0 DDL 完成；下载逻辑 M2 未实现 |
-| SYNC-04 | （M1 计划：轮询/回扫窗口参数、持久检查点补拉）；sync_checkpoint DDL 就绪 | AT-007（计划） | G-ERP 未取证 | 未实现（M1） |
-| SYNC-05 | （M1 计划：SOURCE_CHANGED 保留旧快照+异常+暂停依赖）；DDL 就绪 | AT-057（计划） | G-ERP 未取证 | 未实现（M1） |
-| MD-01 | 0003 product trace_classification CHECK + classification_reason；分类变更/影响重算逻辑未实现；openapi TracePolicyRequest 契约已列 | AT-009/010/011（计划） | — | M0 DDL 完成；分类管理 M1 未实现 |
-| MD-02 | 0003 platform_drug.source_kind/source_time（积累来源标记）；积累逻辑未实现 | — | G-TOP 未取证 | 未实现（M1/M2） |
-| MD-03 | 0003 import_batch UQ_import_intent + import_row（行错误可追查）；暂存/预览/提交流程未实现 | — | — | M0 DDL 完成；导入 M1 未实现 |
-| MATCH-01 | （M1 计划：五字段一致+双向唯一才 AUTO_CONFIRMED）；product_mapping DDL 就绪 | AT-012/014（计划） | — | 未实现（M1） |
-| MATCH-02 | （M1 计划：条码仅辅助、单字段不自动绑定）；approval_no_raw/norm 双列就绪 | AT-013（计划） | — | 未实现（M1） |
-| MATCH-03 | 0003 UX_pmap_active_local/UX_pmap_active_platform（双向有效唯一）；drug_prefix_index IX_drug_prefix 非唯一 | MasterConstraintTests.Two_active_mappings_to_same_platform_drug_rejected、Two_active_mappings_for_same_local_product_rejected；AT-015/018（计划） | SQL 2019 集成（授权降级；2008 R2 待补验） | M0 DDL+约束集成完成；匹配算法 M1 未实现 |
-| MATCH-04 | 0003 product_mapping/supplier_mapping 7 态 CHECK + is_locked + version；状态流转逻辑未实现 | AT-016/017（计划） | — | M0 DDL 完成；流转 M1 未实现 |
-| MATCH-05 | （M1 计划：确认显示差异/证据/影响，强冲突禁忽略）；openapi ConfirmMappingRequest 契约已列 | AT-015（计划） | — | 未实现（M1） |
-| ENT-01 | （M1 计划：证号精确匹配+审核枚举核对）；supplier_mapping DDL 就绪 | AT-019（计划） | G-TOP 未取证 | 未实现（M1） |
-| ENT-02 | 0003 platform_enterprise_version UQ_ent_version(ref_ent_id, ent_id)（稳定身份+名称版本）；快照保护逻辑未实现 | AT-020/021（计划） | G-TOP 未取证 | M0 DDL 完成；逻辑 M1/M2 未实现 |
-| ENT-03 | 代码无 saveent 调用能力；supplier_mapping 无默认供应商路径 | AT-019（计划） | G-TOP 未取证 | M0 完成（负约束）；匹配 M1 未实现 |
+| SYNC-04 | SyncScheduler（轮询 30 秒/回扫 72h/每日 30 天）+ SourceSyncJobHandler 检查点补拉不截断 | SyncSchedulerTests.Tick_enqueues_periodic_daily_and_match_intents_idempotent、Next_poll_bucket_creates_new_periodic_intents；SourceSyncJobHandlerTests.First_periodic_run_uses_daily_rescan_window、Stale_checkpoint_gap_never_truncated；SourceValueObjectTests.Daily_window_30_days、First_run_uses_daily_lookback、Gap_backfill_never_truncates | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成（fixture 通道） |
+| SYNC-05 | SourceStabilizationService SOURCE_CHANGED（旧快照保留+任务 payload 不可变） | SourceStabilizationTests.Complete_doc_changed_marks_source_changed_and_task_payload_immutable（AT-057） | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成（检测+保留）；依赖暂停接线 M2/M3 |
+| MD-01 | ClassificationService trace-policy（REQUIRED/EXEMPT+reason+版本并发）+ ProductsPage ClassifyDialog | ClassificationTests.Trace_policy_updates_and_audits、Trace_policy_validation_and_concurrency、Trace_policy_requires_permission；ImportServiceTests.Commit_product_update_never_touches_classification | SQL 2019 集成（授权降级；2008 R2 待补验）；npm run build | M1 完成 |
+| MD-02 | ImportService PLATFORM_DRUG/ENTERPRISE 导入积累（source_kind=IMPORT）；真实平台下载 M2 | ImportServiceTests.Commit_supplier_and_platform_drug_upsert、Commit_enterprise_insert_only | SQL 2019 集成（授权降级；2008 R2 待补验）；G-TOP 未取证 | M1 导入积累完成；平台下载 M2 |
+| MD-03 | ImportService 暂存/预览/提交（20MB/10000 行上限）+ ImportWizard + 0007 import_batch.staged_content | ImportServiceTests（15 用例：Stage_product_creates_batch_then_handler_writes_rows、Stage_same_hash_idempotent、Stage_hash_mismatch_rejected、Stage_invalid_base64_rejected、Stage_oversize_rejected、Stage_too_many_rows_rejected、Stage_header_only_batch_becomes_failed、Commit_product_update_never_touches_classification、Commit_supplier_and_platform_drug_upsert、Commit_enterprise_insert_only、Commit_version_conflict_and_double_commit、Commit_enqueues_match_job_and_audit、Stage_committed_batch_restage_returns_zero_job、Stage_failed_batch_restage_returns_zero_job、Stage_handler_rerun_on_committed_batch_is_noop）；ImportApiTests（3 用例：Post_import_stage_returns_202_with_string_ids、Get_import_detail_shape_and_pagination、Commit_import_stale_version_409_and_validation） | SQL 2019 集成（授权降级；2008 R2 待补验）；npm run build | M1 完成 |
+| MATCH-01 | DrugIdentityMatcher 五字段（Trim+Ordinal，缺字段不通配）+ MatchingService AUTO_CONFIRMED | DrugIdentityMatcherTests.All_five_equal_is_full_match、Trim_before_compare、Missing_field_never_wildcards、Empty_string_counts_as_missing_not_equal；MatchingServiceTests.Full_match_bidirectional_unique_auto_confirms、Missing_field_never_wildcards（AT-012/014） | 单元；SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成 |
+| MATCH-02 | ApprovalNoNormalizer（raw+norm 双存）；条码仅辅助、单字段不自动绑定 | DrugIdentityMatcherTests.Same_name_different_package_conflicts_not_full、Zero_overlap_has_no_equal_no_conflict；ApprovalNoNormalizerTests.Normalize_keeps_letters_digits_version；MatchingServiceTests.Field_conflict_marks_conflict（AT-013） | 单元；SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成 |
+| MATCH-03 | MatchingService 双向唯一 + drug_prefix_index 重建/冲突 + 0007 UX_pmap_pair | MatchingServiceTests.Bidirectional_unique_blocks_identical_twins、Prefix_index_rebuild_and_conflict；MappingConfirmTests.Confirm_active_unique_race_rejected；MasterConstraintTests（2 用例）（AT-015/018） | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成 |
+| MATCH-04 | MappingStates 7 态流转 + confirm/disable + is_locked + 重验 | MatchingServiceTests.Locked_mapping_untouched、Active_mapping_revalidation_detects_platform_change；MappingConfirmTests.Confirm_candidate_sets_manual_locked、Disable_active_then_reconfirm（AT-016/017） | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成 |
+| MATCH-05 | MappingEndpoints confirm（五字段差异/targetId 校验/强冲突拒绝）+ ProductsPage ConfirmDialog | MappingConfirmTests.Confirm_strong_conflict_rejected、Confirm_wrong_target_rejected_no_rebind、Confirm_version_conflict_and_validation_and_404（AT-015）；npm run build | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成 |
+| ENT-01 | SupplierMatchingService 信用代码精确+审核状态核对+名称仅候选+空通过集不自动 | SupplierMatchingTests.Credit_exact_audit_pass_unique_auto_confirms、Multiple_credit_matches_conflict、Name_only_is_candidate_never_auto、Default_empty_pass_set_never_auto_confirms（AT-019） | SQL 2019 集成（授权降级；2008 R2 待补验）；G-TOP 企业库真实取证待做 | M1 完成（导入企业库匹配） |
+| ENT-02 | platform_enterprise_version 名称版本化（改名映射保留）+ 角色独立存储 | SupplierMatchingTests.Rename_new_version_mapping_stays、Roles_are_independent（AT-020/021） | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成 |
+| ENT-03 | 代码无 saveent 调用能力；无默认供应商自动确认路径 | SupplierMatchingTests.Default_empty_pass_set_never_auto_confirms、Locked_supplier_mapping_untouched（AT-019） | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成（负约束+匹配） |
 | UP-01 | 0004 upstream_bill UQ_upbill_identity（主体组合唯一）；listupout 下载未实现 | CodeConstraintTests.Same_bill_no_different_upstream_subjects_not_merged；AT-022/023（计划） | SQL 2019 集成（授权降级；2008 R2 待补验）；G-TOP 未取证 | M0 DDL+约束完成；下载 M2 未实现 |
 | UP-02 | 0004 upstream_bill_line/upstream_bill_code（批次/数量/单位/码/包装层级/来源版本）；保存逻辑未实现 | AT-022（计划） | G-TOP 未取证 | M0 DDL 完成；M2 未实现 |
 | IN-01 | （M2 计划：触发点+一键重排只入队）；openapi /inbounds/{id}/rematch 契约已列；outbox_job 入队能力就绪 | AT-024（计划） | — | 未实现（M2） |
@@ -84,41 +84,41 @@
 | JOB-02 | Infrastructure/Jobs/SendRecoveryService.cs（失租→受理未知→只回查；业务占用与租约分离） | SendRecoveryTests（5 用例）、JobQueueTests.Recover_expired_leases_skips_upload_dispatch；AT-059（计划） | SQL 2019 集成（授权降级；2008 R2 待补验） | M0 完成（上传动作恢复在 M3） |
 | JOB-03 | （M3 计划：AppKey/接口/主体共享调用预算、持久 nextAllowedAt） | AT-060（计划） | G-TOP 未取证 | 未实现（M3） |
 | JOB-04 | （M3 计划：回查退避参数、24h 转人工）；outbox_job next_run_at/attempt_count/max_attempts DDL 就绪 | AT-061（计划） | G-TOP 未取证 | 未实现（M3） |
-| JOB-05 | （M1/M3 计划：通道暂停/服务到期阻断）；app_setting DDL 就绪；Host env 配置大小写不敏感、启动规范化为 LIVE/MOCK（默认 MOCK；LIVE 须显式开启） | — | G-TOP/G-DEPLOY 未取证 | 未实现（M1/M3） |
+| JOB-05 | SettingsService sync.paused + SyncScheduler 暂停跳过来源同步（保留匹配）；LIVE 环境不入队 | SettingsServiceTests.Import_bounds_defaults_and_pause_toggle；SyncSchedulerTests.Paused_channel_skips_source_sync_but_keeps_match、Live_env_tick_enqueues_nothing | SQL 2019 集成（授权降级；2008 R2 待补验）；G-TOP/G-DEPLOY 未取证 | M1 完成（来源通道暂停）；平台通道暂停 M3 |
 | UI-01 | Host/Endpoints/DashboardEndpoints.cs + Web/src/pages/DashboardPage.tsx（真实 DB 计数、只读不触发平台请求） | ApiGateTests.Dashboard_requires_trace_read_and_returns_real_counts；AT-073（计划） | SQL 2019 集成（授权降级；2008 R2 待补验） | M0 完成（基础工作台）；深链/全待办 M4 |
-| UI-02 | （M4 计划：商品资料与匹配页）；openapi /products 等契约已列 | — | — | 未实现（M4） |
-| UI-03 | （M4 计划：供应商资料与匹配页） | — | — | 未实现（M4） |
+| UI-02 | Web/src/pages/ProductsPage.tsx（筛选/分页/分类/确认/解除对话框，顶层组件） | ClassificationTests.Products_list_paginates_and_filters、Products_list_includes_active_mapping_identity；MasterPaginationApiTests.Products_page_size_clamped_and_out_of_range_page_empty；npm run build | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成；深链/全待办 M4 |
+| UI-03 | Web/src/pages/SuppliersPage.tsx（信用代码精确对比/名称仅候选/角色独立展示） | ClassificationTests.Suppliers_list_filters_and_mapping；MasterPaginationApiTests.Suppliers_page_size_clamped_and_out_of_range_page_empty；npm run build | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成 |
 | UI-04 | （M4 计划：上游出库单页） | — | — | 未实现（M4） |
 | UI-05 | （M4 计划：入库关联与上传页） | — | — | 未实现（M4） |
 | UI-06 | （M4 计划：POS 销售数据页） | — | G-POS 未取证 | 未实现（M4） |
 | UI-07 | （M4 计划：退货数据页） | — | G-RETURN 未取证 | 未实现（M4） |
 | UI-08 | （M4 计划：追溯码台账页）；code_event 事件链 DDL 就绪 | — | — | 未实现（M4） |
 | UI-09 | （M4 计划：上报与对账中心页） | — | — | 未实现（M4） |
-| UI-10 | （M4 计划：系统设置页）；openapi /settings/* 契约已列 | — | — | 未实现（M4） |
-| UI-11 | （M2/M4 计划：补配逐行差异+版本确认 409 刷新）；openapi AllocationRequest/expectedVersion 契约已列 | AT-067（计划） | — | 未实现（M2/M4） |
+| UI-10 | Web/src/pages/SettingsPage.tsx + SettingsEndpoints（密钥只写/连接测试/渠道暂停） | SettingsServiceTests（9 方法/12 用例）；SettingsApiTests（7 用例）；M1ApiGateTests.Viewer_lacks_settings_and_sync_and_audit_permissions；npm run build | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成 |
+| UI-11 | 映射确认版本 409（ConfirmDialog/DisableDialog expectedVersion）；补配逐行差异 M2 | MappingConfirmTests.Confirm_version_conflict_and_validation_and_404；AT-067（分配重配待 M2） | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 部分完成（映射版本确认）；补配 UI M2/M4 |
 | UI-12 | Web/src/pages/DashboardPage.tsx（10 秒轮询本系统，不直调 TOP）+ components/EnvBadge.tsx（LIVE/MOCK 标识）+ 状态由后台落库展示 | npm run build（tsc 0 错误+vite 产物）；AT-073（计划） | — | M0 完成（壳级）；部分成功标识/失败码入口 M3/M4 |
-| UI-13 | （M4 计划：批量预览+导出后台任务与下载审计） | AT-074（计划） | — | 未实现（M4） |
-| DB-01 | db/migrations/0001–0006（外部 ID/码 nvarchar + Latin1_General_BIN2；内部 bigint identity） | Sql2008CompatibilityTests、MasterConstraintTests、CodeConstraintTests | SQL 2019 集成（授权降级；2008 R2 待补验） | M0 完成 |
-| DB-02 | db/migrations（datetime2(3)/rowversion/decimal(18,6)）；Domain/Quantities（比例精确分子分母） | QtyTests、UnitRatioTests；Sql2008CompatibilityTests | SQL 2019 集成（授权降级；2008 R2 待补验） | M0 完成 |
-| DB-03 | db/migrations/*.sql + 内嵌 SQL（ROW_NUMBER 分页，无高版本语法） | Sql2008CompatibilityTests.No_high_version_syntax_in_any_migration_or_embedded_sql、No_high_version_syntax_in_migration_scripts_full_constraint_list、Row_number_pagination_works_on_2008r2；AT-070（2008 R2 实 instance 待补验） | 静态语法门禁通过；SQL 2019 集成（授权降级；2008 R2 待补验） | M0 完成（语法层）；2008 R2 运行时门禁未满足 |
+| UI-13 | ImportWizard 批量预览（ERROR 行红显/批次版本提交）；导出 M4 | ImportServiceTests.Stage_product_creates_batch_then_handler_writes_rows；ImportApiTests.Get_import_detail_shape_and_pagination；npm run build；AT-074（导出待 M4） | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 部分完成（导入预览）；导出 M4 |
+| DB-01 | db/migrations/0001–0007（外部 ID/码 nvarchar+BIN2；0007 code_format 拓宽/token 化） | Sql2008CompatibilityTests、MasterConstraintTests、CodeConstraintTests、Migration0007Tests.Format_columns_widened_and_default_token、Mapping_pair_unique_indexes_exist | SQL 2019 集成（授权降级；2008 R2 待补验）；默认 collation + BIN2 双变体运行 | M1 完成 |
+| DB-02 | db/migrations（datetime2(3)/rowversion/decimal(18,6)）；RowVer.ToHex/FromHex；BusinessTimeParser.Shanghai | QtyTests、UnitRatioTests；RowVerTests.Roundtrip_16_upper_hex、Invalid_hex_throws_FormatException；SourceValueObjectTests.Business_time_shanghai_to_utc、Business_time_date_only_midnight、Invalid_time_returns_null；Sql2008CompatibilityTests | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成 |
+| DB-03 | db/migrations/*.sql（含 0007）+ 内嵌 SQL（ROW_NUMBER 分页，无高版本语法；0007 入白名单） | Sql2008CompatibilityTests.No_high_version_syntax_in_any_migration_or_embedded_sql、No_high_version_syntax_in_migration_scripts_full_constraint_list、Row_number_pagination_works_on_2008r2；Migration0007Tests（6 用例）；AT-070（2008 R2 实 instance 待补验） | 静态语法门禁通过；SQL 2019 集成（授权降级；2008 R2 待补验）；双 collation 变体 | M1 完成（语法层）；2008 R2 运行时门禁未满足 |
 | DB-04 | 过滤唯一索引 UX_pmap_active_* / UX_smap_active_* / UX_claim_active / UX_alloc_pair_active / UX_verif_current；soft delete 不复用成功单号（UQ_part_billcode 无状态过滤） | MasterConstraintTests（2 用例）、CodeConstraintTests.Active_claim_unique_per_store_env_code_scope、Released_claim_allows_new_active_claim、UploadConstraintTests.Bill_code_unique_and_part_index_unique | SQL 2019 集成（授权降级；2008 R2 待补验） | M0 完成（DDL+约束集成）；替换事务逻辑 M1/M2 |
 | DB-05 | 0005 code_event（事件链/direction/predecessor_event_id）+ code_claim（event_scope 隔离）；父子互斥事务逻辑未实现 | CodeConstraintTests.Same_code_multiple_events_allowed_but_event_code_unique、Active_claim_unique_per_store_env_code_scope；AT-046（计划） | SQL 2019 集成（授权降级；2008 R2 待补验） | M0 完成（DDL+占用唯一）；父子互斥事务 M2 |
-| API-01 | Host/Security/ApiErrors.cs（统一 code/message/fieldErrors/retryable/requestId）；各端点 data/requestId 包络；外部 ID/数量/rowversion 字符串（openapi.yaml） | ApiGateTests（7 用例）；QtyTests（数量字符串精度基础） | SQL 2019 集成（授权降级；2008 R2 待补验） | M0 完成（已实现端点；全量契约 M1+） |
-| API-02 | Host/Security/IdempotencyExecutor.cs + Infrastructure/Security/IdempotencyStore.cs + idempotency_record（同事务） | IdempotencyStoreTests.Same_key_same_hash_replays_same_key_different_hash_conflicts、Rollback_removes_idempotency_record_with_business；ApiGateTests.Idempotent_user_create_same_key_same_body_replays_different_body_409（AT-066） | SQL 2019 集成（授权降级；2008 R2 待补验） | M0 完成 |
+| API-01 | ApiErrors 统一错误 + M1 端点 data/requestId 包络（记录型响应 Results.Json Web camelCase）+ 外部 ID/rowversion 字符串（内部 int64 代理 id/fencingToken 为 JSON number，裁决 #9） | ApiGateTests（7 用例）；M1ApiGateTests.Anonymous_gets_401_on_all_m1_endpoints、Mapping_endpoints_gated、Audit_logs_paginated_and_filterable、Manual_sync_job_accepted_and_validated；SettingsApiTests.Get_settings_returns_camel_case_views_with_unpersisted_defaults；ImportApiTests.Post_import_stage_returns_202_with_string_ids | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成（已实现端点）；全量契约 M2+ |
+| API-02 | IdempotencyExecutor + 0007 用户作用域幂等键 + 查询串参与请求哈希 | IdempotencyHardeningTests.Same_key_different_users_are_independent、Query_string_participates_in_hash、Concurrent_same_key_loser_rolls_back_and_replays_winner、Concurrent_same_key_different_hash_loser_gets_conflict_and_rolls_back；IdempotencyStoreTests（2 用例）；ApiGateTests.Idempotent_user_create_same_key_same_body_replays_different_body_409（AT-066） | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成（加固） |
 | API-03 | M0 仅 7 个端点（auth/admin/dashboard/health），无任意 SQL/平台代理/改结果/reset/换号强推/跳过核验后门；UploadStateMachine 无强制成功 | ApiGateTests（负向门禁）；UploadStateMachineTests.Illegal_edge_rejected；AT-068（计划） | SQL 2019 集成（授权降级；2008 R2 待补验） | M0 完成（负约束） |
 | REC-01 | （M4 计划：日对账集合+摘要比对）；reconciliation_run/difference DDL 就绪 | AT-062/063（计划） | G-TOP 未取证 | 未实现（M4） |
 | REC-02 | 0006 reconciliation_difference CK_diff_type（11 类全枚举）+ severity/owner_role/next_action/证据列；生成逻辑未实现 | AT-062（计划） | — | M0 DDL 完成；M4 未实现 |
 | REC-03 | （M4 计划：INCOMPLETE 口径、查不到不立即重传）；reconciliation_run CK_recon_status 含 INCOMPLETE | AT-064（计划） | G-TOP 未取证 | 未实现（M4） |
-| AUD-01 | Infrastructure/Security/AuditLog.cs + audit_log（不可变追加，无业务删除入口）；AuthEndpoints/AdminEndpoints/AdminInitializer 留痕 | PermissionAuditTests.Audit_append_stores_before_after_and_actor；AT-069（计划） | SQL 2019 集成（授权降级；2008 R2 待补验） | M0 完成（已实现动作；映射/分配/导出等审计随 M1–M4） |
+| AUD-01 | AuditLog + 同步/导入/分类/映射/设置全留痕 + GET /audit-logs 分页过滤（精确等值过滤/occurred_at DESC,id DESC/页大小钳制 1..200） | PermissionAuditTests.Audit_append_stores_before_after_and_actor；SourceSyncTests.Sale_ingest_per_line_codes_utc_time_checkpoint_and_audit；ClassificationTests.Trace_policy_updates_and_audits；SettingsServiceTests.Update_new_int_setting_creates_row_and_audit；M1ApiGateTests.Audit_logs_paginated_and_filterable、Audit_page_size_clamped_and_out_of_range_page_empty、Audit_ordering_newest_first_with_id_tiebreak、Audit_filters_are_exact_not_substring | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成（已实现动作）；分配/导出审计 M2/M4 |
 | NFR-01 | docs/adr/ADR-0001-dotnet8-dapper-sql2008r2.md；Host/Program.cs UseWindowsService + --worker-only/--web-only；独立业务库 | dotnet build TraceFlow.sln -c Release（0 警告 0 错误）；Sql2008CompatibilityTests（语法层） | 服务器兼容证据：SQL 2019 降级运行（2008 R2 待补验）；G-DEPLOY 未取证 | M0 完成（ADR+宿主）；目标环境兼容实证待补 |
-| NFR-02 | Web/src（React 18 + TS：独立请求、轮询清理、无组件内定义组件、交互在事件处理） | npm run build（tsc -b 0 错误 + vite 产物） | — | M0 完成（壳）；长表分页等随 M4 页面 |
+| NFR-02 | Web/src（React 18+TS：顶层对话框组件、轮询 active 守卫清理、分页 50/页、交互在事件处理） | npm run build（tsc -b 0 错误 + vite 产物） | — | M1 完成（六页）；其余页面 M4 |
 | NFR-03 | （M4 计划：10000 商品/100000 销售行基准 p95≤2s） | AT-075（计划） | — | 未实现（M4）；M0 不声称性能 |
-| NFR-04 | （M1 计划：ERP 查询页≤500 头、慢查询记录） | AT-075（计划） | G-ERP 未取证 | 未实现（M1） |
-| NFR-05 | Infrastructure/Security/DpapiProtector.cs + app_setting CK_app_setting_secret（密文与明文互斥）；ApiErrors 不回显连接串/堆栈；HealthEndpoints 不回显连接细节 | DpapiProtectorTests.Roundtrip_under_current_user、Tampered_ciphertext_throws_no_fallback；AT-071（计划） | — | M0 完成 |
+| NFR-04 | FixtureKsoaAdapter 分页拉取（≤500 头/页）；真实 ERP 慢查询记录未取证 | FixtureKsoaAdapterTests（8 用例）；AT-075（性能基准待 M4） | G-ERP 未取证 | M1 部分完成（fixture 分页）；真实 ERP 取证待做 |
+| NFR-05 | DpapiProtector + app_setting 密文/明文互斥 + SettingsService 密钥只写/连接测试不回显凭据 | DpapiProtectorTests（2 用例）；SettingsServiceTests.Secret_is_write_only_never_echoed_and_audit_has_no_plaintext、Connection_test_with_stored_local_connection_succeeds、Connection_test_rejects_non_erp_config_and_missing_id；SettingsApiTests.Secret_write_returns_has_secret_value_and_null_value_json、Connection_test_guards_and_stored_local_connection | SQL 2019 集成（授权降级；2008 R2 待补验） | M1 完成（设置层） |
 | NFR-06 | DashboardEndpoints 基础计数（积压/最近活动时间）；完整指标/站内告警未实现 | ApiGateTests.Dashboard_requires_trace_read_and_returns_real_counts | — | M0 部分完成；完整告警 M4 未实现 |
 | NFR-07 | （M4/G-DEPLOY 计划：备份恢复/配置备份/密钥恢复文档与演练） | AT-072（计划） | G-DEPLOY 未取证 | 未实现（M4） |
 | NFR-08 | （M4 计划：恢复后暂停上传→平台对账修复→再开放） | AT-072（计划） | G-DEPLOY 未取证 | 未实现（M4） |
-| G-ERP | docs/contracts/adapter-facts.md + source-mapping.md + fixtures/ksoa/*（候选，未取证） | — | 未取证 | 真实 ERP 同步禁用（M1 通道） |
+| G-ERP | adapter-facts.md + source-mapping.md + ksoa-adapter-contract.md + fixtures/ksoa/*（fixture 通道已实现，候选列未取证） | FixtureKsoaAdapterTests（8 用例）；SourceSyncTests.Live_env_refuses_sync_in_m1 | 未取证（fixture-only） | 真实 ERP 同步禁用；取证清单见 ksoa-adapter-contract.md §3 |
 | G-TOP | docs/contracts/fixtures/top/*（_verified:false，Mock 形状非平台事实） | — | 未取证 | 真实平台发送禁用（M2/M3 通道） |
 | G-POS | adapter-facts.md POS 采码行（SCOPE-09 冲突待样例裁决） | — | 未取证 | 销售生产自动上报禁用 |
 | G-RETURN | adapter-facts.md 消费者退货/采购退货/负数退货行 | — | 未取证 | 未验证类型不生产上报 |
@@ -128,5 +128,6 @@
 ## 覆盖统计
 
 - 需求行合计 **114**：SCOPE 10、DEF 7、AUTH 3、SRC 5、SYNC 5、MD 3、MATCH 5、ENT 3、UP 2、IN 9、SALE 5、RET 4、TOP 4、IDEM 5、JOB 5、UI 13、DB 5、API 3、REC 3、AUD 1、NFR 8、G-* 6。
+- M1 已实现行（来源同步 fixture 通道/稳定期/导入/分类/匹配/确认解除/设置/审计/四页 UI）均给出实际测试名；G-ERP 仍 fixture-only，真实通道禁用；2008 R2 运行时门禁（AT-070）未满足。
 - M0 已实现（含 DDL/值对象/壳层部分完成）行均给出实际文件与实际测试名；后续阶段行标注计划归属与"未实现"；门禁行全部"未取证"并写明对应真实通道禁用。
 - 未声称任何未验证能力：TOP fixture 为 Mock 形状；2008 R2 运行时兼容未验证；性能/连续运行/备份恢复属 M4，M0 不声称。

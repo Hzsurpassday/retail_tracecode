@@ -5,8 +5,10 @@ info:
   description: >
     PRD §12 最低资源契约。金额/数量/外部ID/rowversion 一律 JSON 字符串（API-01）。
     变更接口要求 Idempotency-Key 头与 expectedVersion（API-02）。x-phase 标注实现阶段。
-    M0 已实现端点（/auth/*、/admin/*、/dashboard、/health）按真实代码形状描述
-    （traceflow/src/TraceFlow.Host/Endpoints/*.cs）；M1+ 端点为计划契约，尚未实现。
+    M0 已实现端点（/auth/*、/admin/*、/dashboard、/health）与 M1 已实现端点
+    （/products、/suppliers、/imports*、/product-mappings/*、/supplier-mappings/*、
+    /products/{id}/trace-policy、/sync-jobs、/jobs/{id}、/audit-logs、/settings*）
+    按真实代码形状描述（traceflow/src/TraceFlow.Host/Endpoints/*.cs）；M2+ 端点为计划契约，尚未实现。
     已认证请求的所有 /api 变更方法（POST/PUT/DELETE/PATCH）必须携带 X-CSRF-TOKEN 头
     （全局 antiforgery 中间件，AUTH-02）；/auth/login 与 /auth/logout 匿名可达但自行校验 CSRF。
     失败统一 code/message/fieldErrors/retryable/requestId；401 未登录、403 无权、
@@ -177,7 +179,7 @@ components:
       type: object
       required: [fileKind, fileHash, content]
       properties:
-        fileKind: { type: string, description: 导入文件类型（如平台药品映射导出） }
+        fileKind: { type: string, enum: [PRODUCT, SUPPLIER, PLATFORM_DRUG, ENTERPRISE], description: 导入类型（决定 CSV 列模板与目标表） }
         fileName: { type: string }
         fileHash: { type: string, description: 文件 SHA-256 摘要字符串；同导入意图幂等（MD-03） }
         content: { type: string, description: 上传内容（Base64）；默认边界 20 MB/10000 行，超限 422 要求拆批 }
@@ -231,6 +233,255 @@ components:
           required: [jobId]
           properties:
             jobId: { type: string, description: 'outbox_job 作业 ID 字符串；GET /jobs/{id} 查询进度' }
+        requestId: { type: string }
+    # ---- M1 已实现端点真实响应形状（T16 回写） ----
+    SettingView:
+      type: object
+      required: [id, key, isSecret, hasSecretValue, version]
+      properties:
+        id: { type: integer, format: int64, description: app_setting 本地 ID（JSON number，内部 int64 代理）；未持久化为 0 }
+        key: { type: string }
+        valueJson: { type: string, nullable: true, description: 非密钥配置 JSON 文本；密钥键恒 null }
+        isSecret: { type: boolean }
+        hasSecretValue: { type: boolean, description: 是否已保存密钥密文（不回显明文） }
+        version: { type: string, description: rowversion 字符串；未持久化为 "0" }
+        updatedBy: { type: string, nullable: true }
+        updatedAtUtc: { type: string, format: date-time, nullable: true }
+        reason: { type: string, nullable: true }
+    SettingsListResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data: { type: array, items: { $ref: '#/components/schemas/SettingView' } }
+        requestId: { type: string }
+    SettingUpdateResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data: { $ref: '#/components/schemas/SettingView' }
+        requestId: { type: string }
+    ConnectionTestResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [ok, message]
+          properties:
+            ok: { type: boolean }
+            message: { type: string, description: 连接结果描述（不回显凭据/连接串） }
+        requestId: { type: string }
+    ImportBatchView:
+      type: object
+      required: [batchId, fileKind, fileName, fileHash, totalRows, successRows, failedRows, status, version]
+      properties:
+        batchId: { type: string }
+        fileKind: { type: string, enum: [PRODUCT, SUPPLIER, PLATFORM_DRUG, ENTERPRISE] }
+        fileName: { type: string }
+        fileHash: { type: string }
+        totalRows: { type: integer }
+        successRows: { type: integer }
+        failedRows: { type: integer }
+        status: { type: string, enum: [STAGED, COMMITTED, FAILED] }
+        version: { type: string, description: rowversion 字符串 }
+        stagedBy: { type: string }
+        stagedAt: { type: string, format: date-time }
+        committedBy: { type: string, nullable: true }
+        committedAt: { type: string, format: date-time, nullable: true }
+    ImportAccepted:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [jobId, batchId]
+          properties:
+            jobId: { type: string, description: 'import-stage 作业 ID；已提交/失败批次返回 "0"（不产生作业）' }
+            batchId: { type: string }
+        requestId: { type: string }
+    ImportPreviewResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data: { $ref: '#/components/schemas/ImportBatchView' }
+        requestId: { type: string }
+    ImportDetailResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [batch, rows, total, page, pageSize]
+          properties:
+            batch: { $ref: '#/components/schemas/ImportBatchView' }
+            rows:
+              type: array
+              items:
+                type: object
+                required: [rowNumber, status, rawJson]
+                properties:
+                  rowNumber: { type: integer }
+                  status: { type: string, enum: [OK, ERROR, APPLIED] }
+                  error: { type: string, nullable: true }
+                  rawJson: { type: string }
+            total: { type: integer }
+            page: { type: integer }
+            pageSize: { type: integer }
+        requestId: { type: string }
+    ImportCommitResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [appliedRows, status]
+          properties:
+            appliedRows: { type: integer }
+            status: { type: string, enum: [COMMITTED] }
+        requestId: { type: string }
+    MappingActionResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [mappingId, state, version, mappingVersion]
+          properties:
+            mappingId: { type: string }
+            state: { type: string, enum: [MANUAL_CONFIRMED, DISABLED] }
+            version: { type: string, description: 新 rowversion 字符串 }
+            mappingVersion: { type: integer, description: 新 int 乐观版本 }
+        requestId: { type: string }
+    DisableMappingRequest:
+      type: object
+      required: [expectedVersion, reason]
+      properties:
+        expectedVersion: { type: string }
+        reason: { type: string, maxLength: 500 }
+    TracePolicyResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [productId, traceClassification, classificationReason, version, affectedNonTerminalTasks]
+          properties:
+            productId: { type: string }
+            traceClassification: { type: string, enum: [REQUIRED, EXEMPT] }
+            classificationReason: { type: string }
+            affectedNonTerminalTasks: { type: integer, description: 关联非终态任务数；M1 恒 0（无任务产生路径），失效接线 M2 }
+            version: { type: string, description: 新商品 rowversion 字符串 }
+        requestId: { type: string }
+    ProductMappingView:
+      type: object
+      required: [mappingId, state, isLocked, mappingVersion, version, platformDrugId]
+      properties:
+        mappingId: { type: string }
+        state: { type: string }
+        isLocked: { type: boolean }
+        mappingVersion: { type: integer }
+        version: { type: string }
+        platformDrugId: { type: string }
+        approvalNoNorm: { type: string, nullable: true }
+        manufacturerIdentity: { type: string, nullable: true }
+        dosageForm: { type: string, nullable: true }
+        strength: { type: string, nullable: true }
+        packageSpec: { type: string, nullable: true }
+    ProductsResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [records, total, page, pageSize]
+          properties:
+            records:
+              type: array
+              items:
+                type: object
+                required: [productId, spid, name, traceClassification, version, mappingState]
+                properties:
+                  productId: { type: string }
+                  spid: { type: string }
+                  displayCode: { type: string, nullable: true }
+                  barcode: { type: string, nullable: true }
+                  name: { type: string }
+                  approvalNoRaw: { type: string, nullable: true }
+                  approvalNoNorm: { type: string, nullable: true }
+                  manufacturerRaw: { type: string, nullable: true }
+                  manufacturerIdentity: { type: string, nullable: true }
+                  dosageForm: { type: string, nullable: true }
+                  strength: { type: string, nullable: true }
+                  packageSpec: { type: string, nullable: true }
+                  unit: { type: string, nullable: true }
+                  traceClassification: { type: string, enum: [UNKNOWN, REQUIRED, EXEMPT] }
+                  classificationReason: { type: string, nullable: true }
+                  updatedAt: { type: string, format: date-time }
+                  version: { type: string }
+                  mappingState: { type: string, description: 7 态或 NONE（无映射） }
+                  mapping: { nullable: true, allOf: [{ $ref: '#/components/schemas/ProductMappingView' }] }
+            total: { type: integer }
+            page: { type: integer }
+            pageSize: { type: integer }
+        requestId: { type: string }
+    SupplierMappingView:
+      type: object
+      required: [mappingId, state, isLocked, mappingVersion, version, refEntId, entId, platformName]
+      properties:
+        mappingId: { type: string }
+        state: { type: string }
+        isLocked: { type: boolean }
+        mappingVersion: { type: integer }
+        version: { type: string }
+        refEntId: { type: string }
+        entId: { type: string }
+        platformName: { type: string }
+        creditCode: { type: string, nullable: true }
+        auditStatus: { type: string, nullable: true }
+        role: { type: string, nullable: true }
+    SuppliersResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [records, total, page, pageSize]
+          properties:
+            records:
+              type: array
+              items:
+                type: object
+                required: [supplierId, dwbh, name, version, mappingState]
+                properties:
+                  supplierId: { type: string }
+                  dwbh: { type: string }
+                  name: { type: string }
+                  creditCode: { type: string, nullable: true }
+                  role: { type: string, nullable: true }
+                  version: { type: string }
+                  mappingState: { type: string }
+                  mapping: { nullable: true, allOf: [{ $ref: '#/components/schemas/SupplierMappingView' }] }
+            total: { type: integer }
+            page: { type: integer }
+            pageSize: { type: integer }
+        requestId: { type: string }
+    JobStatusResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [jobId, jobKind, intentKey, jobState, attemptCount, fencingToken]
+          properties:
+            jobId: { type: string }
+            jobKind: { type: string }
+            intentKey: { type: string }
+            jobState: { type: string, enum: [PENDING, RUNNING, DONE, FAILED, CANCELLED] }
+            attemptCount: { type: integer }
+            nextRunAtUtc: { type: string, format: date-time }
+            lastError: { type: string, nullable: true }
+            leaseOwner: { type: string, nullable: true }
+            fencingToken: { type: integer, format: int64, description: JSON number（int64 内部代理；API-01 字符串约定仅适用外部平台 ID/rowversion，裁决 #9） }
         requestId: { type: string }
   responses:
     Unauthorized: { description: 未登录, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
@@ -321,7 +572,7 @@ paths:
       description: 健康检查（匿名）。DB 探测失败仅返回 UNAVAILABLE，不回显连接细节（NFR-05）。
       responses:
         '200': { description: 环境/DB 状态/服务器 UTC 时间, content: { application/json: { schema: { $ref: '#/components/schemas/HealthResponse' } } } }
-  # ================= M1+ 计划契约（未实现，x-phase 标注） =================
+  # ================= M1 已实现端点（真实形状）+ M2+ 计划契约（x-phase 标注） =================
   /products:
     get:
       x-phase: M1
@@ -331,7 +582,7 @@ paths:
         { name: classification, in: query, schema: { type: string, enum: [UNKNOWN, REQUIRED, EXEMPT] } },
         { name: mappingState, in: query, schema: { type: string } }]
       responses:
-        '200': { description: 分页商品, content: { application/json: { schema: { $ref: '#/components/schemas/PageMeta' } } } }
+        '200': { description: 分页商品, content: { application/json: { schema: { $ref: '#/components/schemas/ProductsResponse' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
   /suppliers:
@@ -342,13 +593,25 @@ paths:
         { name: keyword, in: query, schema: { type: string } },
         { name: mappingState, in: query, schema: { type: string } }]
       responses:
-        '200': { description: 分页供应商, content: { application/json: { schema: { $ref: '#/components/schemas/PageMeta' } } } }
+        '200': { description: 分页供应商, content: { application/json: { schema: { $ref: '#/components/schemas/SuppliersResponse' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
   /imports:
+    get:
+      x-phase: M1
+      description: 按 (fileKind,fileHash) 定位批次预览（权限 master:match）。上传暂存完成后返回批次摘要与版本。fileHash 大小写不敏感（查询归一化为大写 hex）。
+      parameters:
+        - { name: fileKind, in: query, required: true, schema: { type: string, enum: [PRODUCT, SUPPLIER, PLATFORM_DRUG, ENTERPRISE] } }
+        - { name: fileHash, in: query, required: true, schema: { type: string } }
+      responses:
+        '200': { description: 批次摘要, content: { application/json: { schema: { $ref: '#/components/schemas/ImportPreviewResponse' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
     post:
       x-phase: M1
-      description: 导入先暂存预览（权限 master:match，MD-03）。202 返回 jobId；文件摘要幂等（UQ_import_intent）；超默认 20 MB/10000 行边界 422 要求拆批。
+      description: 导入先暂存预览（权限 master:match，MD-03）。202 返回 jobId/batchId（均字符串）；文件摘要幂等（UQ_import_intent）；已提交/失败批次重复上传返回 jobId="0"（不产生作业）；超默认 20 MB/10000 行边界 422 要求拆批。
       parameters:
         - { $ref: '#/components/parameters/IdempotencyKey' }
         - { $ref: '#/components/parameters/CsrfToken' }
@@ -356,7 +619,7 @@ paths:
         required: true
         content: { application/json: { schema: { $ref: '#/components/schemas/ImportRequest' } } }
       responses:
-        '202': { description: 已入队暂存校验作业, content: { application/json: { schema: { $ref: '#/components/schemas/JobAccepted' } } } }
+        '202': { description: 已入队暂存校验作业, content: { application/json: { schema: { $ref: '#/components/schemas/ImportAccepted' } } } }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -365,7 +628,7 @@ paths:
   /imports/{id}/commit:
     post:
       x-phase: M1
-      description: 预览确认后提交导入（权限 master:match）。expectedVersion 校验；冲突保留失败行，失败行可单独重提，成功行重复导入幂等；不自动覆盖锁定映射。
+      description: 预览确认后提交导入（权限 master:match）。expectedVersion 校验（冲突 409 VERSION_CONFLICT）；仅应用 OK 行（ERROR 行保留留证，不应用）；非 STAGED 批次 422；提交同事务入队 master-match 自动匹配；PRODUCT 更新永不触碰追溯分类（MD-01）；不自动覆盖锁定映射。
       parameters:
         - { $ref: '#/components/parameters/ResourceId' }
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -374,10 +637,11 @@ paths:
         required: true
         content: { application/json: { schema: { $ref: '#/components/schemas/CommitImportRequest' } } }
       responses:
-        '200': { description: 提交结果（成功/失败行数与失败原因）, content: { application/json: { schema: { $ref: '#/components/schemas/EmptyDataResponse' } } } }
+        '200': { description: 提交结果（应用行数）, content: { application/json: { schema: { $ref: '#/components/schemas/ImportCommitResponse' } } } }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         '422': { $ref: '#/components/responses/Unprocessable' }
   /product-mappings/{id}/confirm:
@@ -392,7 +656,7 @@ paths:
         required: true
         content: { application/json: { schema: { $ref: '#/components/schemas/ConfirmMappingRequest' } } }
       responses:
-        '200': { description: 映射已确认（MANUAL_CONFIRMED，锁定）, content: { application/json: { schema: { $ref: '#/components/schemas/EmptyDataResponse' } } } }
+        '200': { description: 映射已确认（MANUAL_CONFIRMED，锁定）, content: { application/json: { schema: { $ref: '#/components/schemas/MappingActionResponse' } } } }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -410,7 +674,7 @@ paths:
         required: true
         content: { application/json: { schema: { $ref: '#/components/schemas/ConfirmMappingRequest' } } }
       responses:
-        '200': { description: 映射已确认, content: { application/json: { schema: { $ref: '#/components/schemas/EmptyDataResponse' } } } }
+        '200': { description: 映射已确认, content: { application/json: { schema: { $ref: '#/components/schemas/MappingActionResponse' } } } }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -419,7 +683,7 @@ paths:
   /products/{id}/trace-policy:
     post:
       x-phase: M1
-      description: 变更追溯分类（权限 master:classify，MD-01）。REQUIRED→EXEMPT 须原因并显示受影响未传任务；审计留痕；未传任务失效重算；禁止批量免除消除漏码错误。
+      description: 变更追溯分类（权限 master:classify，MD-01）。REQUIRED→EXEMPT 须原因（≤500 字）；审计留痕；UPDATE 只动分类两列。affectedNonTerminalTasks 为经快照→来源行 spid 关联的非终态任务计数（M1 无任务产生路径，恒 0）；分类变更对已生成任务的失效/重阻断接线 M2；禁止批量免除消除漏码错误。
       parameters:
         - { $ref: '#/components/parameters/ResourceId' }
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -428,12 +692,71 @@ paths:
         required: true
         content: { application/json: { schema: { $ref: '#/components/schemas/TracePolicyRequest' } } }
       responses:
-        '200': { description: 分类已变更（含受影响任务提示）, content: { application/json: { schema: { $ref: '#/components/schemas/EmptyDataResponse' } } } }
+        '200': { description: 分类已变更（含受影响任务提示）, content: { application/json: { schema: { $ref: '#/components/schemas/TracePolicyResponse' } } } }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
         '422': { $ref: '#/components/responses/Unprocessable' }
+  /imports/{id}:
+    get:
+      x-phase: M1
+      description: 导入批次详情+逐行预览（权限 master:match，MD-03）。ROW_NUMBER 分页；行含 OK/ERROR/APPLIED 与错误原因。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/PageSize' }
+      responses:
+        '200': { description: 批次与逐行预览, content: { application/json: { schema: { $ref: '#/components/schemas/ImportDetailResponse' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /product-mappings/{id}/disable:
+    post:
+      x-phase: M1
+      description: 解除商品映射（权限 master:match）。expectedVersion+reason；存在非终态上传任务阻断（409 TASKS_IN_FLIGHT）；解除后 is_locked=0，可重新确认。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/DisableMappingRequest' } } }
+      responses:
+        '200': { description: 映射已解除, content: { application/json: { schema: { $ref: '#/components/schemas/MappingActionResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: 版本冲突/在途任务, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /supplier-mappings/{id}/disable:
+    post:
+      x-phase: M1
+      description: 解除供应商映射（权限 master:match）。org 下非终态采购任务阻断（409 TASKS_IN_FLIGHT，M1 保守守卫；M2 细化到 dwbh 级）。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/DisableMappingRequest' } } }
+      responses:
+        '200': { description: 映射已解除, content: { application/json: { schema: { $ref: '#/components/schemas/MappingActionResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: 版本冲突/在途任务, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /settings:
+    get:
+      x-phase: M1
+      description: 设置列表（权限 system:manage，UI-10）。密钥键仅返回 isSecret/hasSecretValue，绝不回显明文（NFR-05）；含未持久化键默认值（id=0, version="0"）。响应 camelCase。
+      responses:
+        '200': { description: 设置列表, content: { application/json: { schema: { $ref: '#/components/schemas/SettingsListResponse' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /upstream-bills:
     get:
       x-phase: M2
@@ -461,7 +784,7 @@ paths:
   /sync-jobs:
     post:
       x-phase: M1
-      description: 触发有界同步作业（权限 job:rematch 或 system:manage 按实体）。有界参数（entity/窗口），202 入队；不同步等待全部 TOP；无条件补拉拒绝（UI-13）。
+      description: 触发有界同步作业（权限 job:rematch）。有界参数（entity 限 sale/purchase-in；窗口 end>start、end≤now+5min、跨度≤90 天），202 入队（data.jobId 字符串）；LIVE 环境 422 ERP_NOT_CERTIFIED（G-ERP 未取证）；通道暂停 422 CHANNEL_PAUSED；不同步等待全部 TOP；无条件补拉拒绝（UI-13）。
       parameters:
         - { $ref: '#/components/parameters/IdempotencyKey' }
         - { $ref: '#/components/parameters/CsrfToken' }
@@ -474,7 +797,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
-        '422': { description: 参数越界/无界窗口/通道暂停, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: 参数越界/无界窗口/通道暂停（CHANNEL_PAUSED）/LIVE 未取证（ERP_NOT_CERTIFIED）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
   /inbounds:
     get:
       x-phase: M2
@@ -733,14 +1056,14 @@ paths:
       description: 作业进度（权限 trace:read）。jobState/attemptCount/nextRunAt/lastError/leaseOwner/fencingToken。
       parameters: [{ $ref: '#/components/parameters/ResourceId' }]
       responses:
-        '200': { description: 作业详情, content: { application/json: { schema: { type: object, properties: { data: { type: object }, requestId: { type: string } } } } } }
+        '200': { description: 作业详情, content: { application/json: { schema: { $ref: '#/components/schemas/JobStatusResponse' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
   /audit-logs:
     get:
       x-phase: M1
-      description: 审计记录（权限 audit:read，AUD-01）。操作者/时间/对象/原因/前后值摘要/请求关联号；审计不可变，无普通业务删除入口。
+      description: 审计记录（权限 audit:read，AUD-01）。操作者/时间/对象/原因/前后值摘要/请求关联号；审计不可变，无普通业务删除入口。过滤为精确等值（非子串）；排序 occurred_at DESC, id DESC。records[].id 为 JSON number（int64 内部代理；API-01 字符串约定仅适用外部平台 ID/rowversion，裁决 #9）。records 行形状：id/occurredAtUtc/actor/actorKind/action/objectType/objectId/reason/beforeDigest/afterDigest/requestId/ruleVersion/env。
       parameters: [{ $ref: '#/components/parameters/Page' }, { $ref: '#/components/parameters/PageSize' },
         { name: action, in: query, schema: { type: string } },
         { name: objectType, in: query, schema: { type: string } },
@@ -760,7 +1083,7 @@ paths:
         required: true
         content: { application/json: { schema: { $ref: '#/components/schemas/ConnectionTestRequest' } } }
       responses:
-        '200': { description: 连接健康结果（不回显凭据/连接串）, content: { application/json: { schema: { $ref: '#/components/schemas/EmptyDataResponse' } } } }
+        '200': { description: 连接健康结果（不回显凭据/连接串）, content: { application/json: { schema: { $ref: '#/components/schemas/ConnectionTestResponse' } } } }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -777,7 +1100,7 @@ paths:
         required: true
         content: { application/json: { schema: { $ref: '#/components/schemas/SettingUpdateRequest' } } }
       responses:
-        '200': { description: 设置已更新（敏感值不回显）, content: { application/json: { schema: { $ref: '#/components/schemas/EmptyDataResponse' } } } }
+        '200': { description: 设置已更新（敏感值不回显）, content: { application/json: { schema: { $ref: '#/components/schemas/SettingUpdateResponse' } } } }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
