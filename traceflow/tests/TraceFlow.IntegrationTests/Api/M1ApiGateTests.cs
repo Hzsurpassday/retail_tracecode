@@ -206,6 +206,82 @@ IF NOT EXISTS (SELECT 1 FROM dbo.user_permission WHERE user_id=@id AND permissio
         Assert.Equal(staged.Data.BatchId, view!.Data.BatchId);
     }
 
+    // ---- T16 携带项 2：审计查询加固（pageSize 钳制/越界页/排序/过滤精确性，特征化 OpsEndpoints 既有行为） ----
+
+    private async Task<long> SeedAuditAsync(string action, DateTime occurredAtUtc, string objectType = "t16obj")
+    {
+        await using var c = await _fx.OpenAsync();
+        return await c.ExecuteScalarAsync<long>(@"
+INSERT INTO dbo.audit_log(occurred_at,actor,actor_kind,action,object_type,env)
+OUTPUT inserted.id
+VALUES(@at,N't16seeder',N'User',@action,@ot,N'LIVE')",
+            new { at = occurredAtUtc, action, ot = objectType });
+    }
+
+    [Fact]
+    public async Task Audit_page_size_clamped_and_out_of_range_page_empty()
+    {
+        var (client, _) = await LoginAsync("m1admin", "Admin-Password-123");
+        var action = "t16.audit.clamp." + Guid.NewGuid().ToString("N")[..8];
+        for (var i = 0; i < 3; i++)
+            await SeedAuditAsync(action, DateTime.UtcNow.AddMinutes(-i));
+        // OpsEndpoints：size=Math.Clamp(pageSize??50,1,200)，p=Math.Max(1,page??1)
+        var big = await client.GetFromJsonAsync<AuditPage>($"/api/v1/audit-logs?action={action}&pageSize=1000");
+        Assert.Equal(200, big!.Data.PageSize);
+        Assert.Equal(3, big.Data.Total);
+        Assert.Equal(3, big.Data.Records.Length);
+        var zero = await client.GetFromJsonAsync<AuditPage>($"/api/v1/audit-logs?action={action}&pageSize=0");
+        Assert.Equal(1, zero!.Data.PageSize);
+        Assert.Single(zero.Data.Records);
+        var p0 = await client.GetFromJsonAsync<AuditPage>($"/api/v1/audit-logs?action={action}&page=0");
+        Assert.Equal(1, p0!.Data.Page);
+        // 越界页：ROW_NUMBER 无命中→records 空，total 不变
+        var far = await client.GetFromJsonAsync<AuditPage>($"/api/v1/audit-logs?action={action}&page=100000&pageSize=200");
+        Assert.Empty(far!.Data.Records);
+        Assert.Equal(3, far.Data.Total);
+    }
+
+    [Fact]
+    public async Task Audit_ordering_newest_first_with_id_tiebreak()
+    {
+        var (client, _) = await LoginAsync("m1admin", "Admin-Password-123");
+        var action = "t16.audit.order." + Guid.NewGuid().ToString("N")[..8];
+        var tie = DateTime.UtcNow.AddHours(-1);
+        var older = await SeedAuditAsync(action, tie.AddHours(-1));
+        var tieFirst = await SeedAuditAsync(action, tie);
+        var tieSecond = await SeedAuditAsync(action, tie); // 同 occurred_at，后插入 id 更大
+        // ORDER BY occurred_at DESC, id DESC
+        var page = await client.GetFromJsonAsync<AuditPage>($"/api/v1/audit-logs?action={action}&pageSize=10");
+        Assert.Equal(new[] { tieSecond, tieFirst, older }, page!.Data.Records.Select(r => r.Id).ToArray());
+        // 内部代理 id 为 JSON number（int64；API-01 字符串约定仅适用外部平台 ID/rowversion，裁决 #9）
+        var raw = await client.GetAsync($"/api/v1/audit-logs?action={action}&pageSize=10");
+        using var doc = System.Text.Json.JsonDocument.Parse(await raw.Content.ReadAsStringAsync());
+        var first = doc.RootElement.GetProperty("data").GetProperty("records")[0];
+        Assert.Equal(System.Text.Json.JsonValueKind.Number, first.GetProperty("id").ValueKind);
+        Assert.Equal(tieSecond, first.GetProperty("id").GetInt64());
+    }
+
+    [Fact]
+    public async Task Audit_filters_are_exact_not_substring()
+    {
+        var (client, _) = await LoginAsync("m1admin", "Admin-Password-123");
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+        var action = "t16.audit.filter." + suffix;
+        var objectType = "t16obj." + suffix;
+        await SeedAuditAsync(action, DateTime.UtcNow, objectType);
+        await SeedAuditAsync(action + ".extra", DateTime.UtcNow, objectType + "X"); // 前缀扩展行不得命中
+        var byAction = await client.GetFromJsonAsync<AuditPage>($"/api/v1/audit-logs?action={action}");
+        Assert.Equal(1, byAction!.Data.Total); // action=@action 精确等值，非 LIKE 子串
+        Assert.Equal(action, byAction.Data.Records.Single().Action);
+        var byType = await client.GetFromJsonAsync<AuditPage>($"/api/v1/audit-logs?objectType={objectType}");
+        Assert.Equal(1, byType!.Data.Total);
+        Assert.Equal(objectType, byType.Data.Records.Single().ObjectType);
+    }
+
+    private sealed record AuditPage(AuditData Data);
+    private sealed record AuditData(AuditRecord[] Records, int Total, int Page, int PageSize);
+    private sealed record AuditRecord(long Id, string Action, string ObjectType, DateTime OccurredAtUtc);
+
     private sealed record JobAccepted(JobData Data);
     private sealed record JobData(string JobId);
     private sealed record ImportAccepted(ImportAcceptedData Data);

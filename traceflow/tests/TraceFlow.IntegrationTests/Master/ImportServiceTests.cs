@@ -240,6 +240,59 @@ VALUES(@org,@sys,N'P100',N'旧名',N'REQUIRED',N'处方药')", new { org = orgId
             new { id = batchId.ToString() }));
     }
 
+    // ---- T16 携带项 4（服务级）：COMMITTED/FAILED 批次重暂存→JobId=0；handler 对 COMMITTED 重跑无操作 ----
+
+    [Fact]
+    public async Task Stage_committed_batch_restage_returns_zero_job()
+    {
+        var csv = ProductHeader + "\nP200,,,重暂存药,,,,,,盒,UNKNOWN,,\n";
+        var (_, batchId, jobId) = await StageAsync("PRODUCT", csv);
+        Assert.True(jobId > 0);
+        await RunStageJobAsync();
+        await CommitAsync(batchId, await BatchVersionAsync(batchId));
+        // StageAsync 重选路径：既有批次非 STAGED→返回 (batchId, 0)，不产生新作业
+        var (_, againBatch, againJob) = await StageAsync("PRODUCT", csv);
+        Assert.Equal(batchId, againBatch);
+        Assert.Equal(0, againJob);
+        Assert.Equal(1, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'import-stage'"));
+        Assert.Equal(1, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.import_batch"));
+    }
+
+    [Fact]
+    public async Task Stage_failed_batch_restage_returns_zero_job()
+    {
+        var csv = ProductHeader + "\n"; // 仅表头→handler 判 FAILED
+        var (_, batchId, _) = await StageAsync("PRODUCT", csv);
+        await RunStageJobAsync();
+        Assert.Equal("FAILED", await ScalarAsync<string>("SELECT status FROM dbo.import_batch WHERE id=@id", new { id = batchId }));
+        var (_, againBatch, againJob) = await StageAsync("PRODUCT", csv);
+        Assert.Equal(batchId, againBatch);
+        Assert.Equal(0, againJob);
+        Assert.Equal(1, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'import-stage'"));
+    }
+
+    [Fact]
+    public async Task Stage_handler_rerun_on_committed_batch_is_noop()
+    {
+        var csv = ProductHeader + "\nP201,,,重跑药,,,,,,盒,UNKNOWN,,\n";
+        var (orgId, batchId, jobId) = await StageAsync("PRODUCT", csv);
+        await RunStageJobAsync();
+        await CommitAsync(batchId, await BatchVersionAsync(batchId));
+        var appliedBefore = await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.import_row WHERE batch_id=@id AND status=N'APPLIED'", new { id = batchId });
+        var stagedAuditBefore = await ScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'master.import.staged' AND object_id=@id", new { id = batchId.ToString() });
+        // 模拟租约失效重跑：以原作业 payload 直接调 handler；status!=STAGED 守卫应无操作（不删行/不重计数/不重复审计）
+        var payload = System.Text.Json.JsonSerializer.Serialize(new { orgId, env = "MOCK", batchId });
+        var claimed = new ClaimedJob(jobId, "import-stage", $"import-stage:{batchId}", payload,
+            1, DateTime.UtcNow.AddMinutes(5), 2);
+        await new ImportStageJobHandler(_fx.ConnectionString).HandleAsync(claimed, CancellationToken.None);
+        Assert.Equal("COMMITTED", await ScalarAsync<string>("SELECT status FROM dbo.import_batch WHERE id=@id", new { id = batchId }));
+        Assert.Equal(appliedBefore, await ScalarAsync<int>("SELECT COUNT(*) FROM dbo.import_row WHERE batch_id=@id AND status=N'APPLIED'", new { id = batchId }));
+        Assert.Equal(1, await ScalarAsync<int>("SELECT success_rows FROM dbo.import_batch WHERE id=@id", new { id = batchId }));
+        Assert.Equal(stagedAuditBefore, await ScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'master.import.staged' AND object_id=@id", new { id = batchId.ToString() }));
+    }
+
     [Fact]
     public async Task Commit_supplier_and_platform_drug_upsert()
     {
