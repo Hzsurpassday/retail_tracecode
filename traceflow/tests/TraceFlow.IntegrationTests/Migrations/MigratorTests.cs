@@ -34,6 +34,18 @@ public class MigratorTests : IClassFixture<Sql2008Fixture>
     }
 
     [Fact]
+    public async Task Verification_snapshot_index_exists_after_migration()
+    {
+        // 0009 的兜底索引（SyncScheduler/SourceSyncJobHandler 的判重查询依赖它）：迁移后必须真实存在且未禁用。
+        await using var conn = await _fx.OpenAsync();
+        var index = await conn.QuerySingleOrDefaultAsync<(string name, int disabled)>(
+            "SELECT i.name, i.is_disabled FROM sys.indexes i JOIN sys.tables t ON t.object_id=i.object_id " +
+            "WHERE t.name=N'verification' AND i.name=N'IX_verif_snapshot'");
+        Assert.False(string.IsNullOrEmpty(index.name));
+        Assert.Equal(0, index.disabled);
+    }
+
+    [Fact]
     public async Task Core_tables_exist_and_single_active_org_enforced()
     {
         await using var conn = await _fx.OpenAsync();
