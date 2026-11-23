@@ -237,8 +237,9 @@ function UploadDrawer({ taskId, envFilter, onClose, onChanged }: {
   const [reloadKey, setReloadKey] = useState(0);
   const [retryBlocked, setRetryBlocked] = useState<string>('');
   const [busy, setBusy] = useState(false);
-  // 幂等键在抽屉打开时生成一次：同一抽屉内的重试提交复用同一 key，关闭重开才换新 key。
-  const [retryKey] = useState(() => crypto.randomUUID());
+  // 幂等键按「一次提交」轮换：失败重试沿用同一 key（网络重试不会重复提交），
+  // 成功后立刻换新 key，避免同一 Failed 视图里再次点击时服务端重放旧 200 响应。
+  const [retryKey, setRetryKey] = useState(() => crypto.randomUUID());
 
   useEffect(() => {
     let active = true;
@@ -274,6 +275,8 @@ function UploadDrawer({ taskId, envFilter, onClose, onChanged }: {
         body: JSON.stringify({ expectedVersion: task.version }),
       });
       setStatus(`受控重试已接受（任务状态 ${r.state}，版本 ${r.version}），后台执行中。`);
+      // 成功即轮换幂等键：再次点击必须是一次新提交，绝不能重放上面这个 200 响应。
+      setRetryKey(crypto.randomUUID());
       setReloadKey(reloadKey + 1);
       onChanged();
     } catch (e) {
@@ -396,8 +399,9 @@ function ManualVerifyForm({ detail, onDone }: { detail: UploadDetail; onDone: (m
   const [contract, setContract] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  // 幂等键在表单打开时生成一次：同一表单内的重试复用同一 key，关闭重开才换新 key。
-  const [idemKey] = useState(() => crypto.randomUUID());
+  // 幂等键按「一次提交」轮换：失败重试沿用同一 key（网络重试不会重复提交）；
+  // 成功后换新 key 并保持表单打开，多 ManualAction 分片任务可继续提交下一片而不会 409 IDEMPOTENCY_CONFLICT。
+  const [idemKey, setIdemKey] = useState(() => crypto.randomUUID());
 
   async function submit() {
     setError('');
@@ -416,6 +420,8 @@ function ManualVerifyForm({ detail, onDone }: { detail: UploadDetail; onDone: (m
           expectedVersion: detail.task.version,
         }),
       });
+      // 成功后轮换幂等键：下一次提交（下一分片）必须是新请求，表单保持打开。
+      setIdemKey(crypto.randomUUID());
       onDone(`人工核对已提交（${r.decision}）：任务状态 ${r.state}，版本 ${r.version}。`);
     } catch (e) {
       setError(errMsg(e));

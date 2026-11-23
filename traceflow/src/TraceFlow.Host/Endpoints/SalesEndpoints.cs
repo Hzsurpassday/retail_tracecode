@@ -204,7 +204,7 @@ SELECT id, part_index, bill_code, state FROM dbo.upload_part WHERE task_id=@task
             if (!string.IsNullOrEmpty(state)
                 && !Enum.TryParse<UploadState>(state, ignoreCase: false, out _))
                 return Err(ctx, 422, "VALIDATION", "state 不是合法的上传状态");
-            // 页签分组（稳定，不依赖 state_reason 是否为 RETURN_CONFIRMED 留存）：大小写敏感，非法值 422，
+            // 页签分组以 return_confirmation 为准（稳定，不依赖 state_reason 留存）：大小写敏感，非法值 422，
             // 且在读写前拒绝（绝不静默返回空列表）。
             if (!TryParseConfirmStatus(confirmStatus, out var confirmGroup))
                 return Err(ctx, 422, "VALIDATION", "confirmStatus 只能为 PENDING、CONFIRMED 或 REJECTED");
@@ -310,20 +310,25 @@ FROM (
     private const string ConfirmStatusConfirmed = "CONFIRMED";
     private const string ConfirmStatusRejected = "REJECTED";
 
-    /// <summary>待确认：仍是 Blocked 且原因为 RETURN_CONFIRM_REQUIRED 的占位任务。</summary>
+    // 页签分组以 dbo.return_confirmation（0009：task_id UNIQUE，decision 只能取 CONFIRMED/REJECTED）为唯一
+    // 权威事实源：state_reason 会被 SaleVerificationService / RetailTaskFactory 改写，按文本推导会把
+    // 「驳回后被新快照取代」（Cancelled + RETURN_CONFIRM_REJECTED_SUPERSEDED）错落到已确认页签。
+
+    /// <summary>确认记录子查询的公共前缀（按任务 + 机构 + 环境定界，避免跨环境串组）。</summary>
+    private const string ConfirmRowSelect =
+        "SELECT 1 FROM dbo.return_confirmation rc WHERE rc.task_id=t.id AND rc.org_id=@orgId AND rc.env=@env";
+
+    private const string ConfirmRowExists = "EXISTS (" + ConfirmRowSelect + ")";
+
+    /// <summary>待确认：仍是 Blocked 且原因为 RETURN_CONFIRM_REQUIRED，且尚无任何确认记录。</summary>
     private const string ConfirmPendingPredicate =
-        "(t.state=N'Blocked' AND t.state_reason=N'RETURN_CONFIRM_REQUIRED')";
+        "(t.state=N'Blocked' AND t.state_reason=N'RETURN_CONFIRM_REQUIRED' AND NOT " + ConfirmRowExists + ")";
 
-    /// <summary>已驳回：Blocked + 两种驳回原因（含被撤销的驳回）。</summary>
-    private const string ConfirmRejectedPredicate =
-        "(t.state=N'Blocked' AND t.state_reason IN (N'RETURN_CONFIRM_REJECTED',N'RETURN_CONFIRM_REJECTED_SUPERSEDED'))";
+    /// <summary>已驳回：存在 REJECTED 确认记录（覆盖被取代的历史驳回，无论当前 state 是什么）。</summary>
+    private const string ConfirmRejectedPredicate = "EXISTS (" + ConfirmRowSelect + " AND rc.decision=N'REJECTED')";
 
-    /// <summary>
-    /// 已确认＝不属于前两组：确认后任务会随上传推进改写 state/state_reason（如 PLATFORM_ACCEPTED），
-    /// 因此只能按「排除法」分组，绝不能要求 state_reason 仍为 RETURN_CONFIRMED。
-    /// </summary>
-    private const string ConfirmConfirmedPredicate =
-        "NOT " + ConfirmPendingPredicate + " AND NOT " + ConfirmRejectedPredicate;
+    /// <summary>已确认：存在 CONFIRMED 确认记录（确认后 state/state_reason 如何改写都不影响分组）。</summary>
+    private const string ConfirmConfirmedPredicate = "EXISTS (" + ConfirmRowSelect + " AND rc.decision=N'CONFIRMED')";
 
     private static string ConfirmGroupPredicate(string group) => group switch
     {

@@ -28,8 +28,8 @@ const TABS: { key: Tab; label: string }[] = [
   { key: 'rejected', label: '已驳回' },
 ];
 // 页签即服务端过滤条件（不再对「当前 20 行」做客户端筛选，待确认行不会藏在别的页里）。
-// 服务端按稳定的确认分组过滤（confirmStatus）：已确认＝不属于待确认/已驳回的任务，
-// 因此确认后随上传推进改写 state_reason（如 PLATFORM_ACCEPTED）也不会从页签消失。
+// 服务端按 dbo.return_confirmation 的确认记录分组（confirmStatus）：已确认/已驳回＝存在对应 decision 的
+// 确认记录，待确认＝尚无确认记录；因此确认后随上传推进改写 state_reason（如 PLATFORM_ACCEPTED）也不会串组。
 const TAB_FILTER: Record<Tab, string> = {
   pending: 'PENDING',
   confirmed: 'CONFIRMED',
@@ -105,7 +105,15 @@ export default function ReturnsPage() {
     }
   }, [page, tab]);
 
-  useEffect(() => { let active = true; (async () => { if (active) await load(); })(); return () => { active = false; }; }, [load]);
+  // 页签或页码变化：先清空陈旧行与旧错误（避免短暂显示上一页/上一页签的数据或错误），
+  // 让加载态重新出现，再按新条件取数（load 的依赖只有 page/tab，事件处理器不会自己取数）。
+  useEffect(() => {
+    setData(null);
+    setError('');
+    let active = true;
+    (async () => { if (active) await load(); })();
+    return () => { active = false; };
+  }, [load]);
   const totalPages = data ? Math.max(1, Math.ceil(data.total / PAGE_SIZE)) : 1;
   const rows = data?.items ?? [];
 

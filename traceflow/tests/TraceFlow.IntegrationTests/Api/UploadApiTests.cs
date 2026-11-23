@@ -626,7 +626,13 @@ WHERE id=@id", new { id = seed.JobId });
         var resp = await client.PostAsJsonAsync($"/api/v1/upload-tasks/{seed.TaskId}/controlled-retry",
             new { expectedVersion = 1 });
         Assert.Equal(HttpStatusCode.Conflict, resp.StatusCode);
-        Assert.Contains("RETRY_IN_FLIGHT", await resp.Content.ReadAsStringAsync());
+        using (var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync()))
+        {
+            var root = doc.RootElement;
+            Assert.Equal("RETRY_IN_FLIGHT", root.GetProperty("code").GetString());
+            // 在途发送只是「作业结束后即可重试」的瞬时冲突：retryable=true（其他 409 冲突仍为 false）。
+            Assert.True(root.GetProperty("retryable").GetBoolean());
+        }
 
         await using (var c = await _fx.OpenAsync())
         {
@@ -676,7 +682,11 @@ WHERE id=@id", new { id = seed.JobId });
         var resp = await client.PostAsJsonAsync($"/api/v1/upload-tasks/{seed.TaskId}/controlled-retry",
             new { expectedVersion = 1 });
         Assert.Equal(HttpStatusCode.Conflict, resp.StatusCode);
-        Assert.Contains("RETRY_IN_FLIGHT", await resp.Content.ReadAsStringAsync());
+        using (var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync()))
+        {
+            Assert.Equal("RETRY_IN_FLIGHT", doc.RootElement.GetProperty("code").GetString());
+            Assert.True(doc.RootElement.GetProperty("retryable").GetBoolean());
+        }
 
         await using (var c = await _fx.OpenAsync())
         {
@@ -694,6 +704,35 @@ WHERE id=@id", new { id = seed.JobId });
                 "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'task.upload.controlled_retry'"));
             Assert.Equal(0, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.idempotency_record"));
         }
+    }
+
+    /// <summary>
+    /// 409 冲突的 retryable 语义：只在途发送（RETRY_IN_FLIGHT）是稍后即可重试的瞬时冲突（true）；
+    /// 其余 AllocationConflict 冲突码（VERSION_CONFLICT 等）保持 false，不受本次修复影响。
+    /// </summary>
+    [Fact]
+    public async Task Version_conflict_stays_non_retryable()
+    {
+        await EnableRetryPathCertifiedAsync();
+        var seed = await SeedUploadAsync("R6", 1375, taskState: "Failed", partState: "Failed", failedCodes: 1,
+            withJob: true, jobState: "PENDING", jobAttempts: 1);
+        var client = await LoginAsync("upload-admin", AdminPassword);
+        NewIdemKey(client);
+        var resp = await client.PostAsJsonAsync($"/api/v1/upload-tasks/{seed.TaskId}/controlled-retry",
+            new { expectedVersion = 99 });
+        Assert.Equal(HttpStatusCode.Conflict, resp.StatusCode);
+        using (var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync()))
+        {
+            Assert.Equal("VERSION_CONFLICT", doc.RootElement.GetProperty("code").GetString());
+            Assert.False(doc.RootElement.GetProperty("retryable").GetBoolean());
+        }
+        // 拒绝即零写入：版本冲突在首个写入前抛出。
+        await using var c = await _fx.OpenAsync();
+        Assert.Equal("Failed", await c.ExecuteScalarAsync<string>(
+            "SELECT state FROM dbo.upload_part WHERE id=@id", new { id = seed.PartId }));
+        Assert.Equal("PENDING", await c.ExecuteScalarAsync<string>(
+            "SELECT job_state FROM dbo.outbox_job WHERE id=@id", new { id = seed.JobId }));
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.idempotency_record"));
     }
 
     /// <summary>PENDING 作业照常复位（分片 RetryWait 后必须有人认领发送）。</summary>

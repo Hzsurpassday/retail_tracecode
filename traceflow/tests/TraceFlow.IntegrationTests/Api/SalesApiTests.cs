@@ -420,6 +420,23 @@ UPDATE dbo.source_line SET event_kind=N'CONSUMER_RETURN', quantity_original=-1, 
         Assert.Equal(1, await c.ExecuteScalarAsync<int>(
             "SELECT COUNT(*) FROM dbo.audit_log WHERE object_type=N'upload_task' AND object_id=@id AND action=N'task.return.confirmed'",
             new { id = scenario.ReturnTaskId.ToString() }));
+
+        // 真实确认写入的 return_confirmation 即页签唯一事实源：随后上传推进改写 state_reason
+        // （PLATFORM_ACCEPTED）也仍在「已确认」，并从「待确认」消失。
+        await c.ExecuteAsync(
+            "UPDATE dbo.upload_task SET state=N'Processing', state_reason=N'PLATFORM_ACCEPTED' WHERE id=@id",
+            new { id = scenario.ReturnTaskId });
+        static async Task<List<string?>> TabIdsAsync(HttpClient http, string tab)
+        {
+            var resp = await http.GetAsync($"/api/v1/returns?confirmStatus={tab}");
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+            using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+            return doc.RootElement.GetProperty("data").GetProperty("items").EnumerateArray()
+                .Select(i => i.GetProperty("id").GetString()).ToList();
+        }
+        Assert.Contains(scenario.ReturnTaskId.ToString(), await TabIdsAsync(client, "CONFIRMED"));
+        Assert.DoesNotContain(scenario.ReturnTaskId.ToString(), await TabIdsAsync(client, "PENDING"));
+        Assert.DoesNotContain(scenario.ReturnTaskId.ToString(), await TabIdsAsync(client, "REJECTED"));
     }
 
     /// <summary>
@@ -506,16 +523,23 @@ VALUES(@orgId,N'MOCK',@key,N'CONSUMER_RETURN_116',@hash,@payload,@hash,N'Blocked
     }
 
     /// <summary>
-    /// 退货页签按稳定的确认分组过滤（UI-06/07）：confirmStatus ∈ PENDING|CONFIRMED|REJECTED（大小写敏感），
-    /// 三组互斥；已确认走排除法，任务随后续上传推进改写 state_reason（PLATFORM_ACCEPTED）也不从页签消失；
-    /// 非法值 → 422 VALIDATION（不是静默空列表）。
+    /// 退货页签以 dbo.return_confirmation 为权威事实源（UI-06/07）：confirmStatus ∈ PENDING|CONFIRMED|REJECTED
+    /// （大小写敏感），三组互斥；state_reason 会被核验/任务工厂改写，分组绝不按文本推导：
+    /// 驳回→被取代（Cancelled + ..._SUPERSEDED）仍属已驳回；确认后改成 PLATFORM_ACCEPTED 仍属已确认；
+    /// 已有确认记录的 Blocked/RETURN_CONFIRM_REQUIRED 任务不再属于待确认。非法值 → 422 VALIDATION（不是静默空列表）。
     /// </summary>
     [Fact]
     public async Task Returns_list_filters_by_stable_confirm_status_server_side()
     {
         var pending = await SeedReturnTaskAsync("SR1", "Blocked", "RETURN_CONFIRM_REQUIRED");
-        var rejected = await SeedReturnTaskAsync("SR2", "Blocked", "RETURN_CONFIRM_REJECTED");
+        // 驳回后被新快照取代：state/state_reason 都已被改写，只有确认记录能证明它是驳回。
+        var supersededReject = await SeedReturnTaskAsync("SR2", "Cancelled", "RETURN_CONFIRM_REJECTED_SUPERSEDED");
+        // 已确认但状态尚未推进（仍是 Blocked + RETURN_CONFIRM_REQUIRED）：有确认记录 => 不属于待确认。
+        var confirmedBlocked = await SeedReturnTaskAsync("SR3", "Blocked", "RETURN_CONFIRM_REQUIRED");
         var confirmed = await SeedReturnTaskAsync("SR4", "Ready", "RETURN_CONFIRMED");
+        await SeedReturnDecisionAsync(supersededReject, "REJECTED");
+        await SeedReturnDecisionAsync(confirmedBlocked, "CONFIRMED");
+        await SeedReturnDecisionAsync(confirmed, "CONFIRMED");
         var client = await LoginAsync("sales-admin", AdminPassword);
 
         async Task<List<string>> IdsAsync(string query)
@@ -530,18 +554,27 @@ VALUES(@orgId,N'MOCK',@key,N'CONSUMER_RETURN_116',@hash,@payload,@hash,N'Blocked
             return items.Select(i => i.GetProperty("id").GetString()!).ToList();
         }
 
+        // 行序为 id DESC（分页口径），种子按 id 递增创建。
         Assert.Equal(new[] { pending.ToString() }, await IdsAsync("confirmStatus=PENDING"));
-        Assert.Equal(new[] { rejected.ToString() }, await IdsAsync("confirmStatus=REJECTED"));
-        Assert.Equal(new[] { confirmed.ToString() }, await IdsAsync("confirmStatus=CONFIRMED"));
+        Assert.Equal(new[] { supersededReject.ToString() }, await IdsAsync("confirmStatus=REJECTED"));
+        Assert.Equal(new[] { confirmed.ToString(), confirmedBlocked.ToString() }, await IdsAsync("confirmStatus=CONFIRMED"));
 
-        // 上传推进改写 state/state_reason 后，已确认页签必须仍返回该任务（不依赖 RETURN_CONFIRMED 留存）。
+        // 上传推进改写 state/state_reason（PLATFORM_ACCEPTED）后，已确认页签必须仍返回该任务。
         await using (var c = await _fx.OpenAsync())
             await c.ExecuteAsync(
                 "UPDATE dbo.upload_task SET state=N'Processing', state_reason=N'PLATFORM_ACCEPTED' WHERE id=@id",
                 new { id = confirmed });
-        Assert.Equal(new[] { confirmed.ToString() }, await IdsAsync("confirmStatus=CONFIRMED"));
+        Assert.Equal(new[] { confirmed.ToString(), confirmedBlocked.ToString() }, await IdsAsync("confirmStatus=CONFIRMED"));
         Assert.Equal(new[] { pending.ToString() }, await IdsAsync("confirmStatus=PENDING"));
-        Assert.Equal(new[] { rejected.ToString() }, await IdsAsync("confirmStatus=REJECTED"));
+        Assert.Equal(new[] { supersededReject.ToString() }, await IdsAsync("confirmStatus=REJECTED"));
+
+        // 被取代的驳回即使改回 Blocked + RETURN_CONFIRM_REJECTED（旧文本判定口径）也仍按确认记录归入已驳回。
+        await using (var c = await _fx.OpenAsync())
+            await c.ExecuteAsync(
+                "UPDATE dbo.upload_task SET state=N'Blocked', state_reason=N'RETURN_CONFIRM_REJECTED' WHERE id=@id",
+                new { id = supersededReject });
+        Assert.Equal(new[] { supersededReject.ToString() }, await IdsAsync("confirmStatus=REJECTED"));
+        Assert.DoesNotContain(supersededReject.ToString(), await IdsAsync("confirmStatus=CONFIRMED"));
 
         // 三组互斥：同一任务不得同时出现在两个页签。
         var pendingIds = await IdsAsync("confirmStatus=PENDING");
@@ -552,7 +585,7 @@ VALUES(@orgId,N'MOCK',@key,N'CONSUMER_RETURN_116',@hash,@payload,@hash,N'Blocked
         Assert.Empty(confirmedIds.Intersect(rejectedIds));
 
         // 不带 confirmStatus 时不过滤（保持旧行为：全部退货任务）。
-        Assert.Equal(3, (await IdsAsync("page=1&pageSize=20")).Count);
+        Assert.Equal(4, (await IdsAsync("page=1&pageSize=20")).Count);
 
         // 非法值（大小写不符 / 未知分组 / 多值 / 前后空白）一律 422，绝不静默返回空列表。
         foreach (var bad in new[] { "pending", "Pending", "BOGUS", "PENDING,CONFIRMED", " PENDING" })
@@ -576,6 +609,18 @@ OUTPUT INSERTED.id
 VALUES(@orgId,N'MOCK',@key,N'CONSUMER_RETURN_116',@hash,@hash,@state,@stateReason,
     N'COMPLETE',N'COMPLETE',N'PASSED',N'NONE')",
             new { orgId, key, hash = Sha("return-" + tag), state, stateReason });
+    }
+
+    /// <summary>直写权威确认记录（dbo.return_confirmation）：页签分组的唯一事实源，decision 只能 CONFIRMED/REJECTED。</summary>
+    private async Task SeedReturnDecisionAsync(long taskId, string decision)
+    {
+        await using var c = await _fx.OpenAsync();
+        var (orgId, _) = await TestSeed.EnsureAsync(c);
+        await c.ExecuteAsync(@"
+IF NOT EXISTS (SELECT 1 FROM dbo.return_confirmation WHERE task_id=@taskId)
+INSERT INTO dbo.return_confirmation(org_id,env,task_id,decision,relation_kind,evidence_json,confirmed_by)
+VALUES(@orgId,N'MOCK',@taskId,@decision,N'SALE',N'{""reason"":""seed""}',N'test-harness')",
+            new { orgId, taskId, decision });
     }
 
     private sealed record SessionResp(SessionData Data);

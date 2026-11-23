@@ -1,4 +1,5 @@
 using TraceFlow.Application.Abstractions;
+using TraceFlow.Infrastructure.Uploads;
 
 namespace TraceFlow.Host.Security;
 
@@ -33,7 +34,13 @@ public static class ApiErrors
         // 动态错误码：409/422 的 code 由异常自带，如 CODE_CONTENDED/CANCEL_REFUSED/ALLOCATION_EXISTS/BIG_CODE_BLOCKED
         // 与 brief 的最小偏差：brief 的 `var fieldErrors = Array.Empty<object>()` 为 object[]，无法接收 IReadOnlyList<object>（CS0266）
         IReadOnlyList<object> fieldErrors = Array.Empty<object>();
-        if (ex is AllocationConflictException ace) code = ace.ErrorCode;
+        if (ex is AllocationConflictException ace)
+        {
+            code = ace.ErrorCode;
+            // 在途发送（RETRY_IN_FLIGHT）是「作业结束后即可重试」的瞬时冲突：仅它 retryable=true；
+            // 其余冲突码（VERSION_CONFLICT/CODE_CONTENDED/CANCEL_REFUSED/FROZEN/...）语义不变（false）。
+            retryable = string.Equals(ace.ErrorCode, UploadManualService.ErrorRetryInFlight, StringComparison.Ordinal);
+        }
         if (ex is AllocationValidationException ave) { code = ave.ErrorCode; fieldErrors = ave.FieldErrors ?? Array.Empty<object>(); }
         // 限流：retryAfter（秒）来自异常，无可用值（≤0）时为 null；有值才写 Retry-After 响应头。
         int? retryAfter = ex is TopRateLimitedException rateLimited && rateLimited.Wait > TimeSpan.Zero
