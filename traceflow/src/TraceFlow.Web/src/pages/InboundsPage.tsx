@@ -11,7 +11,20 @@ const PAGE_SIZE = 50;
 const PRE_SEND = ['Blocked', 'Ready', 'Cancelled'];
 function idem(): Record<string, string> { return { 'Idempotency-Key': crypto.randomUUID() }; }
 function errMsg(e: unknown): string { return e instanceof ApiError ? `${e.code}: ${e.message}` : '网络错误'; }
-function fmt(d: string | null): string { return d ? d.replace('T', ' ').slice(0, 19) : '—'; }
+// 后端 datetime2 出网不带偏移量（"YYYY-MM-DDTHH:mm:ss"），故无偏移时显式按 UTC 解释，再转 Asia/Shanghai 显示
+const SHANGHAI = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'Asia/Shanghai', hourCycle: 'h23',
+  year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
+});
+function fmt(d: string | null): string {
+  if (!d) return '—';
+  const iso = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(d) ? d : d.length === 10 ? `${d}T00:00:00Z` : `${d}Z`;
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return d.replace('T', ' ').slice(0, 19);
+  const parts = SHANGHAI.formatToParts(new Date(t));
+  const part = (type: Intl.DateTimeFormatPartTypes): string => parts.find((p) => p.type === type)?.value ?? '';
+  return `${part('year')}-${part('month')}-${part('day')} ${part('hour')}:${part('minute')}:${part('second')}`;
+}
 // 仅用于差异高亮（R13a）：资格判定与数量合计全部由后端完成，此处不做业务判定
 const round6 = (x: number): number => Math.round(x * 1e6) / 1e6;
 const diffOf = (l: { quantity: string; allocatedQuantity: string }): number => round6(Number(l.quantity) - Number(l.allocatedQuantity));
