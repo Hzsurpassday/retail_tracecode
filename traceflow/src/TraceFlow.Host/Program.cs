@@ -126,7 +126,7 @@ if (!workerOnly)
     });
     app.MapAuthEndpoints(connectionString);
     app.MapAdminEndpoints(connectionString);
-    app.MapSettingsEndpoints(connectionString);
+    app.MapSettingsEndpoints(connectionString, env);
     app.MapImportEndpoints(connectionString, env);
     app.MapMasterEndpoints(connectionString);
     app.MapOpsEndpoints(connectionString, env);
