@@ -65,7 +65,7 @@ dotnet test traceflow/tests/TraceFlow.UnitTests -c Release --no-build
 已通过! - 失败: 0，通过: 136，已跳过: 0，总计: 136，持续时间: 115 ms - TraceFlow.UnitTests.dll (net8.0)
 ```
 
-**结果：136/136 通过。** M1 新增测试类：CodeFormatStorageTests 6（含 Token_roundtrip Theory×3）、RowVerTests 5（含 Invalid_hex Theory×4）、DrugIdentityMatcherTests 6、ApprovalNoNormalizerTests 6（Theory×6）、SourceValueObjectTests 22（含 Expiry_precision/Business_time Theory）、CsvReaderTests 5，合计 50 用例；M0 基线 87 中占位 UnitTest1（1 用例）已在 T4 卫生提交移除（87−1+50=136）。UploadStateMachineTests 理论行 55 不变。
+**结果：136/136 通过。** M1 新增测试类：CodeFormatStorageTests 6（含 Token_roundtrip Theory×3）、RowVerTests 5（含 Invalid_hex Theory×4）、DrugIdentityMatcherTests 6、ApprovalNoNormalizerTests 6（Theory×6）、SourceValueObjectTests 22（含 Expiry_precision/Business_time Theory）、CsvReaderTests 5，合计 50 用例；M0 基线 87 中占位 UnitTest1（1 用例）已在 T4 卫生提交移除（87−1+50=136）。UploadStateMachineTests 理论行 54 不变（另有 1 Fact，类合计 55）。
 
 ### 3. 集成测试（授权降级，默认 collation）
 
