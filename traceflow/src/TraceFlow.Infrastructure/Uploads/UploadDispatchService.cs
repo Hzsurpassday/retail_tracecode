@@ -383,8 +383,9 @@ SELECT ISNULL(MAX(attempt_no),0)+1 FROM dbo.upload_attempt WHERE task_id=@taskId
 
     /// <summary>
     /// 任务状态重算：绝不跳过写入（否则更坏的分片结论已知后任务会滞留在 Dispatching）。
-    /// 守卫：一般聚合只在任务仍处于可发送阶段（Ready/RetryWait/Dispatching）时写入——
-    /// 已取消或已由回查收敛的任务不被迟到的聚合结果覆盖；全 Cancelled 的取消结论始终可写（终态幂等）。
+    /// 守卫：除行政取消（Cancelled）外一律写入——分片独立收尾，任务不得因停留在 AcceptanceUnknown/
+    /// ManualAction 等中间态而永远无法被聚合结果更新；全 Cancelled 的取消结论始终可写（终态幂等）。
+    /// 并发取消已提交时，UPDATE 在守卫内重读 state，不会把已取消任务复活。
     /// </summary>
     private static async Task<int> RecomputeTaskStateAsync(SqlConnection conn, SqlTransaction tx, long taskId, CancellationToken ct)
     {
@@ -397,7 +398,7 @@ SELECT ISNULL(MAX(attempt_no),0)+1 FROM dbo.upload_attempt WHERE task_id=@taskId
         return await conn.ExecuteAsync(new CommandDefinition(@"
 UPDATE dbo.upload_task SET state=@state, version=version+1
 WHERE id=@taskId
-  AND (state IN (N'Ready',N'RetryWait',N'Dispatching') OR @state=N'Cancelled')",
+  AND (state <> N'Cancelled' OR @state = N'Cancelled')",
             new { taskId, state = aggregate.ToString() }, tx, cancellationToken: ct));
     }
 
@@ -508,7 +509,13 @@ WHERE id=@taskId
 
     private static bool IsSendablePart(string state) => state is "Ready" or "RetryWait";
 
-    private static bool IsDispatchableTask(string state) => state is "Ready" or "RetryWait" or "Dispatching";
+    /// <summary>
+    /// 任务级可发送判定：只拒绝已落定/需人工/已取消的任务（Cancelled/Blocked/Succeeded/Failed/ManualAction）；
+    /// 其余中间态（含 AcceptanceUnknown/Processing/PartialSuccess/ResultUnresolved）不阻断无关分片发送——
+    /// 分片是独立发送单元（§2.6/§3.2），真正的逐分片闸门是 <see cref="IsSendablePart"/> 与短事务内的重读复核。
+    /// </summary>
+    private static bool IsDispatchableTask(string state)
+        => state is not ("Cancelled" or "Blocked" or "Succeeded" or "Failed" or "ManualAction");
 
     private static string IntentFor(long partId) => "part:" + partId.ToString(CultureInfo.InvariantCulture);
 

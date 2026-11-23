@@ -346,7 +346,7 @@ OUTPUT inserted.id VALUES(@taskId,@partId,1,N'UPLOAD',N'MOCK',@w,@token)",
     }
 
     /// <summary>追加一个非目标分片（任务级聚合场景），返回分片 id。</summary>
-    private static Task<long> AddPartAsync(SqlConnection c, Seed seed, int partIndex, string state)
+    private static Task<long> AddPartAsync(SqlConnection c, Seed seed, int partIndex, string state, SqlTransaction? tx = null)
         => c.ExecuteScalarAsync<long>(@"
 INSERT INTO dbo.upload_part(task_id,org_id,env,part_index,bill_code,payload_json,payload_hash,code_set_hash,state)
 OUTPUT inserted.id
@@ -356,7 +356,24 @@ VALUES(@taskId,@orgId,N'MOCK',@partIndex,@bill,@payload,REPLICATE('b',64),REPLIC
                 seed.TaskId, seed.OrgId, partIndex,
                 bill = "TFX" + Guid.NewGuid().ToString("N")[..16],
                 payload = PartPayloadJson("extra" + partIndex), state,
-            });
+            }, tx);
+
+    /// <summary>追加一个可发送分片及其发送作业并定向认领，返回分片 id 与 fencing_token（用于触发一次重算）。</summary>
+    private async Task<(long PartId, long FencingToken)> AddPartWithJobAsync(Seed seed, int partIndex, string state)
+    {
+        await using var c = await _fx.OpenAsync();
+        long partId;
+        await using (var tx = (SqlTransaction)await c.BeginTransactionAsync())
+        {
+            partId = await AddPartAsync(c, seed, partIndex, state, tx);
+            var q = new JobQueue(_fx.ConnectionString, new AuditLog());
+            await q.EnqueueAsync(c, tx, seed.OrgId, "MOCK", "upload-dispatch", $"part:{partId}",
+                JsonSerializer.Serialize(new { seed.OrgId, env = "MOCK", seed.TaskId, partId, trigger = "test" }), null, default);
+            await tx.CommitAsync();
+        }
+        var token = await ClaimAsync(c, partId);
+        return (partId, token);
+    }
 
     private async Task<string?> PartStateAtAsync(long taskId, int partIndex)
     {
@@ -417,6 +434,83 @@ VALUES(@taskId,@orgId,N'MOCK',@partIndex,@bill,@payload,REPLICATE('b',64),REPLIC
         Assert.Equal(DispatchOutcome.Accepted, outcome);
         Assert.Equal("Accepted", await PartStateAsync(seed.PartId)); // 本分片只推进到回执受理
         Assert.Equal("Accepted", await TaskStateAsync(seed.TaskId));
+    }
+
+    [Fact]
+    public async Task Acceptance_unknown_task_does_not_block_sibling_ready_part()
+    {
+        // 一个分片已落到 AcceptanceUnknown：同任务的其余 Ready 分片仍是独立发送单元（§2.6/§3.2），不得被阻断。
+        var seed = await SeedAsync(Tag(), taskState: "AcceptanceUnknown");
+        long unknownPartId;
+        await using (var c = await _fx.OpenAsync())
+        {
+            unknownPartId = await AddPartAsync(c, seed, partIndex: 1, state: "AcceptanceUnknown");
+            // 未知分片已有发送证据：兄弟分片的发送/重算不得触碰它的状态与尝试行。
+            await c.ExecuteAsync(@"
+INSERT INTO dbo.upload_attempt(task_id,part_id,attempt_no,attempt_kind,env,lease_owner,fencing_token,finished_at)
+VALUES(@taskId,@partId,1,N'UPLOAD',N'MOCK',@w,1,SYSUTCDATETIME())",
+                new { seed.TaskId, partId = unknownPartId, w = Worker });
+        }
+        var calls = 0;
+        var service = NewService(_ => { calls++; return Accepted(); });
+
+        var outcome = await service.DispatchAsync(seed.PartId, Worker, seed.FencingToken, default);
+
+        Assert.Equal(DispatchOutcome.Accepted, outcome);
+        Assert.Equal(1, calls); // 兄弟分片照常发送一次 HTTP
+        Assert.Equal("Accepted", await PartStateAsync(seed.PartId));
+        await using var c2 = await _fx.OpenAsync();
+        Assert.Equal("AcceptanceUnknown", await c2.ExecuteScalarAsync<string>(
+            "SELECT state FROM dbo.upload_part WHERE id=@id", new { id = unknownPartId }));
+        Assert.Equal(1, await c2.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.upload_attempt WHERE part_id=@id", new { id = unknownPartId }));
+        Assert.Equal("AcceptanceUnknown", await TaskStateAsync(seed.TaskId)); // 未知结论仍是最严重分片
+    }
+
+    [Fact]
+    public async Task Recompute_clears_acceptance_unknown_after_all_parts_settle()
+    {
+        // 守卫修复：任务已 AcceptanceUnknown 时，后续聚合仍必须可写——否则任务永久滞留（Task 5 查询收敛也修不了）。
+        var seed = await SeedAsync(Tag(), taskState: "AcceptanceUnknown");
+        long unknownPartId;
+        await using (var c = await _fx.OpenAsync())
+            unknownPartId = await AddPartAsync(c, seed, partIndex: 1, state: "AcceptanceUnknown");
+        var service = NewService(_ => Accepted());
+
+        // 第一次发送：未知分片尚未收敛，聚合仍为 AcceptanceUnknown。
+        Assert.Equal(DispatchOutcome.Accepted, await service.DispatchAsync(seed.PartId, Worker, seed.FencingToken, default));
+        Assert.Equal("AcceptanceUnknown", await TaskStateAsync(seed.TaskId));
+
+        // 全部历史分片收敛（Succeeded / Failed），新增 Ready 分片的发送触发一次重算。
+        await using (var c = await _fx.OpenAsync())
+        {
+            await c.ExecuteAsync("UPDATE dbo.upload_part SET state=N'Succeeded' WHERE task_id=@id", new { id = seed.TaskId });
+            await c.ExecuteAsync("UPDATE dbo.upload_part SET state=N'Failed' WHERE id=@id", new { id = unknownPartId });
+        }
+        var (partId, token) = await AddPartWithJobAsync(seed, partIndex: 2, state: "Ready");
+
+        Assert.Equal(DispatchOutcome.Accepted, await service.DispatchAsync(partId, Worker, token, default));
+
+        Assert.Equal("Failed", await TaskStateAsync(seed.TaskId)); // AcceptanceUnknown → 正确聚合（不再是终态滞留）
+        Assert.Equal("Succeeded", await PartStateAtAsync(seed.TaskId, 0));
+        Assert.Equal("Failed", await PartStateAtAsync(seed.TaskId, 1));
+        Assert.Equal("Accepted", await PartStateAtAsync(seed.TaskId, 2));
+    }
+
+    [Fact]
+    public async Task Manual_action_task_refuses_dispatch()
+    {
+        var seed = await SeedAsync(Tag(), taskState: "ManualAction");
+        var calls = 0;
+        var service = NewService(_ => { calls++; return Accepted(); });
+
+        var outcome = await service.DispatchAsync(seed.PartId, Worker, seed.FencingToken, default);
+
+        Assert.Equal(DispatchOutcome.StaleRejected, outcome);
+        Assert.Equal(0, calls);
+        Assert.Equal(0, await UploadAttemptCountAsync(seed.TaskId));
+        Assert.Equal("Ready", await PartStateAsync(seed.PartId));
+        Assert.Equal("ManualAction", await TaskStateAsync(seed.TaskId));
     }
 
     [Fact]
