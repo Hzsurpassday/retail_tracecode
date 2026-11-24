@@ -213,15 +213,23 @@ WHERE id=@id AND state=N'Blocked'",
         catch (SqlException ex) when (ex.Number is 2601 or 2627)
         {
             // F6：按约束名区分重复键，而非吞掉所有 2601/2627。
-            // UQ_retconf_task = 同一任务已有确认决定（并发穿透 Blocked 守卫）→ 409 冲突，提示刷新；
             // UQ_idempotency_user_key = 幂等键并发竞态败者 → 业务+幂等整体回滚后重读胜者记录（与 IdempotencyExecutor 同裁定）；
+            // UQ_retconf_task = 同一任务已有确认决定 → 409 冲突，提示刷新。此为**防御性**分支：本 try 只包住
+            //   SaveAsync+Commit，而 return_confirmation 的插入更早、且两条决策分支都在插入前以 UPDLOCK/HOLDLOCK
+            //   锁住任务行并复核 Blocked——并发同任务确认被该锁串行化后落在 4xx 业务错误（VERSION_CONFLICT/
+            //   NOT_RETURNABLE/ALREADY_RETURNED），故服务路径不可达（见 ReturnConfirmTests 并发同任务用例与
+            //   MigratorTests 的 UQ_retconf_task 库级用例）。保留映射以便未来无锁写入路径 fail-closed 成 409 而非 500。
             // 其他唯一键冲突原样抛出，交由调用方回滚。
             await tx.RollbackAsync(ct);
             if (ex.Message.Contains(ReturnConfirmationTaskConstraint, StringComparison.Ordinal))
                 throw new AllocationConflictException(ErrorVersionConflict, "任务已有退货确认决定，请刷新后重试");
             if (!ex.Message.Contains(IdempotencyKeyConstraint, StringComparison.Ordinal))
                 throw;
+            // 冲突后（本事务已回滚）重读胜者记录：key/user 相同、hash 不同 → TryGetAsync 抛 IdempotencyConflictException（409）。
             var winner = await _idempotency.TryGetAsync(conn, null!, storeKey, requestHash, userId, ct);
+            // 防御性兜底（正常不可达）：2601/2627 只会在另一事务已提交（或本语句见到的索引项已落库）时抛出，
+            // 故回滚后同 key/user 的胜者行必然存在；仅当胜者行在极短窗口内被外部删除时才可能读空。
+            // 不存在任何确定性路径能让本分支为 true，故不以测试"覆盖"它（不做恒真断言）。
             if (winner is null) throw new IdempotencyConflictException();
             return ParseHit(taskId, winner);
         }

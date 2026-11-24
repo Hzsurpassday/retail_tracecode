@@ -15,7 +15,7 @@ namespace TraceFlow.Host.Endpoints;
 /// CSV 导出（AT-074 / DEF-07）：码台账、对账单差异、审计日志三分面，GET 只读。
 /// 统一约束：
 /// - Dapper <c>QueryUnbufferedAsync</c> + <see cref="StreamWriter"/> 直接写 <see cref="HttpResponse.Body"/>，不落临时明文文件；
-/// - 先 COUNT 后写：预计超过 <see cref="MaxExportRows"/> 行 → 422 <c>EXPORT_TOO_LARGE</c>（一个字节都不写）；
+/// - 先 COUNT 后写：预计超过 <see cref="ExportPolicy.MaxExportRows"/> 行 → 422 <c>EXPORT_TOO_LARGE</c>（一个字节都不写）；
 /// - UTF-8 BOM 开头 + 表头 + 数据行，行尾 CRLF；文本列一律经 <see cref="Csv.Cell"/> 防公式注入；
 /// - 成功导出后写审计 <c>data.exported</c>（actor=当前用户，env 恒 LIVE，object_type=export）；
 /// - GET 无需 CSRF；需登录 + 对应权限（401/403 由权限策略统一处理）。
@@ -23,19 +23,9 @@ namespace TraceFlow.Host.Endpoints;
 /// </summary>
 public static class ExportEndpoints
 {
-    /// <summary>单次导出最大行数（超过则 422；常量 + <see cref="ExceedsLimit"/> 便于测试，无需 seed 5 万行）。</summary>
-    internal const int MaxExportRows = 50_000;
-
     private const int AuditReasonMaxChars = 200;
     private const int MaxNameChars = 128;
     private const string TooLargeMessage = "导出行数超过上限（50,000 行），请缩小筛选范围";
-
-    /// <summary>行数是否超过上限（端点写响应前调用）。</summary>
-    internal static bool ExceedsLimit(long count) => count > MaxExportRows;
-
-    /// <summary>UTC ISO 时间文本（数据库列存储即 UTC）：<c>yyyy-MM-ddTHH:mm:ss.fffZ</c>。</summary>
-    internal static string UtcIso(DateTime value)
-        => value.ToString("yyyy-MM-ddTHH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);
 
     public static void MapExportEndpoints(this WebApplication app, string connectionString, string env)
     {
@@ -88,7 +78,7 @@ public static class ExportEndpoints
             var total = await conn.ExecuteScalarAsync<int>(new CommandDefinition(
                 $"{baseCte} SELECT COUNT(*) FROM ev WHERE {statePredicate}",
                 args, cancellationToken: ctx.RequestAborted));
-            if (ExceedsLimit(total))
+            if (ExportPolicy.ExceedsLimit(total))
                 return Err(ctx, 422, "EXPORT_TOO_LARGE", TooLargeMessage);
 
             // 与台账列表同一口径（排序也一致：最近事件时间倒序、code_id 倒序），仅去掉分页以流式全量输出。
@@ -126,13 +116,13 @@ ORDER BY ev.lastEventAt DESC, ev.code_id DESC", args);
                 prefix is null ? null : $"q={prefix}",
                 typeFilter is null ? null : $"eventType={typeFilter}",
                 stateFilter is null ? null : $"state={stateFilter}",
-                fromUtc is DateTime ff ? $"from={UtcIso(ff)}" : null,
-                toUtc is DateTime tt ? $"to={UtcIso(tt)}" : null);
+                fromUtc is DateTime ff ? $"from={ExportPolicy.UtcIso(ff)}" : null,
+                toUtc is DateTime tt ? $"to={ExportPolicy.UtcIso(tt)}" : null);
             return await StreamCsvAsync(ctx, conn, audit, logs, "codes", summary, total, rows,
                 r => new[]
                 {
                     Csv.Cell(r.code), Csv.Cell(r.format), Csv.Cell(r.latestEventType),
-                    Csv.Number(r.eventCount), Csv.Cell(UtcIso(r.lastEventAt)),
+                    Csv.Number(r.eventCount), Csv.Cell(ExportPolicy.UtcIso(r.lastEventAt)),
                     Csv.Cell(r.claimState ?? "NONE"), Csv.Cell(r.claimScope), Csv.Cell(r.billCode),
                 },
                 "码", "格式", "最近事件类型", "事件数", "最近事件时间", "占用状态", "占用范围", "单号");
@@ -157,7 +147,7 @@ WHERE r.id=@id AND r.org_id=@orgId AND r.env=@env",
             var total = await conn.ExecuteScalarAsync<int>(new CommandDefinition(
                 "SELECT COUNT(*) FROM dbo.reconciliation_difference WHERE run_id=@id",
                 new { id }, cancellationToken: ctx.RequestAborted));
-            if (ExceedsLimit(total))
+            if (ExportPolicy.ExceedsLimit(total))
                 return Err(ctx, 422, "EXPORT_TOO_LARGE", TooLargeMessage);
 
             // 排序与 run 详情差异列表一致（found_at, id 升序）；evidence_json 不入导出（原始证据不外泄）。
@@ -175,9 +165,9 @@ ORDER BY found_at, id", new { id });
                 r => new[]
                 {
                     Csv.Cell(r.diffType), Csv.Cell(r.severity), Csv.Cell(r.objectRef), Csv.Cell(r.status),
-                    Csv.Cell(r.ownerRole), Csv.Cell(r.nextAction), Csv.Cell(UtcIso(r.foundAt)),
+                    Csv.Cell(r.ownerRole), Csv.Cell(r.nextAction), Csv.Cell(ExportPolicy.UtcIso(r.foundAt)),
                     Csv.Cell(r.resolutionEvidence), Csv.Cell(r.resolvedBy),
-                    Csv.Cell(r.resolvedAt is DateTime at ? UtcIso(at) : null),
+                    Csv.Cell(r.resolvedAt is DateTime at ? ExportPolicy.UtcIso(at) : null),
                 },
                 "差异类型", "严重级", "对象", "状态", "责任角色", "下一步", "发现时间",
                 "解决证据", "解决人", "解决时间");
@@ -201,7 +191,7 @@ ORDER BY found_at, id", new { id });
             await conn.OpenAsync(ctx.RequestAborted);
             var total = await conn.ExecuteScalarAsync<int>(new CommandDefinition(
                 $"SELECT COUNT(*) FROM dbo.audit_log {where}", args, cancellationToken: ctx.RequestAborted));
-            if (ExceedsLimit(total))
+            if (ExportPolicy.ExceedsLimit(total))
                 return Err(ctx, 422, "EXPORT_TOO_LARGE", TooLargeMessage);
 
             var rows = conn.QueryUnbufferedAsync<AuditExportRow>($@"
@@ -214,13 +204,13 @@ ORDER BY occurred_at DESC, id DESC", args);
             var summary = Summary(action is null ? null : $"action={action}",
                 objectType is null ? null : $"objectType={objectType}",
                 objectId is null ? null : $"objectId={objectId}",
-                dateStart is null ? null : $"dateStart={UtcIso(NormalizeUtc(dateStart.Value))}",
-                dateEnd is null ? null : $"dateEnd={UtcIso(NormalizeUtc(dateEnd.Value))}");
+                dateStart is null ? null : $"dateStart={ExportPolicy.UtcIso(NormalizeUtc(dateStart.Value))}",
+                dateEnd is null ? null : $"dateEnd={ExportPolicy.UtcIso(NormalizeUtc(dateEnd.Value))}");
             return await StreamCsvAsync(ctx, conn, audit, logs, "audit-logs",
                 string.IsNullOrEmpty(summary) ? "全量" : summary, total, rows,
                 r => new[]
                 {
-                    Csv.Cell(UtcIso(r.occurredAt)), Csv.Cell(r.env), Csv.Cell(r.actor), Csv.Cell(r.action),
+                    Csv.Cell(ExportPolicy.UtcIso(r.occurredAt)), Csv.Cell(r.env), Csv.Cell(r.actor), Csv.Cell(r.action),
                     Csv.Cell(r.objectType), Csv.Cell(r.objectId), Csv.Cell(r.reason),
                     Csv.Cell(r.beforeDigest), Csv.Cell(r.afterDigest),
                 },

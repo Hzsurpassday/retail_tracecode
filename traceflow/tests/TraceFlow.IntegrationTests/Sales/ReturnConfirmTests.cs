@@ -54,11 +54,70 @@ public class ReturnConfirmTests : IAsyncLifetime
     }
 
     private ReturnConfirmService NewConfirmService()
+        => NewConfirmService(new IdempotencyStore());
+
+    private ReturnConfirmService NewConfirmService(IIdempotencyStore idempotency)
     {
         var settings = NewSettings();
         var audit = new AuditLog();
         var factory = new RetailTaskFactory(settings, new JobQueue(_fx.ConnectionString, audit));
-        return new ReturnConfirmService(_fx.ConnectionString, "MOCK", settings, factory, new IdempotencyStore(), audit);
+        return new ReturnConfirmService(_fx.ConnectionString, "MOCK", settings, factory, idempotency, audit);
+    }
+
+    /// <summary>
+    /// F6 确定性竞态模拟（不依赖随机并发）：进入服务时的幂等读发生在胜者提交之前（返回 null），
+    /// 随后在**独立连接、已提交**的条件下预置胜者行，再委托真实存储执行 SaveAsync →
+    /// 真实触发 UQ_idempotency_user_key 2601/2627；冲突后的重读（tx=null）委托真实存储，
+    /// 用于验证「胜者回放」与「异摘要 409」两条分支。胜者行自身的业务提交不在本模拟范围内。
+    /// </summary>
+    private sealed class WinnerRaceIdempotencyStore : IIdempotencyStore
+    {
+        private readonly string _cs;
+        private readonly long _winnerTaskId;
+        private readonly string? _winnerHashOverride;
+        private readonly IdempotencyStore _inner = new();
+        private bool _winnerSeeded;
+        private string _key = "";
+        private string _hash = "";
+        private long _userId;
+
+        public WinnerRaceIdempotencyStore(string connectionString, long winnerTaskId, string? winnerHashOverride = null)
+        {
+            _cs = connectionString;
+            _winnerTaskId = winnerTaskId;
+            _winnerHashOverride = winnerHashOverride;
+        }
+
+        public Task<IdempotencyHit?> TryGetAsync(SqlConnection conn, SqlTransaction tx, string key, string requestHash,
+            long userId, CancellationToken ct)
+        {
+            if (_winnerSeeded) return _inner.TryGetAsync(conn, tx, key, requestHash, userId, ct);
+            // 赛道读：胜者尚未提交 → 读空；记录本次指纹（胜者必须以同 key/user + 指定摘要落库）。
+            _key = key;
+            _hash = requestHash;
+            _userId = userId;
+            return Task.FromResult<IdempotencyHit?>(null);
+        }
+
+        public async Task SaveAsync(SqlConnection conn, SqlTransaction tx, string key, string requestHash, long userId,
+            int status, string body, CancellationToken ct)
+        {
+            if (!_winnerSeeded)
+            {
+                _winnerSeeded = true;
+                await using var winnerConn = new SqlConnection(_cs);
+                await winnerConn.OpenAsync(ct);
+                // 独立连接 + 无显式事务（自动提交）：胜者行在本次 SaveAsync 之前已提交。
+                await winnerConn.ExecuteAsync(@"
+INSERT INTO dbo.idempotency_record(idem_key,request_hash,user_id,response_status,response_body)
+VALUES(@key,@hash,@userId,200,@body)", new
+                {
+                    key = _key, hash = _winnerHashOverride ?? _hash, userId = _userId,
+                    body = JsonSerializer.Serialize(new { taskId = _winnerTaskId, state = "Ready" }),
+                });
+            }
+            await _inner.SaveAsync(conn, tx, key, requestHash, userId, status, body, ct);
+        }
     }
 
     private static string Code(int n) => "8" + n.ToString("D19");
@@ -715,5 +774,148 @@ SELECT COUNT(*) FROM dbo.code_event WHERE upload_task_id=@id AND source_snapshot
             new { id = scenario.ReturnTaskId }));
         Assert.Equal(0, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'upload-dispatch' AND payload_json LIKE @p",
             new { p = "%" + scenario.ReturnTaskId + "%" }));
+    }
+
+    // ---------- F6：唯一键冲突（UQ_idempotency_user_key）两条分支的确定性覆盖 ----------
+
+    /// <summary>
+    /// F6 分支一（确定性，不依赖随机并发）：赛道读落空后预置同 storeKey/user/requestHash 的幂等胜者
+    /// （响应体含 {taskId,state}），本次业务写入完成即撞 <c>UQ_idempotency_user_key</c> →
+    /// 业务+幂等整体回滚 → 重读胜者并回放其响应。断言证明：回放的是胜者结论，且任务/分片/确认行/
+    /// 审计/占用/事件/发送作业与幂等表都只有胜者那一份（本事务零残留）。
+    /// </summary>
+    [Fact]
+    public async Task Idempotency_race_winner_is_replayed_and_business_writes_roll_back()
+    {
+        await using var c = await _fx.OpenAsync();
+        var code = Code(14);
+        var scenario = await SeedConfirmableAsync(c, "SALE-T6-W1", "RET-T6-W1", code);
+        var svc = NewConfirmService(new WinnerRaceIdempotencyStore(_fx.ConnectionString, scenario.ReturnTaskId));
+
+        var result = await svc.ConfirmAsync(scenario.ReturnTaskId,
+            new ReturnConfirmCommand(1, "CONFIRMED", new[] { scenario.SaleEventId }, Evidence, "idem-t6-w1", "tester",
+                FirstReportDeclared: true), default);
+
+        // 回放胜者响应（ParseHit 与胜者响应体一致），而非本次业务结果。
+        Assert.True(result.Idempotent);
+        Assert.Equal(scenario.ReturnTaskId, result.TaskId);
+        Assert.Equal("Ready", result.State);
+
+        // 本次业务写入零残留：任务仍停在 Blocked/RETURN_CONFIRM_REQUIRED、版本未变。
+        Assert.Equal("Blocked", await ScalarAsync<string>(c, "SELECT state FROM dbo.upload_task WHERE id=@id",
+            new { id = scenario.ReturnTaskId }));
+        Assert.Equal("RETURN_CONFIRM_REQUIRED", await ScalarAsync<string>(c,
+            "SELECT state_reason FROM dbo.upload_task WHERE id=@id", new { id = scenario.ReturnTaskId }));
+        Assert.Equal(1, await ScalarAsync<int>(c, "SELECT version FROM dbo.upload_task WHERE id=@id",
+            new { id = scenario.ReturnTaskId }));
+        Assert.Null(await ScalarAsync<long?>(c,
+            "SELECT predecessor_task_id FROM dbo.upload_task WHERE id=@id", new { id = scenario.ReturnTaskId }));
+        // 确认行/审计/占用/分片/事件/发送作业均无第二次写入（全部来自被回滚的本次事务）。
+        Assert.Equal(0, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.return_confirmation"));
+        Assert.Equal(0, await ScalarAsync<int>(c,
+            "SELECT COUNT(*) FROM dbo.audit_log WHERE action LIKE N'task.return.%' AND object_id=@id",
+            new { id = scenario.ReturnTaskId.ToString(CultureInfo.InvariantCulture) }));
+        Assert.Equal(0, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.upload_part WHERE task_id=@id",
+            new { id = scenario.ReturnTaskId }));
+        Assert.Equal(0, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.code_claim WHERE upload_task_id=@id",
+            new { id = scenario.ReturnTaskId }));
+        Assert.Equal(0, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.code_event WHERE upload_task_id=@id",
+            new { id = scenario.ReturnTaskId }));
+        Assert.Equal(0, await ScalarAsync<int>(c, @"
+SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'upload-dispatch' AND payload_json LIKE @p",
+            new { p = "%" + scenario.ReturnTaskId + "%" }));
+        // 幂等表只有胜者一行，响应体即回放的来源。
+        Assert.Equal(1, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.idempotency_record"));
+        var body = await ScalarAsync<string>(c, "SELECT response_body FROM dbo.idempotency_record");
+        Assert.Contains("\"state\":\"Ready\"", body, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// F6 分支二（确定性）：赛道读落空后预置**同 storeKey/user 但不同 requestHash** 的幂等记录，
+    /// 本次 SaveAsync 撞 <c>UQ_idempotency_user_key</c> → 回滚 → 重读胜者时摘要不一致 →
+    /// <see cref="IdempotencyConflictException"/>（409 IDEMPOTENCY_CONFLICT 语义），业务写入全部回滚。
+    /// 与 <see cref="Same_idempotency_key_for_different_task_is_409"/> 互补：那条覆盖"赛道读命中"，
+    /// 本条覆盖"读落空后写冲突"的同一裁定。
+    /// </summary>
+    [Fact]
+    public async Task Idempotency_race_with_different_request_hash_is_409_and_rolls_back()
+    {
+        await using var c = await _fx.OpenAsync();
+        var code = Code(15);
+        var scenario = await SeedConfirmableAsync(c, "SALE-T6-W2", "RET-T6-W2", code);
+        var svc = NewConfirmService(
+            new WinnerRaceIdempotencyStore(_fx.ConnectionString, scenario.ReturnTaskId, new string('F', 64)));
+
+        await Assert.ThrowsAsync<IdempotencyConflictException>(() => svc.ConfirmAsync(scenario.ReturnTaskId,
+            new ReturnConfirmCommand(1, "CONFIRMED", new[] { scenario.SaleEventId }, Evidence, "idem-t6-w2", "tester",
+                FirstReportDeclared: true), default));
+
+        Assert.Equal("Blocked", await ScalarAsync<string>(c, "SELECT state FROM dbo.upload_task WHERE id=@id",
+            new { id = scenario.ReturnTaskId }));
+        Assert.Equal("RETURN_CONFIRM_REQUIRED", await ScalarAsync<string>(c,
+            "SELECT state_reason FROM dbo.upload_task WHERE id=@id", new { id = scenario.ReturnTaskId }));
+        Assert.Equal(1, await ScalarAsync<int>(c, "SELECT version FROM dbo.upload_task WHERE id=@id",
+            new { id = scenario.ReturnTaskId }));
+        Assert.Equal(0, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.return_confirmation"));
+        Assert.Equal(0, await ScalarAsync<int>(c,
+            "SELECT COUNT(*) FROM dbo.audit_log WHERE action LIKE N'task.return.%' AND object_id=@id",
+            new { id = scenario.ReturnTaskId.ToString(CultureInfo.InvariantCulture) }));
+        Assert.Equal(0, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.upload_part WHERE task_id=@id",
+            new { id = scenario.ReturnTaskId }));
+        Assert.Equal(0, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.code_claim WHERE upload_task_id=@id",
+            new { id = scenario.ReturnTaskId }));
+        Assert.Equal(0, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.code_event WHERE upload_task_id=@id",
+            new { id = scenario.ReturnTaskId }));
+        Assert.Equal(0, await ScalarAsync<int>(c, @"
+SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'upload-dispatch' AND payload_json LIKE @p",
+            new { p = "%" + scenario.ReturnTaskId + "%" }));
+        // 幂等表只有预置的异摘要记录（本次插入随事务回滚）。
+        Assert.Equal(1, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.idempotency_record"));
+        Assert.Equal(new string('F', 64), await ScalarAsync<string>(c,
+            "SELECT request_hash FROM dbo.idempotency_record"));
+    }
+
+    /// <summary>
+    /// F6 死分支的等价性证据：同一任务的两个并发确认由「插入前 UPDLOCK/HOLDLOCK 锁任务行 + 锁后重解析」
+    /// 串行化，败者必落 4xx 业务错误（VERSION_CONFLICT / NOT_RETURNABLE / ALREADY_RETURNED），
+    /// 绝不抛原始 <see cref="SqlException"/>（若 UQ_retconf_task 冲突逃出会成 500）。
+    /// 恰一条确认行/占用/确认审计，证明没有双写；UQ_retconf_task 的 catch 分支因此仅作防御。
+    /// </summary>
+    [Fact]
+    public async Task Concurrent_confirmation_of_same_task_never_escapes_raw_sql_error()
+    {
+        await using var c = await _fx.OpenAsync();
+        var code = Code(16);
+        var scenario = await SeedConfirmableAsync(c, "SALE-T6-W3", "RET-T6-W3", code);
+
+        var outcomes = await Task.WhenAll(
+            AttemptAsync(() => NewConfirmService().ConfirmAsync(scenario.ReturnTaskId,
+                new ReturnConfirmCommand(1, "CONFIRMED", new[] { scenario.SaleEventId }, Evidence, "idem-t6-w3a", "tester",
+                    FirstReportDeclared: true), default)),
+            AttemptAsync(() => NewConfirmService().ConfirmAsync(scenario.ReturnTaskId,
+                new ReturnConfirmCommand(1, "CONFIRMED", new[] { scenario.SaleEventId }, Evidence, "idem-t6-w3b", "tester",
+                    FirstReportDeclared: true), default)));
+
+        Assert.Single(outcomes.Where(o => o.Result is not null));
+        var failure = Assert.Single(outcomes.Where(o => o.Error is not null)).Error!;
+        Assert.False(failure is SqlException, $"并发同任务确认不得抛原始 SQL 异常：{failure}");
+        var errorCode = failure switch
+        {
+            AllocationConflictException conflict => conflict.ErrorCode,
+            AllocationValidationException validation => validation.ErrorCode,
+            _ => throw new Xunit.Sdk.XunitException($"意外的异常类型 {failure.GetType().Name}: {failure.Message}"),
+        };
+        Assert.Contains(errorCode, new[]
+        {
+            ReturnConfirmService.ErrorVersionConflict, ReturnConfirmService.ErrorNotReturnable, "ALREADY_RETURNED",
+        });
+
+        Assert.Equal(1, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.return_confirmation"));
+        Assert.Equal(1, await ScalarAsync<int>(c,
+            "SELECT COUNT(*) FROM dbo.code_claim WHERE event_scope=N'RETURN:116' AND claim_state=N'ACTIVE'"));
+        Assert.Equal(1, await ScalarAsync<int>(c,
+            "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'task.return.confirmed' AND object_id=@id",
+            new { id = scenario.ReturnTaskId.ToString(CultureInfo.InvariantCulture) }));
+        Assert.Equal(1, await ScalarAsync<int>(c, "SELECT COUNT(*) FROM dbo.idempotency_record"));
     }
 }

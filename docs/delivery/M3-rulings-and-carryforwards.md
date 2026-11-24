@@ -27,16 +27,16 @@
 | R-M3-19 | T8 UI 跟进（tab 服务端过滤、错误互斥、稳定幂等键、EnvBadge unknown、不预选、中文原因、aria）在 T7 修复轮之后执行，避免 SalesEndpoints/ReturnsPage 冲突。 | 多一轮评审。 |
 | R-M3-20 | T7 修复轮 2（M1/M2/M3 + 低风险加固）在 T8 跟进完成后顺序执行，避免并发构建与文件冲突。 | 多一轮串行。 |
 | R-M3-21 | 抽屉高度布局修复单独提交（单文件单 CSS 属性，已浏览器复测），不重开 T7/T8 修复循环。 | 分支多一个提交。 |
-| R-M3-22 | 恢复流程在自己的事务内重算任务聚合（先取任务 UPDLOCK/HOLDLOCK），而非留给后续回查/扫描；用例 6 由此断言精确 AcceptanceUnknown。 | 恢复路径多一次任务行锁；死锁顺序已对照派发/回查/人工路径审计。 |
+| R-M3-22 | 恢复流程在自己的事务内重算任务聚合（先取任务 UPDLOCK/HOLDLOCK），而非留给后续回查/扫描；用例 6 由此断言精确 AcceptanceUnknown。 | 恢复路径多一次任务行锁；死锁顺序已对照派发/回查/人工路径审计。**M4 Task 8 复核通过**：加锁顺序在所有写路径统一为「任务 → 分片 → 作业（outbox）→ 审计」，无反向成环；每候选一短事务（无 HTTP/无跨机调用），未发现可证明的锁范围缺陷，故未改代码（锁序表见 task-8-report.md）。 |
 
 ## 携带项（M4 必须处理）
 
-- **InternalsVisibleTo 面过宽**：`TraceFlow.Infrastructure.csproj` 对 `TraceFlow.IntegrationTests` 开放全部 internal 成员（供故障注入 BeforeSend/AfterSend/BeforeCommit 钩子）。M4 收窄为独立 internal 接口 + 测试专用注册（`#if DEBUG`），或移入 `InternalsVisibleTo` 白名单类型。
-- **恢复锁范围**：`SendRecoveryService` 在确认分片守卫成功前即锁任务行；当前无害，M4 复核锁顺序与吞吐（R-M3-22）。
-- **用例 2/3 意图计数器**：FaultInjection 用例 2/3 的恢复后计数器结构性为 0，保留作意图文档；M4 改为可证伪断言或删除。
+- **InternalsVisibleTo 面过宽**：`TraceFlow.Infrastructure.csproj` 对 `TraceFlow.IntegrationTests` 开放全部 internal 成员（供故障注入 BeforeSend/AfterSend/BeforeCommit 钩子）。M4 收窄为独立 internal 接口 + 测试专用注册（`#if DEBUG`），或移入 `InternalsVisibleTo` 白名单类型。**M4 Task 8 已关闭**：两条 `InternalsVisibleTo` 全部删除（`src/**/*.csproj` 零命中）；故障注入改为构造注入公开窄接口 `TraceFlow.Infrastructure.Uploads.IUploadDispatchObserver`（生产 DI 不注册 = null 无操作，三处崩溃点位置/顺序不变），导出辅助移入公共 `TraceFlow.Application.Export.ExportPolicy`（`MaxExportRows`/`ExceedsLimit`/`UtcIso`，格式不变）；无其他测试因此编译失败。
+- **恢复锁范围**：`SendRecoveryService` 在确认分片守卫成功前即锁任务行；当前无害，M4 复核锁顺序与吞吐（R-M3-22）。**M4 Task 8 已复核（复核通过，未改代码）**：任务行锁是重算任务聚合（R-M3-22）与「任务→分片」锁定顺序的必要前提——若先改分片再锁任务，将与 T2/T3 的「任务→分片」形成反向环；候选未命中时 rows=0 后同事务立即提交，持锁窗口仅数条语句且无 HTTP/网络调用。
+- **用例 2/3 意图计数器**：FaultInjection 用例 2/3 的恢复后计数器结构性为 0，保留作意图文档；M4 改为可证伪断言或删除。**M4 Task 8 已关闭**：用例 2 `Kill_after_http_before_t3_leaves_dispatching_and_recovery_never_reuploads` 与用例 3 `Kill_during_t3_rolls_back_and_attempt_stays_open` 的「恢复后 QUERY 尝试恒为 0」已删除（恢复服务无网关依赖，该计数永不可能失败），改为可证伪的库内证据：发送作业只落 FAILED 且无 PENDING/RUNNING 发送作业（重排即可重发）、恰一条 `send-recovery` 审计、分片 `query_count` 未被消耗、唯一 UPLOAD 尝试仍保持未收尾；既有断言只增不减。
 - **既有 ImportApi flake**：`ImportServiceTests` 提交用例曾两次观察到暂存区竞争（单跑/重跑均绿，M3 全量运行亦复现过一次 4 例 fixture 建库竞争），非 M3 代码缺陷；M4 与 CI 稳定性一并处理（fixture 建库串行化）。
 - **全局 429 映射缺 `Retry-After`/`retryAfter`**（M2 既有行为，仅 `ApiErrors` 429 分支）：M4 补契约测试与头/字段一致性。
-- **`ReturnConfirmService` 死分支**：`UQ_retconf_task` 唯一冲突 catch 在插入事务外不可达，极窄竞态会 500 而非 409；M4 加固。
+- **`ReturnConfirmService` 死分支**：`UQ_retconf_task` 唯一冲突 catch 在插入事务外不可达，极窄竞态会 500 而非 409；M4 加固。**M4 Task 8 已关闭（加固 + 确定性覆盖）**：`UQ_idempotency_user_key` 的两条分支由确定性用例覆盖——`ReturnConfirmTests.Idempotency_race_winner_is_replayed_and_business_writes_roll_back`（读落空→胜者已提交→2601/2627→回滚后重读胜者并回放响应，任务/分片/确认行/审计/占用/事件/发送作业/幂等表零残留）与 `ReturnConfirmTests.Idempotency_race_with_different_request_hash_is_409_and_rolls_back`（异摘要→`IdempotencyConflictException` 409，业务写入全部回滚）；同任务并发由 `ReturnConfirmTests.Concurrent_confirmation_of_same_task_never_escapes_raw_sql_error` 证明败者落 4xx 业务错误而非 500。`winner is null` 与 `UQ_retconf_task` 两处现为**防御性分支**（源码注释列明不可达理由：2601 只在本语句见到已落库索引项时抛出；确认行插入前已以 UPDLOCK/HOLDLOCK 锁任务行并复核 Blocked），不做恒真断言。
 - **M3 设置键未进 Settings API 目录**：`top.query.*` 等当前只能配置文件/直改库；M4 暴露给运维并补权限与审计。
 - **分片收缩不释放同任务丢弃占用**、`DocPayloadJson` 规范化在核验/工厂两处重复、退货候选 >2100 码未分批：低风险，M4 统一。
 - **前端遗留**：~~`fmtShanghai` 多页重复~~（M4 T7：收敛为 `src/utils/time.ts`，9 页改为导入）、~~Esc 关闭弹窗~~（M4 T7：六个 `role="dialog"` 弹窗接入 `useEscapeClose`）、~~组件测试（R-M3-3 推迟）~~（M4 T7：vitest 26 用例）、~~状态原因文案多源~~（M4 T7：`REASON_ZH` 收敛为 `src/utils/statusReason.ts`）、202 jobId 后续作业状态页（未完成）。

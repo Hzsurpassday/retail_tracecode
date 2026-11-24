@@ -10,6 +10,7 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using TraceFlow.Application.Export;
 using TraceFlow.Application.Security;
 using TraceFlow.Host.Endpoints;
 using TraceFlow.IntegrationTests.Sources;
@@ -20,7 +21,7 @@ namespace TraceFlow.IntegrationTests.Export;
 /// M4 Task 4 CSV 导出 HTTP 层（DEF-07 / AT-074）：BOM + 表头、公式注入防护（= 开头的单号/范围加 '）、
 /// 与台账列表同口径筛选与 env 隔离、对账差异导出按宿主 env 定界（跨 env 404）、
 /// `data.exported` 审计（env 恒 LIVE）、data:export / audit:export 权限 403、匿名 401、GET 无需 CSRF。
-/// 行数上限不做 5 万行 seed：<see cref="ExportEndpoints.ExceedsLimit"/> 为 internal 可测方法（brief 允许的偏差）。
+/// 行数上限不做 5 万行 seed：<see cref="ExportPolicy.ExceedsLimit"/> 为应用层公共纯函数（brief 允许的偏差）。
 /// 同一个类共用一份测试库，故所有断言用本用例专属码前缀 / run / action 定界，绝不跨用例计数。
 /// </summary>
 [SupportedOSPlatform("windows")]
@@ -252,14 +253,14 @@ public class ExportApiTests : IAsyncLifetime
     [Fact]
     public void Export_row_limit_helper_guards_at_fifty_thousand()
     {
-        // brief 允许的偏差：不 seed 5 万行，改为常量 + internal 可测方法；端点写响应前调用同一方法。
-        Assert.Equal(50_000, ExportEndpoints.MaxExportRows);
-        Assert.False(ExportEndpoints.ExceedsLimit(0));
-        Assert.False(ExportEndpoints.ExceedsLimit(50_000));
-        Assert.True(ExportEndpoints.ExceedsLimit(50_001));
-        Assert.True(ExportEndpoints.ExceedsLimit(long.MaxValue));
+        // brief 允许的偏差：不 seed 5 万行，改为公共常量 + 公共纯函数；端点写响应前调用同一方法。
+        Assert.Equal(50_000, ExportPolicy.MaxExportRows);
+        Assert.False(ExportPolicy.ExceedsLimit(0));
+        Assert.False(ExportPolicy.ExceedsLimit(50_000));
+        Assert.True(ExportPolicy.ExceedsLimit(50_001));
+        Assert.True(ExportPolicy.ExceedsLimit(long.MaxValue));
         // 时间列 UTC ISO 格式（yyyy-MM-ddTHH:mm:ss.fffZ）。
-        Assert.Equal("2026-11-20T02:00:00.000Z", ExportEndpoints.UtcIso(T1));
+        Assert.Equal("2026-11-20T02:00:00.000Z", ExportPolicy.UtcIso(T1));
     }
 
     // ---------------------------------------------------------------- 7. 匿名 401

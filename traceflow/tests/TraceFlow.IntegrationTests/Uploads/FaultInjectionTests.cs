@@ -30,8 +30,8 @@ public sealed class SimulatedCrashException : Exception
 /// 平台侧一律 <see cref="FakeTopGateway"/>（env=MOCK），env=LIVE 必须 fail-closed。
 /// </para>
 /// <para>
-/// 崩溃点由 <see cref="UploadDispatchService"/> 的 internal 钩子（BeforeSend/AfterSend/BeforeCommit，
-/// 仅测试程序集可见）注入：钩子抛异常等价于该边界上进程消失；生产代码从不赋值，行为与无钩子一致。
+/// 崩溃点由公开窄接口 <see cref="IUploadDispatchObserver"/>（构造注入，生产 DI 不注册）注入：
+/// 观察者抛异常等价于该边界上进程消失；生产路径无观察者，行为与不注入完全一致。
 /// </para>
 /// </summary>
 [SupportedOSPlatform("windows")]
@@ -44,15 +44,34 @@ public class FaultInjectionTests : IClassFixture<Sql2008Fixture>
 
     private sealed record Seed(long OrgId, long TaskId, long PartId, long JobId, long FencingToken);
 
+    /// <summary>
+    /// 故障注入观察者：任一回调抛异常 = 该边界上进程消失（后续语句一行都不执行）。
+    /// 三个回调用途与作用位置由 <see cref="IUploadDispatchObserver"/> 固定（发送前 / 发送后 / T3 提交前）。
+    /// </summary>
+    private sealed class CrashObserver : IUploadDispatchObserver
+    {
+        public Func<Task>? OnBeforeSend { get; init; }
+        public Func<Task>? OnAfterSend { get; init; }
+        public Func<Task>? OnBeforeCommit { get; init; }
+
+        public Task BeforeSendAsync(CancellationToken ct) => Invoke(OnBeforeSend);
+        public Task AfterSendAsync(CancellationToken ct) => Invoke(OnAfterSend);
+        public Task BeforeCommitAsync(CancellationToken ct) => Invoke(OnBeforeCommit);
+
+        private static Task Invoke(Func<Task>? hook) => hook is null ? Task.CompletedTask : hook();
+    }
+
     // ---------------------------------------------------------------- 服务构造
 
-    private UploadDispatchService NewDispatchService(Func<TopCall, TopRawResponse> handler)
+    private UploadDispatchService NewDispatchService(Func<TopCall, TopRawResponse> handler,
+        IUploadDispatchObserver? observer = null)
     {
         var audit = new AuditLog();
         var queue = new JobQueue(_fx.ConnectionString, audit);
         var top = new TopClientService(_fx.ConnectionString, new FakeTopGateway(handler), new RateBudgetService(),
             new ChannelPauseService(), audit);
-        return new UploadDispatchService(_fx.ConnectionString, top, queue, new SendRecoveryService(_fx.ConnectionString, queue));
+        return new UploadDispatchService(_fx.ConnectionString, top, queue,
+            new SendRecoveryService(_fx.ConnectionString, queue), observer);
     }
 
     private BillQueryService NewQueryService(Func<TopCall, TopRawResponse> handler)
@@ -263,6 +282,27 @@ WHERE job_kind=N'bill-query' AND intent_key=@k AND job_state=@state",
             new { k = $"query:part:{partId}", state });
 
     /// <summary>
+    /// 本分片仍可被再次发送的作业数（PENDING/RUNNING）：恢复只允许把发送作业落 FAILED，
+    /// 绝不复位/新建发送作业——重排发送作业等于重新 UPLOAD，本断言能因此失败（可证伪）。
+    /// </summary>
+    private Task<int> ActiveDispatchJobsAsync(long partId)
+        => ScalarAsync<int>(@"
+SELECT COUNT(*) FROM dbo.outbox_job
+WHERE job_kind=N'upload-dispatch' AND intent_key=@k AND job_state IN (N'PENDING',N'RUNNING')",
+            new { k = $"part:{partId}" });
+
+    /// <summary>本分片的发送恢复审计行数：恢复每处理一个候选恰好写一条（可因漏写/重复写而失败）。</summary>
+    private Task<int> RecoveryAuditRowsAsync(long partId)
+        => ScalarAsync<int>(@"
+SELECT COUNT(*) FROM dbo.audit_log
+WHERE action=N'send-recovery' AND object_type=N'upload_part' AND object_id=@obj",
+            new { obj = partId.ToString(CultureInfo.InvariantCulture) });
+
+    /// <summary>本分片累计查询次数（恢复不消耗查询预算；重排/触发回查会改变它，故可证伪）。</summary>
+    private Task<int> PartQueryCountAsync(long partId)
+        => ScalarAsync<int>("SELECT query_count FROM dbo.upload_part WHERE id=@id", new { id = partId });
+
+    /// <summary>
     /// 本任务已落库的核验流水行数：派发/恢复路径从不写逐码结论，本用例也未播种码台账，
     /// 故不再断言 code_result 计数；核验流水行数用于证明"未提交的受理成功/恢复均未凭空推进核验"。
     /// </summary>
@@ -315,8 +355,8 @@ FROM dbo.upload_attempt WHERE task_id=@id AND attempt_kind=@kind AND attempt_no=
         var codes = new[] { Code(101) };
         var seed = await SeedAsync(NewTag(), codes);
         var uploadCalls = 0;
-        var service = NewDispatchService(_ => { uploadCalls++; return Accepted("r-fj-1"); });
-        service.BeforeSend = () => throw new SimulatedCrashException("尝试行已写、HTTP 未发出时进程退出");
+        var service = NewDispatchService(_ => { uploadCalls++; return Accepted("r-fj-1"); },
+            new CrashObserver { OnBeforeSend = () => throw new SimulatedCrashException("尝试行已写、HTTP 未发出时进程退出") });
 
         await Assert.ThrowsAsync<SimulatedCrashException>(() =>
             service.DispatchAsync(seed.PartId, Worker, seed.FencingToken, default));
@@ -355,8 +395,7 @@ FROM dbo.upload_attempt WHERE task_id=@id AND attempt_kind=@kind AND attempt_no=
             if (call.Method == UploadDispatchService.UploadRetailMethod) { uploadCalls++; return Accepted("r-fj-2"); }
             queryCalls++;
             return BillStatusAllSuccess(codes);
-        });
-        service.AfterSend = () => throw new SimulatedCrashException("请求已发出、回执未落库时进程退出");
+        }, new CrashObserver { OnAfterSend = () => throw new SimulatedCrashException("请求已发出、回执未落库时进程退出") });
 
         await Assert.ThrowsAsync<SimulatedCrashException>(() =>
             service.DispatchAsync(seed.PartId, Worker, seed.FencingToken, default));
@@ -369,7 +408,13 @@ FROM dbo.upload_attempt WHERE task_id=@id AND attempt_kind=@kind AND attempt_no=
         Assert.True(await RecoverAsync() >= 1);
         Assert.Equal("AcceptanceUnknown", await PartStateAsync(seed.PartId));
         Assert.Equal(1, await QueryJobsAsync(seed.PartId, "PENDING"));
-        Assert.Equal(0, await QueryAttemptsAsync(seed.TaskId)); // 恢复本身不触达平台
+        Assert.Equal("FAILED", await DispatchJobStateAsync(seed.JobId));
+        // 恢复"不重发"的证据（可证伪，替代原"QUERY 尝试恒为 0"计数器——恢复服务无网关依赖，该计数永不可能失败）：
+        // 发送作业只落 FAILED、不存在任何待执行/在途发送作业（重排发送作业即可再次 UPLOAD）；
+        // 恢复每候选恰写一条 send-recovery 审计；恢复不消耗分片查询预算。
+        Assert.Equal(0, await ActiveDispatchJobsAsync(seed.PartId));
+        Assert.Equal(1, await RecoveryAuditRowsAsync(seed.PartId));
+        Assert.Equal(0, await PartQueryCountAsync(seed.PartId));
 
         // 回查作业被认领执行后：只有 QUERY 尝试，UPLOAD 调用数仍是 1。
         await using (var c = await _fx.OpenAsync())
@@ -404,8 +449,8 @@ FROM dbo.upload_attempt WHERE task_id=@id AND attempt_kind=@kind AND attempt_no=
     {
         var codes = new[] { Code(103) };
         var seed = await SeedAsync(NewTag(), codes);
-        var service = NewDispatchService(_ => TransportUncertain()); // 平台无结论
-        service.BeforeCommit = () => throw new SimulatedCrashException("T3 提交前进程退出");
+        var service = NewDispatchService(_ => TransportUncertain(), // 平台无结论
+            new CrashObserver { OnBeforeCommit = () => throw new SimulatedCrashException("T3 提交前进程退出") });
 
         await Assert.ThrowsAsync<SimulatedCrashException>(() =>
             service.DispatchAsync(seed.PartId, Worker, seed.FencingToken, default));
@@ -424,7 +469,14 @@ FROM dbo.upload_attempt WHERE task_id=@id AND attempt_kind=@kind AND attempt_no=
         Assert.Equal("FAILED", await DispatchJobStateAsync(seed.JobId));
         Assert.Equal(1, await QueryJobsAsync(seed.PartId, "PENDING"));
         Assert.Equal(1, await UploadAttemptsAsync(seed.TaskId));
-        Assert.Equal(0, await QueryAttemptsAsync(seed.TaskId));
+        // 恢复"不重发/不动本次尝试"的证据（可证伪，替代原"QUERY 尝试恒为 0"计数器——恢复服务无网关依赖）：
+        // 唯一 UPLOAD 尝试仍保持未收尾（恢复绝代收尾）、无待执行/在途发送作业、恰一条 send-recovery 审计、
+        // 分片查询预算未被消耗。
+        Assert.Equal(1, await OpenAttemptsAsync(seed.TaskId, "UPLOAD"));
+        Assert.Null((await AttemptAsync(seed.TaskId, "UPLOAD", 1)).FinishedAt);
+        Assert.Equal(0, await ActiveDispatchJobsAsync(seed.PartId));
+        Assert.Equal(1, await RecoveryAuditRowsAsync(seed.PartId));
+        Assert.Equal(0, await PartQueryCountAsync(seed.PartId));
     }
 
     // ---------------------------------------------------------------- 4
@@ -523,8 +575,8 @@ OUTPUT inserted.id VALUES(@taskId,@partId,1,N'UPLOAD',N'MOCK',@w,@token)",
     public async Task Crash_before_receipt_commit_keeps_accepted_unknown_and_no_task_success()
     {
         var seed = await SeedAsync(NewTag(), new[] { Code(107) });
-        var service = NewDispatchService(_ => Accepted("r-fj-6")); // 平台应答是受理成功
-        service.BeforeCommit = () => throw new SimulatedCrashException("回执已写入事务、提交前进程退出");
+        var service = NewDispatchService(_ => Accepted("r-fj-6"), // 平台应答是受理成功
+            new CrashObserver { OnBeforeCommit = () => throw new SimulatedCrashException("回执已写入事务、提交前进程退出") });
 
         await Assert.ThrowsAsync<SimulatedCrashException>(() =>
             service.DispatchAsync(seed.PartId, Worker, seed.FencingToken, default));
