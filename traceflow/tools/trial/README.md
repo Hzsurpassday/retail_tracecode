@@ -43,6 +43,8 @@
 - `Collect-Evidence.ps1`：`-BaseUrl`（默认 `http://127.0.0.1:5080`）、`-User`、`-Password`、`-IntervalMinutes 60`、`-Days 7`、`-Once`
 - `Stop-Trial.ps1`：`-DropDb`、`-DbName`、`-BaseConn`
 - `New-TrialSummary.ps1`：`-EvidenceDir`、`-Out`、`-IntervalMinutes`、`-ExpectedDays`
+- `Backup-Restore-Drill.ps1`：`-ServerInstance`、`-Base`（默认 `$env:TRACEFLOW_TRIAL_CONN`）、`-Stamp`、`-Keep`、`-KeepBackup`、`-Out`
+  （备份/恢复演练，详见 `docs/delivery/backup-restore.md`；默认写 `docs/delivery/backup-restore-drill.json`）
 
 ## 证据与日志位置（均被 .gitignore 忽略）
 
