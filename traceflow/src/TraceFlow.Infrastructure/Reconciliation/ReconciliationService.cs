@@ -49,7 +49,6 @@ public sealed class ReconciliationService
     private const int MaxWindowDays = 31;
     private const int ParamChunk = 500;
     private const int ObjectRefMaxChars = 200;
-    private const int NextActionMaxChars = 200;
     private const int EvidenceMaxChars = 2000;
     private const int AuditReasonMaxChars = 200;
 
@@ -314,7 +313,8 @@ WHERE id=@runId",
             });
         }
 
-        // MATCH_REQUIRED：核验失败，或任务未匹配且非 Blocked（同快照已有失败核验时只记一条，避免重复信号）。
+        // MATCH_REQUIRED：核验失败，或任务 match_state 未达 COMPLETE 且非 Blocked（生产任务工厂写 N'COMPLETE'，
+        // DDL 默认 N'UNMATCHED'，系统中不存在 N'MATCHED'；同快照已有失败核验时只记一条，避免重复信号）。
         foreach (var v in verifications.Where(v => string.Equals(v.State, "FAILED", StringComparison.Ordinal)))
         {
             var doc = documents.FirstOrDefault(d => d.SnapshotId == v.SnapshotId);
@@ -324,7 +324,7 @@ WHERE id=@runId",
                 state = v.State, uploadTaskId = v.UploadTaskId,
             });
         }
-        foreach (var task in tasks.Where(t => !string.Equals(t.MatchState, "MATCHED", StringComparison.Ordinal)
+        foreach (var task in tasks.Where(t => !string.Equals(t.MatchState, "COMPLETE", StringComparison.Ordinal)
                                               && !string.Equals(t.State, "Blocked", StringComparison.Ordinal)))
         {
             if (task.SnapshotId is long snapshotId && failedVerificationSnapshots.Contains(snapshotId)) continue;
@@ -435,7 +435,22 @@ WHERE id=@runId",
         var (severity, owner, nextAction) = Describe(diffType);
         var reference = string.IsNullOrWhiteSpace(objectRef) ? "(unknown)" : objectRef.Trim();
         diffs.Add(new DifferenceRow(diffType, severity, Truncate(reference, ObjectRefMaxChars),
-            owner, nextAction, Truncate(JsonSerializer.Serialize(evidence), EvidenceMaxChars)));
+            owner, nextAction, BuildEvidenceJson(evidence)));
+    }
+
+    /// <summary>
+    /// 证据 JSON 超限时不能直接按字符截断（会切裂字符串导致详情端点解析失败），改用合法包装
+    /// <c>{"truncated":true,"preview":"…"}</c>；未超限则原样返回（始终是合法 JSON）。
+    /// </summary>
+    private static string BuildEvidenceJson(object evidence)
+    {
+        var json = JsonSerializer.Serialize(evidence);
+        if (json.Length <= EvidenceMaxChars) return json;
+        return JsonSerializer.Serialize(new
+        {
+            truncated = true,
+            preview = json.Substring(0, EvidenceMaxChars),
+        });
     }
 
     private static (string Severity, string OwnerRole, string NextAction) Describe(string diffType) => diffType switch
@@ -470,12 +485,7 @@ WHERE rn=1 AND business_datetime IS NOT NULL AND business_datetime>=@start AND b
 ORDER BY id";
 
     private const string ReturnDocumentsSql = @"
-;WITH latest AS (
-    SELECT s.id, s.source_document_key, s.version, s.business_datetime, s.completeness_status,
-           ROW_NUMBER() OVER (PARTITION BY s.source_system_id, s.source_document_key ORDER BY s.version DESC) AS rn
-    FROM dbo.source_snapshot s
-    WHERE s.org_id=@orgId AND s.document_type=N'SALE'
-), anchored AS (
+;WITH anchored AS (
     SELECT DISTINCT t.source_snapshot_id AS snapshot_id
     FROM dbo.upload_task t
     JOIN dbo.source_snapshot sn ON sn.id=t.source_snapshot_id AND sn.org_id=t.org_id
@@ -483,12 +493,12 @@ ORDER BY id";
       AND t.task_type IN (N'CONSUMER_RETURN_116',N'PURCHASE_RETURN_202')
       AND sn.business_datetime IS NOT NULL AND sn.business_datetime>=@start AND sn.business_datetime<@end
 )
-SELECT l.id AS SnapshotId, l.source_document_key AS DocumentKey, l.version AS Version,
-       l.business_datetime AS BusinessDateTime, l.completeness_status AS Completeness
-FROM latest l
-JOIN anchored a ON a.snapshot_id=l.id
-WHERE l.rn=1
-ORDER BY l.id";
+SELECT s.id AS SnapshotId, s.source_document_key AS DocumentKey, s.version AS Version,
+       s.business_datetime AS BusinessDateTime, s.completeness_status AS Completeness
+FROM dbo.source_snapshot s
+JOIN anchored a ON a.snapshot_id=s.id
+WHERE s.org_id=@orgId
+ORDER BY s.id";
 
     private static async Task<List<SnapshotRow>> LoadDocumentsAsync(SqlConnection conn, SqlTransaction tx,
         long orgId, string env, DateTime start, DateTime end, string businessType, CancellationToken ct)
@@ -539,7 +549,7 @@ WHERE org_id=@orgId AND env=@env AND task_type IN @taskTypes AND source_snapshot
         foreach (var chunk in Chunks(taskIds))
         {
             rows.AddRange(await conn.QueryAsync<PartRow>(new CommandDefinition(@"
-SELECT id AS PartId, task_id AS TaskId, part_index AS PartIndex, bill_code AS BillCode, state AS State
+SELECT id AS PartId, task_id AS TaskId, bill_code AS BillCode, state AS State
 FROM dbo.upload_part WHERE task_id IN @ids ORDER BY id",
                 new { ids = chunk }, tx, cancellationToken: ct)));
         }
@@ -625,7 +635,7 @@ ORDER BY id",
         foreach (var chunk in Chunks(snapshotIds))
         {
             total += await conn.ExecuteScalarAsync<int>(new CommandDefinition(
-                "SELECT COUNT(*) FROM dbo.source_line WHERE snapshot_id IN @ids",
+                "SELECT COUNT(*) FROM dbo.source_line WHERE snapshot_id IN @ids AND event_kind IN (N'SALE',N'CONSUMER_RETURN')",
                 new { ids = chunk }, tx, cancellationToken: ct));
         }
         return total;
@@ -734,7 +744,6 @@ ORDER BY id", new { orgId, env, start, end }, tx, cancellationToken: ct));
     {
         public long PartId { get; set; }
         public long TaskId { get; set; }
-        public int PartIndex { get; set; }
         public string BillCode { get; set; } = "";
         public string State { get; set; } = "";
     }

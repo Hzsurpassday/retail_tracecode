@@ -281,11 +281,20 @@ WHERE d.id=@id AND r.org_id=@orgId AND r.env=@env", new { id, orgId, env }, tx, 
         return body;
     }
 
+    /// <summary>与全局 <c>ApiErrors</c> 同形的标准错误体（code/message/fieldErrors/retryable/retryAfter/requestId 六字段）。</summary>
     private static IResult Err(HttpContext ctx, int status, string code, string message)
-        => Results.Json(new { code, message, retryable = false, requestId = ctx.TraceIdentifier }, statusCode: status);
+        => Results.Json(new
+        {
+            code, message, fieldErrors = Array.Empty<object>(), retryable = false, retryAfter = (int?)null,
+            requestId = ctx.TraceIdentifier,
+        }, statusCode: status);
 
     private static (int Status, string Body) ErrTuple(HttpContext ctx, int status, string code, string message)
-        => (status, JsonSerializer.Serialize(new { code, message, retryable = false, requestId = ctx.TraceIdentifier }));
+        => (status, JsonSerializer.Serialize(new
+        {
+            code, message, fieldErrors = Array.Empty<object>(), retryable = false, retryAfter = (int?)null,
+            requestId = ctx.TraceIdentifier,
+        }));
 
     public sealed record ReconciliationRequestBody(string? WindowStart, string? WindowEnd, string? BusinessType);
     public sealed record ResolveRequestBody(string? ResolutionEvidence);

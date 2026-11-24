@@ -118,6 +118,37 @@ public class ReconciliationTests : IAsyncLifetime
         Assert.Equal(1, summary.RootElement.GetProperty("tasks").GetInt32());
     }
 
+    // ---------------------------------------------------------------- 1c. RETURN 锚定被后写版本超越的快照
+
+    [Fact]
+    public async Task Recon_return_task_anchored_to_superseded_snapshot_version_is_not_dropped()
+    {
+        await using var c = await _fx.OpenAsync();
+        var older = await SeedDocumentAsync(c, "RETURN-BUMP-1", version: 1);
+        var newer = await SeedDocumentAsync(c, "RETURN-BUMP-1", version: 2); // 同文档键的新版本：旧版不再是 rn=1
+        Assert.NotEqual(older, newer);
+        await SeedLineAsync(c, older, "R1", "CONSUMER_RETURN", "690000000000000104");
+        await SeedLineAsync(c, newer, "R1", "CONSUMER_RETURN", "690000000000000105");
+        var task = await SeedTaskAsync(c, "KSOA:RETURN-BUMP-1:CONSUMER_RETURN_116", older,
+            taskType: "CONSUMER_RETURN_116");
+        await SeedPartAsync(c, task, 0, "AcceptanceUnknown"); // 非终态分片
+
+        var result = await NewService().RunAsync("MOCK", DayStart, DayEnd, "RETURN", CancellationToken.None);
+
+        // 旧实现用 rn=1 连接锚定快照：旧版被新版本超越 → 任务被静默丢弃，run 报 COMPLETE/0 差异。
+        Assert.Equal("INCOMPLETE", result.Status);
+        Assert.Equal(1, result.DifferenceCount);
+        Assert.Equal("ACCEPTANCE_UNKNOWN", await c.ExecuteScalarAsync<string>(
+            "SELECT diff_type FROM dbo.reconciliation_difference WHERE run_id=@id", new { id = result.RunId }));
+        var summaryJson = await c.ExecuteScalarAsync<string>(
+            "SELECT local_summary FROM dbo.reconciliation_run WHERE id=@id", new { id = result.RunId });
+        Assert.NotNull(summaryJson);
+        using var summary = JsonDocument.Parse(summaryJson!);
+        Assert.Equal(1, summary.RootElement.GetProperty("documents").GetInt32());
+        Assert.Equal(1, summary.RootElement.GetProperty("tasks").GetInt32());
+        Assert.Equal(1, summary.RootElement.GetProperty("parts").GetInt32());
+    }
+
     // ---------------------------------------------------------------- 2. AT-062 等量不等集
 
     [Fact]
@@ -177,6 +208,10 @@ public class ReconciliationTests : IAsyncLifetime
         Assert.Equal(0, result.DifferenceCount);
         Assert.Equal(0, await c.ExecuteScalarAsync<int>(
             "SELECT COUNT(*) FROM dbo.reconciliation_difference WHERE run_id=@id", new { id = result.RunId }));
+        // 生产任务工厂写 match_state=N'COMPLETE'：健康任务绝不产出 MATCH_REQUIRED。
+        Assert.Equal(0, await c.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.reconciliation_difference WHERE run_id=@id AND diff_type=N'MATCH_REQUIRED'",
+            new { id = result.RunId }));
         Assert.Contains("\"parts\":3", await c.ExecuteScalarAsync<string>(
             "SELECT local_summary FROM dbo.reconciliation_run WHERE id=@id", new { id = result.RunId }), StringComparison.Ordinal);
     }
@@ -238,6 +273,32 @@ public class ReconciliationTests : IAsyncLifetime
         Assert.Equal("INCOMPLETE", result.Status); // AcceptanceUnknown 属非终态分片
     }
 
+    // ---------------------------------------------------------------- 5b. 未匹配任务 → 单条 MATCH_REQUIRED
+
+    [Fact]
+    public async Task Recon_unmatched_task_yields_exactly_one_match_required()
+    {
+        await using var c = await _fx.OpenAsync();
+        var doc = await SeedDocumentAsync(c, "MATCH-UNMATCHED");
+        await SeedLineAsync(c, doc, "L1", "SALE", "690000000000000901");
+        // 生产 DDL 默认 N'UNMATCHED'：未匹配且任务非 Blocked → 恰好一条 MATCH_REQUIRED。
+        var task = await SeedTaskAsync(c, "KSOA:MATCH-UNMATCHED:RETAIL_321", doc, matchState: "UNMATCHED");
+        await SeedVerificationAsync(c, "MATCH-UNMATCHED", doc, "PASSED", task);
+        await SeedPartAsync(c, task, 0, "Succeeded");
+
+        var result = await NewService().RunAsync("MOCK", DayStart, DayEnd, "SALE", CancellationToken.None);
+
+        Assert.Equal("COMPLETE", result.Status);
+        Assert.Equal(1, result.DifferenceCount);
+        var diff = await c.QuerySingleAsync<(string DiffType, string Severity, string Owner, string Evidence)>(
+            "SELECT diff_type, severity, owner_role, evidence_json FROM dbo.reconciliation_difference WHERE run_id=@id",
+            new { id = result.RunId });
+        Assert.Equal("MATCH_REQUIRED", diff.DiffType);
+        Assert.Equal("MEDIUM", diff.Severity);
+        Assert.Equal("operator", diff.Owner);
+        Assert.Contains("\"matchState\":\"UNMATCHED\"", diff.Evidence, StringComparison.Ordinal);
+    }
+
     // ---------------------------------------------------------------- 6. 逐行缺码
 
     [Fact]
@@ -248,6 +309,7 @@ public class ReconciliationTests : IAsyncLifetime
         await SeedLineAsync(c, doc, "L1", "SALE", null);
         await SeedLineAsync(c, doc, "L2", "SALE", "   ");
         await SeedLineAsync(c, doc, "L3", "SALE", "690000000000000601");
+        await SeedLineAsync(c, doc, "L4", "NO_EVENT", null); // 非 SALE/CONSUMER_RETURN 行不参与缺码与 saleLines
         var task = await SeedTaskAsync(c, "KSOA:MISSING-CODE-DOC:RETAIL_321", doc);
         await SeedVerificationAsync(c, "MISSING-CODE-DOC", doc, "PASSED", task);
         await SeedPartAsync(c, task, 0, "Succeeded");
@@ -261,6 +323,9 @@ public class ReconciliationTests : IAsyncLifetime
         Assert.All(refs, r => Assert.Equal("MISSING_CODE", r.DiffType));
         Assert.All(refs, r => Assert.Equal("HIGH", r.Severity));
         Assert.Equal(new[] { "L1", "L2" }, refs.Select(r => r.ObjectRef).ToArray());
+        // saleLines 只统计 SALE/CONSUMER_RETURN 行（与 MISSING_CODE 同口径）：3 行而非 4 行。
+        Assert.Contains("\"saleLines\":3", await c.ExecuteScalarAsync<string>(
+            "SELECT local_summary FROM dbo.reconciliation_run WHERE id=@id", new { id = result.RunId }), StringComparison.Ordinal);
     }
 
     // ---------------------------------------------------------------- 7. 上游不完整
@@ -336,6 +401,65 @@ SELECT CAST(SCOPE_IDENTITY() AS bigint);", new { orgId = _orgId, start = DayStar
         Assert.Equal(1, list.GetProperty("data").GetProperty("total").GetInt32());
     }
 
+    // ---------------------------------------------------------------- 8b. 列表分页 + 状态过滤
+
+    [Fact]
+    public async Task Recon_list_api_paginates_and_filters_by_status()
+    {
+        await using var c = await _fx.OpenAsync();
+        var completeNew = await SeedRunAsync(c, "COMPLETE", DayStart.AddHours(12));
+        var completeOld = await SeedRunAsync(c, "COMPLETE", DayStart.AddHours(6));
+        var incomplete = await SeedRunAsync(c, "INCOMPLETE", DayStart.AddHours(18));
+
+        var client = await LoginAsync();
+        var page1 = await client.GetFromJsonAsync<JsonElement>("/api/v1/reconciliation-runs?page=1&pageSize=2");
+        var page1Data = page1.GetProperty("data");
+        Assert.Equal(3, page1Data.GetProperty("total").GetInt32());
+        Assert.Equal(2, page1Data.GetProperty("pageSize").GetInt32());
+        // started_at DESC 分页：18 时 > 12 时 > 6 时。
+        Assert.Equal(new[] { incomplete, completeNew }, page1Data.GetProperty("items").EnumerateArray()
+            .Select(i => long.Parse(i.GetProperty("runId").GetString()!)).ToArray());
+
+        var page2 = await client.GetFromJsonAsync<JsonElement>("/api/v1/reconciliation-runs?page=2&pageSize=2");
+        var page2Ids = page2.GetProperty("data").GetProperty("items").EnumerateArray()
+            .Select(i => long.Parse(i.GetProperty("runId").GetString()!)).ToArray();
+        Assert.Equal(new[] { completeOld }, page2Ids);
+
+        var filtered = await client.GetFromJsonAsync<JsonElement>("/api/v1/reconciliation-runs?status=COMPLETE");
+        var filteredData = filtered.GetProperty("data");
+        Assert.Equal(2, filteredData.GetProperty("total").GetInt32());
+        Assert.All(filteredData.GetProperty("items").EnumerateArray(), i =>
+            Assert.Equal("COMPLETE", i.GetProperty("status").GetString()));
+
+        // 非法 status → 422；标准错误体六字段齐全（fieldErrors 空数组、retryAfter null）。
+        var bad = await client.GetAsync("/api/v1/reconciliation-runs?status=BOGUS");
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, bad.StatusCode);
+        var badBody = await ReadJsonAsync(bad);
+        Assert.Equal("VALIDATION", badBody.GetProperty("code").GetString());
+        Assert.Equal(JsonValueKind.Array, badBody.GetProperty("fieldErrors").ValueKind);
+        Assert.Equal(0, badBody.GetProperty("fieldErrors").GetArrayLength());
+        Assert.False(badBody.GetProperty("retryable").GetBoolean());
+        Assert.Equal(JsonValueKind.Null, badBody.GetProperty("retryAfter").ValueKind);
+    }
+
+    // ---------------------------------------------------------------- 8c. 匿名 401
+
+    [Fact]
+    public async Task Recon_new_endpoints_reject_anonymous_with_401()
+    {
+        var anon = _factory.CreateClient();
+        Assert.Equal(HttpStatusCode.Unauthorized,
+            (await anon.GetAsync("/api/v1/reconciliation-runs")).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized,
+            (await anon.GetAsync("/api/v1/reconciliation-runs/1")).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized,
+            (await anon.PostAsJsonAsync("/api/v1/reconciliation-runs",
+                new { windowStart = "2026-11-20T00:00:00Z", windowEnd = "2026-11-21T00:00:00Z", businessType = "SALE" })).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized,
+            (await anon.PostAsJsonAsync("/api/v1/reconciliation-differences/1/resolve",
+                new { resolutionEvidence = "匿名" })).StatusCode);
+    }
+
     // ---------------------------------------------------------------- 9. 差异解决
 
     [Fact]
@@ -352,7 +476,11 @@ SELECT CAST(SCOPE_IDENTITY() AS bigint);", new { orgId = _orgId, start = DayStar
 
         var empty = await PostJsonAsync(client, path, new { resolutionEvidence = "   " }, "resolve-empty-1");
         Assert.Equal(HttpStatusCode.UnprocessableEntity, empty.StatusCode);
-        Assert.Equal("VALIDATION", (await ReadJsonAsync(empty)).GetProperty("code").GetString());
+        var emptyBody = await ReadJsonAsync(empty);
+        Assert.Equal("VALIDATION", emptyBody.GetProperty("code").GetString());
+        // 标准错误体六字段：fieldErrors/retryAfter 不得缺失。
+        Assert.Equal(JsonValueKind.Array, emptyBody.GetProperty("fieldErrors").ValueKind);
+        Assert.Equal(JsonValueKind.Null, emptyBody.GetProperty("retryAfter").ValueKind);
 
         var ok = await PostJsonAsync(client, path, new { resolutionEvidence = "已核对平台回查证据，确认平台未受理" }, "resolve-ok-1");
         Assert.Equal(HttpStatusCode.OK, ok.StatusCode);
@@ -372,7 +500,11 @@ WHERE action=N'recon.difference.resolved' AND env='LIVE' AND actor=N'recon-admin
 
         var again = await PostJsonAsync(client, path, new { resolutionEvidence = "重复处理" }, "resolve-again-1");
         Assert.Equal(HttpStatusCode.Conflict, again.StatusCode);
-        Assert.Equal("DIFFERENCE_ALREADY_RESOLVED", (await ReadJsonAsync(again)).GetProperty("code").GetString());
+        var againBody = await ReadJsonAsync(again);
+        Assert.Equal("DIFFERENCE_ALREADY_RESOLVED", againBody.GetProperty("code").GetString());
+        Assert.Equal(JsonValueKind.Array, againBody.GetProperty("fieldErrors").ValueKind);
+        Assert.False(againBody.GetProperty("retryable").GetBoolean());
+        Assert.Equal(JsonValueKind.Null, againBody.GetProperty("retryAfter").ValueKind);
 
         var missing = await PostJsonAsync(client, "/api/v1/reconciliation-differences/999999/resolve",
             new { resolutionEvidence = "不存在" }, "resolve-missing-1");
@@ -491,7 +623,7 @@ VALUES(@snapshotId,@lineKey,N'P-1',1,N'盒',@code,@code,@format,@hash,@eventKind
 
     private async Task<long> SeedTaskAsync(SqlConnection c, string eventKey, long snapshotId,
         string env = "MOCK", string taskType = "RETAIL_321", string state = "Succeeded",
-        string matchState = "MATCHED", string verificationState = "PASSED", string dependencyState = "NONE",
+        string matchState = "COMPLETE", string verificationState = "PASSED", string dependencyState = "NONE",
         string? stateReason = null)
         => await c.ExecuteScalarAsync<long>(@"
 INSERT INTO dbo.upload_task(org_id,env,event_key,task_type,source_snapshot_id,source_hash,payload_hash,
@@ -531,6 +663,17 @@ INSERT INTO dbo.upload_attempt(task_id,part_id,attempt_no,attempt_kind,env,fenci
 VALUES(@taskId,@partId,@attemptNo,N'QUERY',@env,1,DATEADD(minute,-5,SYSUTCDATETIME()),SYSUTCDATETIME(),
     @httpStatus,@requestId,N'{""msgCode"":""SUCCESS""}')",
             new { taskId, partId, attemptNo, env, httpStatus, requestId });
+
+    private async Task<long> SeedRunAsync(SqlConnection c, string status, DateTime startedAt)
+        => await c.ExecuteScalarAsync<long>(@"
+INSERT INTO dbo.reconciliation_run(org_id,env,window_start,window_end,business_type,status,started_at,finished_at)
+VALUES(@orgId,N'MOCK',@start,@end,N'SALE',@status,@startedAt,@finishedAt);
+SELECT CAST(SCOPE_IDENTITY() AS bigint);",
+            new
+            {
+                orgId = _orgId, start = DayStart, end = DayEnd, status, startedAt,
+                finishedAt = status == "RUNNING" ? (DateTime?)null : startedAt.AddMinutes(1),
+            });
 
     // ---------------------------------------------------------------- HTTP 辅助
 
