@@ -88,8 +88,9 @@ public static class CodesEndpoints
             var total = await conn.ExecuteScalarAsync<int>(new CommandDefinition(
                 $"{baseCte} SELECT COUNT(*) FROM ev WHERE {statePredicate}",
                 args, cancellationToken: ctx.RequestAborted));
-            args.Add("lo", (p - 1) * size + 1);
-            args.Add("hi", p * size);
+            // 64 位算区间：page 极大时 int 乘法会溢出为负、区间错位。
+            args.Add("lo", ((long)p - 1) * size + 1);
+            args.Add("hi", (long)p * size);
             // 2008 R2：ROW_NUMBER 区间分页；最新事件类型/占用/单号用 OUTER APPLY TOP 1（禁 2012+ 分页子句）。
             var rows = (await conn.QueryAsync<CodeListRow>(new CommandDefinition($@"
 {baseCte},

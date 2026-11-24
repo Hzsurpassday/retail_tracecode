@@ -137,8 +137,9 @@ WHERE sm.org_id=@orgId AND sm.state=N'CONFLICT'{inactive}");
             var total = await conn.ExecuteScalarAsync<int>(new CommandDefinition(
                 $"SELECT COUNT(*) FROM ({unionSql}) u", args, cancellationToken: ctx.RequestAborted));
 
-            args.Add("lo", (p - 1) * size + 1);
-            args.Add("hi", p * size);
+            // 64 位算区间：page 极大时 int 乘法会溢出为负、区间错位。
+            args.Add("lo", ((long)p - 1) * size + 1);
+            args.Add("hi", (long)p * size);
             // 2008 R2：两层派生表先算 ROW_NUMBER 再按区间取行（排序键含 NULL 置后）。
             var rows = (await conn.QueryAsync<QueueRow>(new CommandDefinition($@"
 SELECT x.category, x.id, x.status, x.title, x.detailSnippet, x.objectRef, x.createdAt, x.env, x.deepLink

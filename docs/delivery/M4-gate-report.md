@@ -209,6 +209,28 @@ powershell -NoProfile -ExecutionPolicy Bypass -File traceflow/tools/trial/Backup
 | 人工操作审计 | 映射确认/改绑/解除、分类、设置更新、人工核对、受控重试、退货确认、异常留证关闭均写前后摘要/原因/对象，无明文密钥 | `PermissionAuditTests`、`SettingsServiceTests.Secret_is_write_only_never_echoed_and_audit_has_no_plaintext`、`ExceptionQueueTests.Ingest_resolve_requires_evidence_audits_live_and_conflicts_on_repeat`、`ReturnConfirmTests`、`UploadApiTests` 人工操作审计用例 |
 | 导出中途失败不写审计 | 流式写出 200 后异常 → 日志 + `ctx.Abort()`，跳过 `data.exported` | `ExportEndpoints.StreamCsvAsync`（fix pass A1）；无新增失败注入用例（如实标注） |
 
+### 9. 整分支终审修复轮补验（H-1 / M-1 / Lows）
+
+在 29fd9d2 之后按终审意见修复（终态白名单、漏跑日窗补跑、文档与分页低危项），命令与上文 ②.1–②.5 相同，真实输出：
+
+```
+dotnet build traceflow/TraceFlow.sln -c Release
+  → 0 个警告 / 0 个错误
+dotnet test traceflow/tests/TraceFlow.UnitTests -c Release --no-build
+  → 已通过! - 失败: 0，通过: 322，总计: 322
+dotnet test traceflow/tests/TraceFlow.IntegrationTests -c Release（默认 collation）
+  → 已通过! - 失败: 0，通过: 495，总计: 495，持续时间: 2 m 18 s
+dotnet test traceflow/tests/TraceFlow.IntegrationTests -c Release --no-build（BIN2 变体）
+  → 已通过! - 失败: 0，通过: 495，总计: 495，持续时间: 3 m 17 s
+npm test / npm run build（TraceFlow.Web）
+  → 29/29 通过；tsc 0 错误 + vite 产物（53 modules）
+```
+
+用例数口径：本报告 ②.3/②.4 的 490 为 Task 12 当时的真实跑数；其后 29fd9d2 增加 2 条（
+`Products_keyword_treats_wildcards_as_literal`、`Suppliers_keyword_treats_percent_as_literal`），本轮修复再增加 3 条
+（`Recon_accepted_part_makes_run_incomplete`、`Recon_manual_action_part_makes_run_incomplete`、
+`Recon_scheduler_backfills_missed_days_since_first_run`），故本轮真实总数为 **492 + 3 = 495**。
+
 ## ③ 迁移账本（真实数据）
 
 - 迁移 **0001–0009 字节未变**：本任务未修改 `traceflow/db/migrations/**`；checksum 以 M3 门禁报告 ③ 登记的 9 个
@@ -221,8 +243,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File traceflow/tools/trial/Backup
 
 | AT | 范围 | 实际证据 | 缺口 |
 | --- | --- | --- | --- |
+| AT-062/063/064 | 日对账（REC-01/02/03）：集合比对、非终态→INCOMPLETE、调度与漏跑补跑 | `ReconciliationTests`（19 用例）：终态白名单（{Succeeded,Failed,PartialSuccess,ResultUnresolved,Cancelled} 之外一律 INCOMPLETE + `NON_TERMINAL_PARTS`，`Recon_accepted_part_makes_run_incomplete`/`Recon_manual_action_part_makes_run_incomplete`）；日调度幂等 `Recon_daily_scheduler_enqueues_once_per_day`；**漏跑日窗有界补跑**（自最早作业活动日起最多 7 天，`Recon_scheduler_backfills_missed_days_since_first_run`） | G-TOP 未取证（平台侧仅本地持久化证据）；AT-064 的 LIVE 端未执行 |
 | AT-069 | 人工映射/补配/分类/配置/重试/导出审计 | 审计覆盖：映射确认与改绑（`MappingConfirmTests`、`M2CarryforwardApiTests.Resolve_*`）、分类（`ClassificationTests.Trace_policy_updates_and_audits`）、设置（`SettingsServiceTests.*`、`SettingsApiTests.*`）、人工核对/受控重试（`UploadApiTests.Manual_verify_*`、`Controlled_retry_*`）、退货确认（`ReturnConfirmTests.Confirm_creates_claims_events_and_dispatch_outbox`）、导出（`data.exported`）、异常关闭（`exception.resolved`）；密钥只写不回显、审计无明文 | 无（审计内容正确性以集成断言为证；未做人工抽查报告） |
-| AT-070 | 全套迁移/分页/队列在 2008 R2 执行 | **未执行**：静态语法门禁 `Sql2008CompatibilityTests`（含目录级扫描）通过；运行时仅在 SQL 2019 | **AT-070 未完成**：须真实 10.50.x 重跑 490 集成用例 + `perf` 基准 |
+| AT-070 | 全套迁移/分页/队列在 2008 R2 执行 | **未执行**：静态语法门禁 `Sql2008CompatibilityTests`（含目录级扫描）通过；运行时仅在 SQL 2019 | **AT-070 未完成**：须真实 10.50.x 重跑全部集成用例（终审修复轮后 495 条）+ `perf` 基准 |
 | AT-071 | 无应用密钥/连接密码/完整签名泄露 | `SettingsServiceTests.Secret_is_write_only_never_echoed_and_audit_has_no_plaintext`、`SettingsApiTests.Secret_write_returns_has_secret_value_and_null_value_json`；前端无密钥；本任务文档/脚本 grep 无敏感值（§验证 4） | 目标机日志与部署配置的人工扫描未做（G-DEPLOY） |
 | AT-072 | 业务库恢复到发送前旧备份：上传暂停、先对账修复、不重放已成功业务 | **数据层演练已完成**（②.7：备份→变更→恢复→8 项断言）；流程文档 `backup-restore.md` §4 强制"停发送→先对账→修复→再开放" | **LIVE 端到端未执行**：无平台可对账（G-TOP 未取证）；恢复后 `outbox_job` 重放防护靠"服务停止"运维约束，未做进程级演练 |
 | AT-073 | 页面关闭后 Worker 独立处理，重开显示真实持久状态 | 作业为数据库持久队列（`outbox_job` 租约/fencing）+ 后台 `WorkerHostedService`，与浏览器会话无关；`JobQueueTests`（双 Worker 竞争、租约回收、token guard）、`OpsStatusTests`（作业状态读库）、`Dashboard_requires_trace_read_and_returns_real_counts` | **未做浏览器端到端运行**（本任务不新增浏览器声明）；页面关闭/重开行为属既有设计事实，未新跑 |
@@ -263,3 +286,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File traceflow/tools/trial/Backup
    `ent_id`/`ref_ent_id` 仍须 DBA 直更（无 API）。
 5. 代码中 `Program.cs:11 UseWindowsService()`、`Program.cs:131 Cookie.SecurePolicy` 与 brief 引用一致；
    brief 中 `Program.cs:11` 的行号在 `deployment.md` 中按实际文件引用。
+6. **对账无独立前端页面（本阶段不交付）**：日对账由 Worker 调度产出（含最多 7 天漏跑补跑），人工触发
+   （`POST /api/v1/reconciliation-runs`）与运行历史/差异/审计三类 CSV 仅走 API；码台账详情不含本地
+   `verification_code` 段（占用/逐码核验结论见 POS 销售详情）。

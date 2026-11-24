@@ -95,8 +95,9 @@ public static class ReconciliationEndpoints
             var total = await conn.ExecuteScalarAsync<int>(new CommandDefinition(
                 $"SELECT COUNT(*) FROM dbo.reconciliation_run r {where}", args, cancellationToken: ctx.RequestAborted));
 
-            args.Add("lo", (p - 1) * size + 1);
-            args.Add("hi", p * size);
+            // 64 位算区间：page 极大时 int 乘法会溢出为负、区间错位。
+            args.Add("lo", ((long)p - 1) * size + 1);
+            args.Add("hi", (long)p * size);
             // 2008 R2：ROW_NUMBER 区间分页（不使用 2012+ 的跳行/取行分页子句）。
             var rows = (await conn.QueryAsync<RunListRow>(new CommandDefinition($@"
 SELECT x.id AS RunId, x.window_start AS WindowStart, x.window_end AS WindowEnd,

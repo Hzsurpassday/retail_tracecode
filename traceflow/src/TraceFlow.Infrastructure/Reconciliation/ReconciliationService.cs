@@ -52,10 +52,11 @@ public sealed class ReconciliationService
     private const int EvidenceMaxChars = 2000;
     private const int AuditReasonMaxChars = 200;
 
-    /// <summary>平台统计无法定论的分片状态（PRD §9.2 非终态）：命中即 run=INCOMPLETE。</summary>
-    private static readonly HashSet<string> NonTerminalPartStates = new(StringComparer.Ordinal)
+    // 终态白名单（PRD §9.2）：不在集合内的任何分片状态（含 Accepted/ManualAction/Dispatching/
+    // Processing/RetryWait/Blocked/Ready/AcceptanceUnknown 及未知值）都视为无法定论 → run=INCOMPLETE。
+    private static readonly HashSet<string> TerminalPartStates = new(StringComparer.Ordinal)
     {
-        "Blocked", "Ready", "Dispatching", "AcceptanceUnknown", "Processing", "RetryWait",
+        "Succeeded", "Failed", "PartialSuccess", "ResultUnresolved", "Cancelled",
     };
 
     private static readonly HashSet<string> SnapshotIncompleteStates = new(StringComparer.Ordinal)
@@ -171,8 +172,8 @@ SELECT CAST(SCOPE_IDENTITY() AS bigint);",
         var diffs = new List<DifferenceRow>();
         Evaluate(diffs, type, documents, verifications, tasks, parts, queries, codeCounts, missingLines, upstreamIncomplete);
 
-        // 4) 平台统计可得性：任一分片非终态 → INCOMPLETE（绝不显示"无差异"）。
-        var unavailable = parts.Any(p => NonTerminalPartStates.Contains(p.State));
+        // 4) 平台统计可得性：任一片不在终态白名单 → INCOMPLETE（绝不显示"无差异"）。
+        var unavailable = parts.Any(p => !TerminalPartStates.Contains(p.State));
         var status = unavailable ? StatusIncomplete : StatusComplete;
 
         var partsByState = new SortedDictionary<string, int>(StringComparer.Ordinal);
@@ -397,6 +398,40 @@ WHERE id=@runId",
             });
         }
         foreach (var part in parts.Where(p => string.Equals(p.State, "ResultUnresolved", StringComparison.Ordinal)))
+        {
+            Add(diffs, DiffResultUnresolved, part.BillCode, new
+            {
+                source = "upload_part", level = "part", partId = part.PartId, taskId = part.TaskId,
+                billCode = part.BillCode, state = part.State,
+            });
+        }
+        // Accepted / ManualAction 同样不是终态：平台已受理（逐码结果未回）或已升级人工（结论未定），
+        // 都必须登记差异，避免「平台无最终结论」被呈现成「COMPLETE 且零差异」。
+        foreach (var task in tasks.Where(t => string.Equals(t.State, "Accepted", StringComparison.Ordinal)))
+        {
+            Add(diffs, DiffAcceptanceUnknown, task.EventKey, new
+            {
+                source = "upload_task", level = "task", taskId = task.TaskId, taskType = task.TaskType,
+                state = task.State, eventKey = task.EventKey,
+            });
+        }
+        foreach (var part in parts.Where(p => string.Equals(p.State, "Accepted", StringComparison.Ordinal)))
+        {
+            Add(diffs, DiffAcceptanceUnknown, part.BillCode, new
+            {
+                source = "upload_part", level = "part", partId = part.PartId, taskId = part.TaskId,
+                billCode = part.BillCode, state = part.State,
+            });
+        }
+        foreach (var task in tasks.Where(t => string.Equals(t.State, "ManualAction", StringComparison.Ordinal)))
+        {
+            Add(diffs, DiffResultUnresolved, task.EventKey, new
+            {
+                source = "upload_task", level = "task", taskId = task.TaskId, taskType = task.TaskType,
+                state = task.State, eventKey = task.EventKey,
+            });
+        }
+        foreach (var part in parts.Where(p => string.Equals(p.State, "ManualAction", StringComparison.Ordinal)))
         {
             Add(diffs, DiffResultUnresolved, part.BillCode, new
             {

@@ -185,8 +185,9 @@ WHERE action=N'job.lease.recovered' AND env=@env AND occurred_at>=@since",
             var total = await conn.ExecuteScalarAsync<int>(new CommandDefinition(
                 $"SELECT COUNT(*) FROM dbo.outbox_job {where}", args, cancellationToken: ct));
 
-            args.Add("lo", (p - 1) * size + 1);
-            args.Add("hi", p * size);
+            // 64 位算区间：page 极大时 int 乘法会溢出为负、区间错位。
+            args.Add("lo", ((long)p - 1) * size + 1);
+            args.Add("hi", (long)p * size);
             // 2008 R2：ROW_NUMBER 区间取行（排序 created_at DESC, id DESC）。
             var rows = (await conn.QueryAsync<JobListRow>(new CommandDefinition($@"
 SELECT x.id AS JobId, x.job_kind AS JobKind, x.job_state AS JobState, x.attempt_count AS AttemptCount,
@@ -282,7 +283,7 @@ WHERE env=@env AND next_allowed_at IS NOT NULL AND next_allowed_at>@now",
         if (leaseRecoveries >= LeaseRecoveryWarn)
             alerts.Add(new AlertItem("LEASE_RECOVERED_24H", "HIGH", "作业租约被回收（24 小时）",
                 $"过去 24 小时回收 {leaseRecoveries} 个过期租约，作业已重回待处理；请检查 Worker 存活与单次作业时长。",
-                leaseRecoveries, "/audit"));
+                leaseRecoveries, "/ops"));
         if (backlog > BacklogThreshold)
             alerts.Add(new AlertItem("JOB_BACKLOG_HIGH", "HIGH", "作业积压超阈值",
                 $"待处理作业 {backlog} 个，超过阈值 {BacklogThreshold}；队列可能停滞。", backlog, "/ops"));

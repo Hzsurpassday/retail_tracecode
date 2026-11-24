@@ -142,7 +142,8 @@ export default function CodesPage() {
       document.body.appendChild(link);
       link.click();
       link.remove();
-      URL.revokeObjectURL(url);
+      // 让浏览器先接管下载再回收：慢环境下同步回收可能使下载 URL 失效（"点了没反应"）。
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
       setError('');
     } catch (e) {
       setError(errMsg(e));

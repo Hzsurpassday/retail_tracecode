@@ -310,7 +310,7 @@ public class OpsStatusTests : IAsyncLifetime
         var lease = alerts[1];
         Assert.Equal("HIGH", lease.GetProperty("severity").GetString());
         Assert.Equal(1, lease.GetProperty("count").GetInt32());
-        Assert.Equal("/audit", lease.GetProperty("deepLink").GetString());
+        Assert.Equal("/ops", lease.GetProperty("deepLink").GetString());
 
         // 指标口径与告警同源：24h 租约恢复 = 1（跨 env/过期不计）。
         var metrics = (await GetJsonAsync(client, "/api/v1/ops/metrics")).GetProperty("data");

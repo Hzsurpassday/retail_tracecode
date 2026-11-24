@@ -10,10 +10,12 @@ info:
     /jobs/{id}、/audit-logs、/settings*）、M2 端点（/upstream-bills*、/inbounds*）与
     M3 端点（/pos-sales*、/returns*、/upload-tasks*）与 M4 端点
     （/reconciliation-runs*、POST /reconciliation-differences/{id}/resolve、GET /codes*、
-    GET /exceptions*、GET /ops/metrics、GET /ops/jobs、GET /ops/alerts）均按真实代码形状描述
+    GET /exceptions*、POST /exceptions/{category}/{id}/resolve、GET /ops/metrics、GET /ops/jobs、
+    GET /ops/alerts、GET /exports/codes.csv、GET /exports/reconciliation-runs/{id}/differences.csv、
+    GET /exports/audit-logs.csv）均按真实代码形状描述
     （traceflow/src/TraceFlow.Host/Endpoints/*.cs，以代码为准）。
     x-phase 标注契约归属阶段：M0/M1/M2/M3 与上述 M4 端点为已实现；
-    其余 x-phase: M4 条目仍为计划契约（未实现，不提供端点）。
+    其余 x-phase: M4 条目为未实现（本阶段不交付，不提供端点）。
     已认证请求的所有 /api 变更方法（POST/PUT/DELETE/PATCH）必须携带 X-CSRF-TOKEN 头
     （全局 antiforgery 中间件，AUTH-02）；/auth/login 与 /auth/logout 匿名可达但自行校验 CSRF。
     失败统一 code/message/fieldErrors/retryable/requestId；401 未登录、403 无权、
@@ -1879,7 +1881,7 @@ paths:
   /verifications/{id}/recheck:
     post:
       x-phase: M4
-      description: '（M3 未实现，计划契约）重新核验（权限 upload:query，SALE-02）。M3 的核验由 sale-verify 作业（COMPLETE 快照入队）与 SyncScheduler 兜底自动触发；人工重核入口留待 M4。'
+      description: '（M3 未实现，计划契约）重新核验（权限 upload:query，SALE-02）。核验由 sale-verify 作业（COMPLETE 快照入队）与 SyncScheduler 兜底自动触发；未实现：本阶段不交付（回查/核验由作业自动完成）。'
       parameters:
         - { $ref: '#/components/parameters/ResourceId' }
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -1993,7 +1995,7 @@ paths:
   /upload-tasks/{id}/query:
     post:
       x-phase: M4
-      description: '（M3 未实现，计划契约）手动状态回查（权限 upload:query，IDEM-04/05）。M3 的回查由 bill-query 作业（发送/核对后入队 + query:scan 兜底）自动执行，无手动入口；端点留待 M4。'
+      description: '（M3 未实现，计划契约）手动状态回查（权限 upload:query，IDEM-04/05）。回查由 bill-query 作业（发送/核对后入队 + query:scan 兜底）自动执行，无手动入口；未实现：本阶段不交付（回查/核验由作业自动完成）。'
       parameters:
         - { $ref: '#/components/parameters/ResourceId' }
         - { $ref: '#/components/parameters/IdempotencyKey' }

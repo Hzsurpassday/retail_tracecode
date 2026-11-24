@@ -239,6 +239,64 @@ public class ReconciliationTests : IAsyncLifetime
             "SELECT status FROM dbo.reconciliation_run WHERE id=@id", new { id = result.RunId }));
     }
 
+    // ---------------------------------------------------------------- 4b. Accepted 分片 → INCOMPLETE
+
+    [Fact]
+    public async Task Recon_accepted_part_makes_run_incomplete()
+    {
+        await using var c = await _fx.OpenAsync();
+        var doc = await SeedDocumentAsync(c, "REC-ACCEPTED");
+        await SeedLineAsync(c, doc, "L1", "SALE", "690000000000000402");
+        // 平台已受理（ACCEPTED）但逐码结果未回：状态可达且非终态（PRD §9.2、UploadStateMachine）。
+        var task = await SeedTaskAsync(c, "KSOA:REC-ACCEPTED:RETAIL_321", doc, state: "Accepted");
+        await SeedVerificationAsync(c, "REC-ACCEPTED", doc, "PASSED", task);
+        await SeedPartAsync(c, task, 0, "Accepted");
+
+        var result = await NewService().RunAsync("MOCK", DayStart, DayEnd, "SALE", CancellationToken.None);
+
+        // 旧实现只把 Blocked/Ready/Dispatching/AcceptanceUnknown/Processing/RetryWait 当非终态：
+        // Accepted 分片 → run=COMPLETE 且零差异，把"平台受理结论未知"报成"当日无差异"。
+        Assert.Equal("INCOMPLETE", result.Status);
+        var platformSummary = await c.ExecuteScalarAsync<string>(
+            "SELECT platform_summary FROM dbo.reconciliation_run WHERE id=@id", new { id = result.RunId });
+        Assert.NotNull(platformSummary);
+        Assert.Contains("\"unavailable\":true", platformSummary, StringComparison.Ordinal);
+        Assert.Contains("\"unavailableReason\":\"NON_TERMINAL_PARTS\"", platformSummary, StringComparison.Ordinal);
+        var diffs = (await c.QueryAsync<(string DiffType, string Evidence)>(
+            "SELECT diff_type, evidence_json FROM dbo.reconciliation_difference WHERE run_id=@id",
+            new { id = result.RunId })).ToList();
+        Assert.Contains(diffs, d => d.DiffType == "ACCEPTANCE_UNKNOWN"
+            && d.Evidence.Contains("\"state\":\"Accepted\"", StringComparison.Ordinal));
+    }
+
+    // ---------------------------------------------------------------- 4c. ManualAction 分片 → INCOMPLETE
+
+    [Fact]
+    public async Task Recon_manual_action_part_makes_run_incomplete()
+    {
+        await using var c = await _fx.OpenAsync();
+        var doc = await SeedDocumentAsync(c, "REC-MANUAL");
+        await SeedLineAsync(c, doc, "L1", "SALE", "690000000000000403");
+        // 已升级人工处置（MANUAL_ACTION）：仍在回查/受控修复中，平台结论未定。
+        var task = await SeedTaskAsync(c, "KSOA:REC-MANUAL:RETAIL_321", doc, state: "ManualAction");
+        await SeedVerificationAsync(c, "REC-MANUAL", doc, "PASSED", task);
+        await SeedPartAsync(c, task, 0, "ManualAction");
+
+        var result = await NewService().RunAsync("MOCK", DayStart, DayEnd, "SALE", CancellationToken.None);
+
+        Assert.Equal("INCOMPLETE", result.Status);
+        var platformSummary = await c.ExecuteScalarAsync<string>(
+            "SELECT platform_summary FROM dbo.reconciliation_run WHERE id=@id", new { id = result.RunId });
+        Assert.NotNull(platformSummary);
+        Assert.Contains("\"unavailable\":true", platformSummary, StringComparison.Ordinal);
+        Assert.Contains("\"unavailableReason\":\"NON_TERMINAL_PARTS\"", platformSummary, StringComparison.Ordinal);
+        var diffs = (await c.QueryAsync<(string DiffType, string Evidence)>(
+            "SELECT diff_type, evidence_json FROM dbo.reconciliation_difference WHERE run_id=@id",
+            new { id = result.RunId })).ToList();
+        Assert.Contains(diffs, d => d.DiffType == "RESULT_UNRESOLVED"
+            && d.Evidence.Contains("\"state\":\"ManualAction\"", StringComparison.Ordinal));
+    }
+
     // ---------------------------------------------------------------- 5. 部分成功 / 受理未知分型
 
     [Fact]
@@ -541,6 +599,54 @@ WHERE action=N'recon.difference.resolved' AND env='LIVE' AND actor=N'recon-admin
         var earlyScheduler = new ReconciliationScheduler(_fx.ConnectionString, queue, audit, () => early);
         Assert.Equal(0, await earlyScheduler.TryEnqueueDailyAsync("MOCK", CancellationToken.None));
         Assert.Equal(2, await c.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'reconciliation'"));
+    }
+
+    // ---------------------------------------------------------------- 10b. 漏跑日窗有界补跑
+
+    [Fact]
+    public async Task Recon_scheduler_backfills_missed_days_since_first_run()
+    {
+        await using var c = await _fx.OpenAsync();
+        var shanghai = TimeZoneInfo.FindSystemTimeZoneById("China Standard Time");
+        // 以 2026-11-19（D-3）为最早作业活动日：只种这两个意图的 DONE 作业（上海 02:05 创建，UTC 落库）。
+        var d3Local = new DateTime(2026, 11, 19, 0, 0, 0, DateTimeKind.Unspecified);
+        var d3StartUtc = TimeZoneInfo.ConvertTimeToUtc(d3Local, shanghai);
+        var d3CreatedUtc = TimeZoneInfo.ConvertTimeToUtc(new DateTime(2026, 11, 19, 2, 5, 0), shanghai);
+        foreach (var type in new[] { "SALE", "RETURN" })
+        {
+            var intent = "recon:run:" + d3StartUtc.ToString("yyyyMMddHHmm", System.Globalization.CultureInfo.InvariantCulture)
+                         + ":" + type;
+            await c.ExecuteAsync(@"
+INSERT INTO dbo.outbox_job(org_id,env,job_kind,intent_key,payload_json,job_state,created_at,finished_at)
+VALUES(@orgId,N'MOCK',N'reconciliation',@intent,N'{}',N'DONE',@createdAt,@createdAt)",
+                new { orgId = _orgId, intent, createdAt = d3CreatedUtc });
+        }
+
+        var audit = new AuditLog();
+        var queue = new JobQueue(_fx.ConnectionString, audit);
+        // 固定钟 2026-11-22 10:00 上海（= 02:00Z）：昨日 = 11-21，D-2 = 11-20，D-3 = 11-19 已有作业。
+        var clock = new DateTimeOffset(2026, 11, 22, 2, 0, 0, TimeSpan.Zero);
+        var scheduler = new ReconciliationScheduler(_fx.ConnectionString, queue, audit, () => clock);
+
+        // 12:00（上海）恢复后首轮：补齐 D-2 与 D-1 两个日窗 × 两类型 = 4；D-3 已存在不重复。
+        Assert.Equal(4, await scheduler.TryEnqueueDailyAsync("MOCK", CancellationToken.None));
+        foreach (var day in new[] { "202611181600", "202611191600", "202611201600" })
+        {
+            foreach (var type in new[] { "SALE", "RETURN" })
+                Assert.Equal(1, await c.ExecuteScalarAsync<int>(
+                    "SELECT COUNT(*) FROM dbo.outbox_job WHERE intent_key=@k",
+                    new { k = $"recon:run:{day}:{type}" }));
+        }
+        Assert.Equal(6, await c.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.outbox_job WHERE job_kind=N'reconciliation'"));
+        // 补跑与常规入队都写自动审计（env 用作业 env），补跑文案可区分。
+        Assert.Equal(4, await c.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'recon.auto_triggered' AND env=N'MOCK'"));
+        Assert.Equal(1, await c.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM dbo.audit_log WHERE action=N'recon.auto_triggered' AND reason=N'日对账补跑入队 类型 SALE 窗口 2026-11-20（Asia/Shanghai）'"));
+
+        // 第二轮：全部意图已存在 → 0（幂等）。
+        Assert.Equal(0, await scheduler.TryEnqueueDailyAsync("MOCK", CancellationToken.None));
     }
 
     // ---------------------------------------------------------------- 11. 触发 API

@@ -235,6 +235,10 @@ Invoke-WebRequest -Uri http://localhost:5000/api/v1/auth/session -UseBasicParsin
 | 作业分页 | `GET /api/v1/ops/jobs?state=&kind=&page=`（只读，`lastError` ≤200 字符） |
 | 审计 | `GET /api/v1/audit-logs`（`audit:read`）；导出 `GET /api/v1/exports/audit-logs.csv`（`audit:export`） |
 
+**运维注意（日对账补跑）**：漏跑的日对账窗口由 Worker 调度自动补跑——自最早作业活动日起、最多 7 天
+（上海时区日窗，逐日 SALE/RETURN 各一次，幂等）；超过 7 天的更早缺口需人工 `POST /api/v1/reconciliation-runs`
+（`system:manage`，无前端入口）。
+
 **日志中不得出现凭据**：连接串/密码不在日志、错误响应、审计摘要中（`SettingsService` 只写不回显；
 `TopClientService` 脱敏留证）。若需归档 stdout，请用服务包装器把控制台重定向到受限目录，不要写入 Web 可访问目录。
 系统**未内置**滚动文件日志（如实说明）。
