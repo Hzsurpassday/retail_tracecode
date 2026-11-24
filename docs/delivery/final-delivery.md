@@ -1,6 +1,6 @@
 # TraceFlow 交付说明（M4 收尾）
 
-日期：2026-11-24　分支：`m4-closure`　代码基线：`d0cac84`　PR：由交付人创建后填写
+日期：2026-11-24　分支：`m4-closure`　PR：https://github.com/Hzsurpassday/retail_tracecode/pull/5
 
 ## 一、交付了什么
 

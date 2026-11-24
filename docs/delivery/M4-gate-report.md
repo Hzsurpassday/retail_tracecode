@@ -1,6 +1,6 @@
 # M4 门禁报告（TraceFlow 收尾与交付）
 
-日期：2026-11-24。分支：`m4-closure`，代码基线 `d0cac84`（fix pass 后）+ 本任务（Task 12）文档与演练脚本。
+日期：2026-11-24。分支：`m4-closure`，代码基线 `d0cac84`（fix pass 后）+ 本任务（Task 12）文档与演练脚本；整分支终审修复见 PR #5。
 配套：`docs/delivery/deployment.md`（G-DEPLOY）、`docs/delivery/backup-restore.md`（NFR-07/08）、
 `docs/delivery/backup-restore-drill.json`（演练实测）、`docs/delivery/trial-run-report.md`、`docs/delivery/perf-baseline.md`、
 `docs/delivery/final-delivery.md`、`docs/traceability/matrix.md`、`.superpowers/sdd/2026-11-23-m4-closure/progress.md`（裁决账本）。
