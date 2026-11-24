@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { api, ApiError } from '../api';
 import EnvBadge from '../components/EnvBadge';
 
@@ -112,6 +112,11 @@ function titleZh(item: QueueItem): string {
   return item.title;
 }
 function statusZh(status: string): string { return status === 'RESOLVED' ? '已解决' : '待处理'; }
+// 深链 ?category=RECON 等：工作台待办与站内告警可直接落到对应页签；非法值回落"全部"。
+function normalizeCategory(raw: string | null): '' | Category {
+  const value = (raw ?? '').trim().toUpperCase();
+  return value === 'INGEST' || value === 'RECON' || value === 'TASK' || value === 'MAPPING' ? value : '';
+}
 function evidenceText(json: unknown, text: string | null): string {
   if (text !== null && text !== '') return text;
   if (json === null || json === undefined) return '（无证据内容）';
@@ -123,7 +128,9 @@ function openCount(counts: Counts): number {
 
 export default function ExceptionsPage() {
   const [env, setEnv] = useState('');
-  const [tab, setTab] = useState<'' | Category>('');
+  const [searchParams, setSearchParams] = useSearchParams();
+  const urlCategory = normalizeCategory(searchParams.get('category'));
+  const [tab, setTab] = useState<'' | Category>(urlCategory);
   const [status, setStatus] = useState<'OPEN' | 'RESOLVED'>('OPEN');
   const [page, setPage] = useState(1);
   const [data, setData] = useState<QueueData | null>(null);
@@ -131,6 +138,24 @@ export default function ExceptionsPage() {
   const [selected, setSelected] = useState<QueueItem | null>(null);
   const seqRef = useRef(0);
   const [reloadKey, setReloadKey] = useState(0);
+
+  // 已挂载时的深链/浏览器前进后退：URL 页签变化 → 同步视图页签（并回到第 1 页）。
+  useEffect(() => {
+    if (urlCategory !== tab) {
+      setTab(urlCategory);
+      setPage(1);
+    }
+    // 仅跟随 URL 变化；tab 自身变更由 selectTab 同步写回 URL。
+  }, [urlCategory]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  function selectTab(next: '' | Category) {
+    setTab(next);
+    setPage(1);
+    const params = new URLSearchParams(searchParams);
+    if (next) params.set('category', next);
+    else params.delete('category');
+    setSearchParams(params, { replace: true });
+  }
 
   useEffect(() => {
     let active = true;
@@ -187,7 +212,7 @@ export default function ExceptionsPage() {
           return (
             <button key={t.key} aria-pressed={tab === t.key}
               style={tab === t.key ? activeTab : undefined}
-              onClick={() => { setTab(t.key); setPage(1); }}>
+              onClick={() => { selectTab(t.key); }}>
               {t.label}{n !== null ? ` (${n})` : ''}
             </button>
           );

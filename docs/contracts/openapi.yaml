@@ -9,7 +9,8 @@ info:
     /product-mappings/*、/supplier-mappings/*、/products/{id}/trace-policy、/sync-jobs、
     /jobs/{id}、/audit-logs、/settings*）、M2 端点（/upstream-bills*、/inbounds*）与
     M3 端点（/pos-sales*、/returns*、/upload-tasks*）与 M4 端点
-    （/reconciliation-runs*、POST /reconciliation-differences/{id}/resolve、GET /codes*）均按真实代码形状描述
+    （/reconciliation-runs*、POST /reconciliation-differences/{id}/resolve、GET /codes*、
+    GET /exceptions*、GET /ops/metrics、GET /ops/jobs、GET /ops/alerts）均按真实代码形状描述
     （traceflow/src/TraceFlow.Host/Endpoints/*.cs，以代码为准）。
     x-phase 标注契约归属阶段：M0/M1/M2/M3 与上述 M4 端点为已实现；
     其余 x-phase: M4 条目仍为计划契约（未实现，不提供端点）。
@@ -170,6 +171,25 @@ components:
             pendingJobs: { type: integer, description: 当前 env 下 outbox_job PENDING 计数 }
             uploadTasksByState: { type: object, additionalProperties: { type: integer }, description: 当前 env 下 upload_task 按 state 分组计数 }
             lastActivityUtc: { type: string, format: date-time, nullable: true, description: audit_log 最近 occurred_at（UTC） }
+            queue:
+              type: object
+              description: M4 Task 5 增量：待办队列计数，与 /exceptions counts 同谓词（INGEST 按 org；RECON/TASK 按宿主 env；MAPPING 两表 CONFLICT）
+              properties:
+                ingestOpen: { type: integer }
+                reconOpen: { type: integer }
+                taskOpen: { type: integer }
+                mappingOpen: { type: integer }
+            openDifferences: { type: integer, description: 同 queue.reconOpen（宿主 env 的 OPEN 对账差异全量计数） }
+            failedJobs24h: { type: integer, description: 当前 env 下 finished_at>=now-24h 的 FAILED 作业数 }
+            activePauses: { type: integer, description: 当前 env 下 top_channel_pause is_active=1 行数 }
+            alertsCount: { type: integer, description: 与 GET /ops/alerts 的 alerts 条数同源（同一派生加载器） }
+            todayUploads:
+              type: object
+              description: 今日（Asia/Shanghai 00:00 起，换算为 UTC 参数）新建 upload_task 口径
+              properties:
+                total: { type: integer, description: 今日新建任务数（全部状态） }
+                succeeded: { type: integer, description: 今日新建且 state=Succeeded 的任务数 }
+                successRate: { type: number, nullable: true, description: 'succeeded/(succeeded+failed)，保留 4 位小数；分母 0 → null（前端显示"—"）' }
         requestId: { type: string }
     HealthResponse:
       type: object
@@ -591,10 +611,14 @@ components:
             intentKey: { type: string }
             jobState: { type: string, enum: [PENDING, RUNNING, DONE, FAILED, CANCELLED] }
             attemptCount: { type: integer }
+            maxAttempts: { type: integer, description: 'M4 Task 5 增量：outbox_job.max_attempts' }
             nextRunAtUtc: { type: string, format: date-time }
             lastError: { type: string, nullable: true }
             leaseOwner: { type: string, nullable: true }
             fencingToken: { type: integer, format: int64, description: 'JSON number（int64 内部代理；API-01 字符串约定仅适用外部平台 ID/rowversion，裁决 #9）' }
+            env: { type: string, enum: [LIVE, MOCK], description: 'M4 Task 5 增量：作业所属环境' }
+            createdAtUtc: { type: string, format: date-time, description: 'M4 Task 5 增量：outbox_job.created_at' }
+            finishedAtUtc: { type: string, format: date-time, nullable: true, description: 'M4 Task 5 增量：outbox_job.finished_at（未结束为 null）' }
         requestId: { type: string }
     # ---- M3 已实现端点真实响应形状（T10 回写；以 SalesEndpoints.cs / UploadEndpoints.cs 为准） ----
     PosSalesRow:
@@ -1189,6 +1213,130 @@ components:
             id: { type: string }
             status: { type: string, enum: [RESOLVED] }
             resolvedAt: { type: string, format: date-time }
+        requestId: { type: string }
+    # ---- M4 Task 5 可观测性只读面（以 OpsStatusEndpoints.cs 为准） ----
+    OpsMetricsResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [env, jobs, attempts24h, uploadsToday, perJobKind, rateBudget, pauses, leaseRecoveries24h, recon]
+          properties:
+            env: { type: string, enum: [LIVE, MOCK] }
+            jobs:
+              type: object
+              properties:
+                pending: { type: integer }
+                running: { type: integer }
+                done: { type: integer }
+                failed: { type: integer }
+                cancelled: { type: integer }
+                backlog: { type: integer, description: 等于 pending }
+                oldestPendingAgeSeconds: { type: integer, description: 'PENDING 最小 next_run_at 距 now 的秒数；未来时间或空闲 → 0' }
+                failureRate24h: { type: number, nullable: true, description: 'finished_at>=now-24h 的 FAILED/(DONE+FAILED)，保留 4 位小数；分母 0 → null' }
+            attempts24h:
+              type: object
+              properties:
+                upload: { type: integer, description: 'upload_attempt.attempt_kind=UPLOAD 且 started_at>=now-24h' }
+                query: { type: integer, description: 'upload_attempt.attempt_kind=QUERY 且 started_at>=now-24h' }
+            uploadsToday:
+              type: object
+              properties:
+                total: { type: integer }
+                succeeded: { type: integer }
+                failed: { type: integer }
+                successRate: { type: number, nullable: true, description: 'succeeded/(succeeded+failed)；分母 0 → null' }
+            perJobKind:
+              type: array
+              items:
+                type: object
+                properties:
+                  jobKind: { type: string }
+                  backlog: { type: integer, description: 该类型 PENDING 数 }
+                  lastDoneAtUtc: { type: string, format: date-time, nullable: true, description: 该类型最近 DONE 的 finished_at }
+            rateBudget:
+              type: array
+              description: 本 env 全部行原样回显；limit 为 null 表示本地未设帽（前端显示"未取证"），不计算/不虚构限值
+              items:
+                type: object
+                properties:
+                  budgetKey: { type: string }
+                  dayCount: { type: integer }
+                  dayLimit: { type: integer, nullable: true }
+                  minuteCount: { type: integer }
+                  minuteLimit: { type: integer, nullable: true }
+                  secondCount: { type: integer }
+                  secondLimit: { type: integer, nullable: true }
+                  nextAllowedAtUtc: { type: string, format: date-time, nullable: true }
+            pauses:
+              type: array
+              description: top_channel_pause is_active=1（本 env），按 scope_key 升序
+              items:
+                type: object
+                properties:
+                  scopeKey: { type: string }
+                  reason: { type: string }
+                  pausedAtUtc: { type: string, format: date-time }
+                  pausedBy: { type: string }
+            leaseRecoveries24h: { type: integer, description: 'audit_log action=job.lease.recovered 且 env=宿主 env、occurred_at>=now-24h（回收审计按作业 env 落库）' }
+            recon:
+              type: object
+              properties:
+                incomplete24h: { type: integer, description: 本 env 且 started_at>=now-24h 的 INCOMPLETE 运行数 }
+                openDifferences: { type: integer, description: 本 env 的 OPEN 差异全量计数（不限时间） }
+        requestId: { type: string }
+    OpsJobsResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [items, page, pageSize, total, env]
+          properties:
+            items:
+              type: array
+              items:
+                type: object
+                required: [jobId, jobKind, jobState, attemptCount, maxAttempts, createdAtUtc]
+                properties:
+                  jobId: { type: string, description: outbox_job.id（本地 int64 以字符串返回） }
+                  jobKind: { type: string }
+                  jobState: { type: string, enum: [PENDING, RUNNING, DONE, FAILED, CANCELLED] }
+                  attemptCount: { type: integer }
+                  maxAttempts: { type: integer }
+                  nextRunAtUtc: { type: string, format: date-time }
+                  lastError: { type: string, nullable: true, description: 'LEFT(last_error,200)' }
+                  createdAtUtc: { type: string, format: date-time }
+                  finishedAtUtc: { type: string, format: date-time, nullable: true }
+            page: { type: integer }
+            pageSize: { type: integer }
+            total: { type: integer }
+            env: { type: string, enum: [LIVE, MOCK] }
+        requestId: { type: string }
+    OpsAlert:
+      type: object
+      required: [code, severity, title, detail, count, deepLink]
+      properties:
+        code: { type: string, enum: [CHANNEL_PAUSED, LEASE_RECOVERED_24H, JOB_BACKLOG_HIGH, JOBS_FAILED_24H, RECON_INCOMPLETE_24H, RECON_DIFFERENCES_OPEN, RATE_BUDGET_WAITING] }
+        severity: { type: string, enum: [HIGH, MEDIUM] }
+        title: { type: string }
+        detail: { type: string, description: 站内可读说明（时间按 Asia/Shanghai 标注），不含密钥/原始平台响应 }
+        count: { type: integer }
+        deepLink: { type: string, description: '站内可达面（如 /ops、/ops?state=FAILED、/audit、/exceptions?category=RECON）' }
+    OpsAlertsResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [env, alerts]
+          properties:
+            env: { type: string, enum: [LIVE, MOCK] }
+            alerts:
+              type: array
+              description: 无告警 → 空数组（不返回"一切正常"伪告警）
+              items: { $ref: '#/components/schemas/OpsAlert' }
         requestId: { type: string }
   responses:
     Unauthorized: { description: 未登录, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
@@ -2124,3 +2272,52 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { description: 'ALREADY_RESOLVED / DIFFERENCE_ALREADY_RESOLVED', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '422': { description: 'VALIDATION（证据为空/超长）或 NOT_RESOLVABLE_VIA_QUEUE（TASK/MAPPING，fieldErrors 附 deepLink）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  # ================= M4 Task 5 可观测性（NFR-06 / UI-01 闭环） =================
+  /ops/metrics:
+    get:
+      x-phase: M4
+      description: >
+        管道健康指标（权限 trace:read；匿名 401）。env 恒为宿主 env（不接受跨 env 查询）。
+        只读：不写库、不发平台外呼。口径：jobs 按 outbox_job 状态分组；oldestPendingAgeSeconds=PENDING 最小
+        next_run_at 距 now 秒数（未来/空闲→0）；failureRate24h=finished_at>=now-24h 的 FAILED/(DONE+FAILED)，
+        分母 0→null；attempts24h 按 upload_attempt.started_at 与 attempt_kind；uploadsToday 按
+        upload_task.created_at>=上海今日 00:00（TimeZoneInfo "China Standard Time" 换算为 UTC 参数），
+        successRate=succeeded/(succeeded+failed)，分母 0→null；rateBudget 原样回显（limit null=未取证）；
+        pauses=is_active=1；leaseRecoveries24h=audit_log action='job.lease.recovered' 且 env 匹配、
+        occurred_at>=now-24h（回收审计按作业 env 落库）；recon.incomplete24h=本 env INCOMPLETE 且
+        started_at>=now-24h，recon.openDifferences=本 env OPEN 差异全量计数。2008 R2 语法。
+      responses:
+        '200': { description: 指标快照, content: { application/json: { schema: { $ref: '#/components/schemas/OpsMetricsResponse' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /ops/jobs:
+    get:
+      x-phase: M4
+      description: >
+        作业状态列表（权限 trace:read；匿名 401）。宿主 env 定界；state 可选（枚举校验，非法 400 VALIDATION）、
+        kind 可选（等值）；ROW_NUMBER 区间分页（2008 R2），排序 created_at DESC, id DESC；pageSize 默认 50、上限 100；
+        lastError 截断到 200 字符。只读。
+      parameters:
+        - { name: state, in: query, schema: { type: string, enum: [PENDING, RUNNING, DONE, FAILED, CANCELLED] }, description: '非法值 400' }
+        - { name: kind, in: query, schema: { type: string }, description: 'job_kind 精确等值' }
+        - { $ref: '#/components/parameters/Page' }
+        - { name: pageSize, in: query, schema: { type: integer, minimum: 1, default: 50 }, description: '1..100；>100 收敛为 100' }
+      responses:
+        '200': { description: 作业分页, content: { application/json: { schema: { $ref: '#/components/schemas/OpsJobsResponse' } } } }
+        '400': { description: 'VALIDATION（state/page/pageSize 非法）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /ops/alerts:
+    get:
+      x-phase: M4
+      description: >
+        派生站内告警（权限 trace:read；匿名 401；只读不写库、不发外呼）。宿主 env 定界。常量阈值：
+        BacklogThreshold=100（PENDING>100 → HIGH，>0 且 ≤100 不报）、FailedJobs24hWarn=1 / FailedJobs24hHigh=10
+        （JOBS_FAILED_24H：≥1 MEDIUM，≥10 HIGH）、LeaseRecoveryWarn=1（LEASE_RECOVERED_24H → HIGH）、
+        IncompleteReconWarn=1（RECON_INCOMPLETE_24H → MEDIUM）。另有 CHANNEL_PAUSED（HIGH，每 scope 一条）、
+        RECON_DIFFERENCES_OPEN（MEDIUM，count>0）、RATE_BUDGET_WAITING（MEDIUM，next_allowed_at>now 的预算行数）。
+        无告警 → alerts: []。deepLink 指向站内可达面（/ops、/ops?state=FAILED、/audit、/exceptions?category=RECON）。
+      responses:
+        '200': { description: 告警列表, content: { application/json: { schema: { $ref: '#/components/schemas/OpsAlertsResponse' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }

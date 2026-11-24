@@ -54,13 +54,16 @@ public static class OpsEndpoints
         {
             await using var conn = new SqlConnection(connectionString);
             var row = await conn.QuerySingleOrDefaultAsync<JobRow>(
-                "SELECT id,job_kind,intent_key,job_state,attempt_count,next_run_at,last_error,lease_owner,fencing_token FROM dbo.outbox_job WHERE id=@id",
+                "SELECT id,job_kind,intent_key,job_state,attempt_count,max_attempts,next_run_at,last_error,lease_owner,fencing_token,env,created_at,finished_at FROM dbo.outbox_job WHERE id=@id",
                 new { id });
             if (row is null)
                 return Results.Json(new { code = "NOT_FOUND", message = "作业不存在", retryable = false, requestId = ctx.TraceIdentifier }, statusCode: 404);
+            // M4 Task 5 增量字段：env/createdAtUtc/finishedAtUtc/maxAttempts（其余字段与 M2 携带项不变）。
             return Results.Ok(new { data = new { jobId = row.id.ToString(), jobKind = row.job_kind, intentKey = row.intent_key,
-                jobState = row.job_state, attemptCount = row.attempt_count, nextRunAtUtc = row.next_run_at,
-                lastError = row.last_error, leaseOwner = row.lease_owner, fencingToken = row.fencing_token }, requestId = ctx.TraceIdentifier });
+                jobState = row.job_state, attemptCount = row.attempt_count, maxAttempts = row.max_attempts,
+                nextRunAtUtc = row.next_run_at, lastError = row.last_error, leaseOwner = row.lease_owner,
+                fencingToken = row.fencing_token, env = row.env, createdAtUtc = row.created_at,
+                finishedAtUtc = row.finished_at }, requestId = ctx.TraceIdentifier });
         }).WithMetadata(new RequirePermissionAttribute(PermissionCatalog.TraceRead));
 
         app.MapGet("/api/v1/audit-logs", async (HttpContext ctx, int? page, int? pageSize,
@@ -109,10 +112,14 @@ SELECT id,occurred_at,actor,actor_kind,action,object_type,object_id,reason,befor
         public string intent_key { get; set; } = "";
         public string job_state { get; set; } = "";
         public int attempt_count { get; set; }
+        public int max_attempts { get; set; }
         public DateTime next_run_at { get; set; }
         public string? last_error { get; set; }
         public string? lease_owner { get; set; }
         public long fencing_token { get; set; }
+        public string env { get; set; } = "";
+        public DateTime created_at { get; set; }
+        public DateTime? finished_at { get; set; }
     }
 
     private sealed class AuditRow

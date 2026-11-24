@@ -12,6 +12,7 @@ import InboundsPage from './pages/InboundsPage';
 import SalesPage from './pages/SalesPage';
 import ReturnsPage from './pages/ReturnsPage';
 import UploadCenterPage from './pages/UploadCenterPage';
+import OpsPage from './pages/OpsPage';
 import CodesPage from './pages/CodesPage';
 import ExceptionsPage from './pages/ExceptionsPage';
 import SettingsPage from './pages/SettingsPage';
@@ -38,6 +39,7 @@ export default function App() {
         <Route path="/sales" element={<SalesPage />} />
         <Route path="/returns" element={<ReturnsPage />} />
         <Route path="/uploads" element={<UploadCenterPage />} />
+        <Route path="/ops" element={<OpsPage />} />
         <Route path="/codes" element={<CodesPage />} />
         <Route path="/exceptions" element={<ExceptionsPage />} />
         <Route path="/settings" element={<SettingsPage />} />

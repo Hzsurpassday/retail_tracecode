@@ -173,6 +173,7 @@ if (!workerOnly)
     app.MapImportEndpoints(connectionString, env);
     app.MapMasterEndpoints(connectionString);
     app.MapOpsEndpoints(connectionString, env);
+    app.MapOpsStatusEndpoints(connectionString, env);
     app.MapInboundEndpoints(connectionString, env);
     app.MapSalesEndpoints(connectionString, env);
     app.MapCodesEndpoints(connectionString, env);
