@@ -55,6 +55,10 @@ function isPending(r: ReturnItem): boolean {
 function candidateErrorZh(error: string | null): string {
   return reasonZh(error, '唯一前序（可确认）');
 }
+// 任务状态原因：RETURN_CONFIRMED 在调用点恢复信息量（确认后符合资格会自动上传），其余沿用共享映射表。
+function stateReasonZh(reason: string | null): string {
+  return reason === 'RETURN_CONFIRMED' ? `${reasonZh(reason)}（符合资格自动上传）` : reasonZh(reason);
+}
 
 export default function ReturnsPage() {
   const [env, setEnv] = useState('');
@@ -138,7 +142,7 @@ export default function ReturnsPage() {
                     {r.taskType === 'PURCHASE_RETURN_202' && <div style={{ color: '#8a6d3b', fontSize: 12 }}>采购退货采集未接入（G-ERP）</div>}
                   </td>
                   <td>{STATE_ZH[r.state] ?? r.state}</td>
-                  <td>{reasonZh(r.stateReason)}</td>
+                  <td>{stateReasonZh(r.stateReason)}</td>
                   <td>
                     {r.predecessorCandidates.length === 0 ? '—' : (
                       <span title={r.predecessorCandidates.map((c) =>
@@ -270,7 +274,7 @@ function ReturnConfirmDialog({ item, onClose, onDone }: {
         <h3>退货首次人工确认 · 任务 #{item.id}</h3>
         <p>
           {TASK_TYPE_ZH[item.taskType] ?? item.taskType} · 当前版本 {item.version} · 状态 {STATE_ZH[item.state] ?? item.state}
-          （{reasonZh(item.stateReason)}）
+          （{stateReasonZh(item.stateReason)}）
         </p>
         {is202 && <p role="alert" style={{ background: '#fff3cd', padding: 8 }}>采购退货采集未接入（G-ERP）：仅支持服务/测试数据的确认，无真实采集入口。</p>}
         <div style={{ display: 'flex', gap: 16, marginBottom: 8 }}>

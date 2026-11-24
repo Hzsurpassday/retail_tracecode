@@ -141,15 +141,18 @@ if (-not $stopped) { Write-Host '宿主进程已不在运行。' }
 
 # ---------------------------------------------------------------- 3. 清理 PID 文件
 Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath $MetaFile -Force -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------- 4. 可选删库
 if ($DropDb) {
     Write-Host ("删除库 " + $DbName + " ...")
     $env:TRACEFLOW_TRIAL_CONN = $BaseConn
     & dotnet run --project $OpsToolProject -c Release -- drop-db $DbName --yes
-    if ($LASTEXITCODE -ne 0) { Fail ("drop-db 失败（退出码 " + $LASTEXITCODE + "）。") $LASTEXITCODE }
+    if ($LASTEXITCODE -ne 0) { Fail ("drop-db 失败（退出码 " + $LASTEXITCODE + "）。host.json 已保留，可修正后重试。") $LASTEXITCODE }
     Write-Host ("库 " + $DbName + " 处理完成。")
 }
+
+# ---------------------------------------------------------------- 5. 清理元数据（放在删库之后）
+# host.json 记录库名：删库失败时保留它，重跑 -DropDb 才能自动定位目标库。
+Remove-Item -LiteralPath $MetaFile -Force -ErrorAction SilentlyContinue
 
 exit 0

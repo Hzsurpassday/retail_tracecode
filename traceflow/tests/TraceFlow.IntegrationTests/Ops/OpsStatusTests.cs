@@ -1,3 +1,4 @@
+﻿using System.Globalization;
 using System.Net;
 using System.Net.Http.Json;
 using System.Runtime.Versioning;
@@ -463,6 +464,63 @@ VALUES(@runId,N'SOURCE_MISSING',N'HIGH',N'DOC-L',N'OPEN',@now)",
         Assert.Equal(1, metrics.GetProperty("incomplete24h").GetInt32());
         Assert.Equal(3, metrics.GetProperty("openDifferences").GetInt32());
     }
+
+    // ---------------------------------------------------------------- 11. UTC 时间带 Z
+
+    /// <summary>
+    /// `datetime2` 读出为 Unspecified，投影必须显式标 UTC，否则 JSON 不带 `Z`（契约含糊）。
+    /// 覆盖：/ops/jobs 列表项、/jobs/{id} 详情、/ops/metrics 的 budgets/pauses/按类型时间字段。
+    /// </summary>
+    [Fact]
+    public async Task Ops_timestamps_serialize_with_utc_z()
+    {
+        await using var c = await _fx.OpenAsync();
+        var createdAt = T0.AddHours(6);
+        var finishedAt = T0.AddHours(7);
+        var jobId = await SeedJobAsync(c, "MOCK", "source-sync", "DONE", createdAt, T0.AddHours(8), finishedAt);
+        await SeedPauseAsync(c, "MOCK", "scope-utc", "UTC 暂停", "tester", T0.AddHours(9));
+        await SeedRateBudgetAsync(c, "MOCK", "utc-budget", null, null, null, T0.AddHours(10));
+
+        var client = await LoginAsync(_factory);
+
+        // 列表项：一律 Z 结尾；本用例作业的具体值与种子的 UTC 时刻一致（解析不偏移）。
+        var items = (await GetJsonAsync(client, "/api/v1/ops/jobs?state=DONE&pageSize=100")).GetProperty("data")
+            .GetProperty("items").EnumerateArray().ToList();
+        Assert.All(items, i =>
+        {
+            Assert.EndsWith("Z", i.GetProperty("nextRunAtUtc").GetString()!);
+            Assert.EndsWith("Z", i.GetProperty("createdAtUtc").GetString()!);
+        });
+        var item = items.Single(i => i.GetProperty("jobId").GetString() == jobId.ToString());
+        Assert.Equal(createdAt, ParseUtc(item.GetProperty("createdAtUtc")));
+        Assert.Equal(finishedAt, ParseUtc(item.GetProperty("finishedAtUtc")));
+
+        // 详情。
+        var detail = (await GetJsonAsync(client, "/api/v1/jobs/" + jobId)).GetProperty("data");
+        Assert.EndsWith("Z", detail.GetProperty("nextRunAtUtc").GetString()!);
+        Assert.EndsWith("Z", detail.GetProperty("createdAtUtc").GetString()!);
+        Assert.EndsWith("Z", detail.GetProperty("finishedAtUtc").GetString()!);
+        Assert.Equal(createdAt, ParseUtc(detail.GetProperty("createdAtUtc")));
+        Assert.Equal(finishedAt, ParseUtc(detail.GetProperty("finishedAtUtc")));
+
+        // 指标：限流预算 nextAllowedAtUtc、暂停 pausedAtUtc、按类型 lastDoneAtUtc。
+        var metrics = (await GetJsonAsync(client, "/api/v1/ops/metrics")).GetProperty("data");
+        var budget = metrics.GetProperty("rateBudget").EnumerateArray()
+            .Single(b => b.GetProperty("budgetKey").GetString() == "utc-budget");
+        Assert.EndsWith("Z", budget.GetProperty("nextAllowedAtUtc").GetString()!);
+        Assert.Equal(T0.AddHours(10), ParseUtc(budget.GetProperty("nextAllowedAtUtc")));
+        var pause = metrics.GetProperty("pauses").EnumerateArray()
+            .Single(p => p.GetProperty("scopeKey").GetString() == "scope-utc");
+        Assert.EndsWith("Z", pause.GetProperty("pausedAtUtc").GetString()!);
+        Assert.Equal(T0.AddHours(9), ParseUtc(pause.GetProperty("pausedAtUtc")));
+        var kind = metrics.GetProperty("perJobKind").EnumerateArray()
+            .Single(k => k.GetProperty("jobKind").GetString() == "source-sync");
+        Assert.EndsWith("Z", kind.GetProperty("lastDoneAtUtc").GetString()!);
+    }
+
+    /// <summary>带 `Z` 的时间串解析回来必须是 UTC（不带偏移）。</summary>
+    private static DateTime ParseUtc(JsonElement element)
+        => DateTimeOffset.Parse(element.GetString()!, CultureInfo.InvariantCulture).UtcDateTime;
 
     // ---------------------------------------------------------------- 种子
 

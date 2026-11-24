@@ -65,7 +65,7 @@ public static class ExportEndpoints
             var args = new DynamicParameters();
             args.Add("orgId", orgId);
             args.Add("env", targetEnv);
-            if (prefix is not null) args.Add("prefix", prefix);
+            if (prefix is not null) args.Add("prefix", CodesEndpoints.EscapeLikePrefix(prefix));
             if (typeFilter is not null) args.Add("eventType", typeFilter);
             if (fromUtc is DateTime f) args.Add("from", f);
             if (toUtc is DateTime t) args.Add("to", t);
@@ -251,6 +251,15 @@ ORDER BY occurred_at DESC, id DESC", args);
         catch (OperationCanceledException) when (ctx.RequestAborted.IsCancellationRequested)
         {
             // 客户端中途断开：不写审计（导出未完成）。
+            return Results.Empty;
+        }
+        catch (Exception ex)
+        {
+            // 200/BOM 已写出后取数失败（如连接中断）：中断响应（客户端看到的是被 abort 的截断下载，
+            // 不是看似完整的 CSV），并且不写 data.exported（导出未完成）。
+            loggerFactory.CreateLogger("TraceFlow.Host.Endpoints.ExportEndpoints")
+                .LogWarning(ex, "导出流中断，未写审计：{Export}", exportName);
+            ctx.Abort();
             return Results.Empty;
         }
 

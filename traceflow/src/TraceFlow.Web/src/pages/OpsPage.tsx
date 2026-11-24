@@ -58,12 +58,14 @@ function limitText(limit: number | null): string { return limit === null ? '未�
 
 export default function OpsPage() {
   const [searchParams] = useSearchParams();
-  const initial = searchParams.get('state') ?? '';
+  const stateParam = searchParams.get('state') ?? '';
+  // 仅接受已知状态值（与下拉框同一白名单），非法值按“全部”处理。
+  const stateFromUrl = STATE_OPTIONS.indexOf(stateParam) > 0 ? stateParam : '';
   const [env, setEnv] = useState('');
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [alerts, setAlerts] = useState<AlertItem[] | null>(null);
   const [error, setError] = useState('');
-  const [state, setState] = useState(STATE_OPTIONS.indexOf(initial) > 0 ? initial : '');
+  const [state, setState] = useState(stateFromUrl);
   const [kindDraft, setKindDraft] = useState('');
   const [kind, setKind] = useState('');
   const [page, setPage] = useState(1);
@@ -72,6 +74,17 @@ export default function OpsPage() {
   const [openJobId, setOpenJobId] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const seqRef = useRef(0);
+  // 已应用到 state 的 URL 参数：初值即挂载时的参数，故挂载不会二次取数。
+  const appliedStateParamRef = useRef(stateParam);
+
+  // 深链（如告警里的 /ops?state=FAILED）在已在 /ops 时点链接也要生效：
+  // 参数变化 → 同步筛选状态；取数由 loadJobs 的依赖变化驱动，这里不额外请求。
+  useEffect(() => {
+    if (appliedStateParamRef.current === stateParam) return;
+    appliedStateParamRef.current = stateParam;
+    setState(stateFromUrl);
+    setPage(1);
+  }, [stateParam, stateFromUrl]);
 
   useEffect(() => {
     let active = true;

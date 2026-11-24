@@ -141,16 +141,16 @@ WHERE action=N'job.lease.recovered' AND env=@env AND occurred_at>=@since",
                     },
                     perJobKind = perJobKind.Select(r => new
                     {
-                        r.JobKind, r.Backlog, lastDoneAtUtc = r.LastDoneAt,
+                        r.JobKind, r.Backlog, lastDoneAtUtc = UtcOrNull(r.LastDoneAt),
                     }),
                     rateBudget = rateBudget.Select(r => new
                     {
                         r.BudgetKey, r.DayCount, r.DayLimit, r.MinuteCount, r.MinuteLimit,
-                        r.SecondCount, r.SecondLimit, nextAllowedAtUtc = r.NextAllowedAt,
+                        r.SecondCount, r.SecondLimit, nextAllowedAtUtc = UtcOrNull(r.NextAllowedAt),
                     }),
                     pauses = pauses.Select(p => new
                     {
-                        p.ScopeKey, p.Reason, pausedAtUtc = p.PausedAt, p.PausedBy,
+                        p.ScopeKey, p.Reason, pausedAtUtc = Utc(p.PausedAt), p.PausedBy,
                     }),
                     leaseRecoveries24h = leaseRecoveries,
                     recon = new { incomplete24h = recon.Incomplete24h, openDifferences = recon.OpenDifferences },
@@ -208,10 +208,10 @@ ORDER BY x.rn", args, cancellationToken: ct))).ToList();
                 r.JobState,
                 r.AttemptCount,
                 r.MaxAttempts,
-                nextRunAtUtc = r.NextRunAt,
+                nextRunAtUtc = Utc(r.NextRunAt),
                 r.LastError,
-                createdAtUtc = r.CreatedAt,
-                finishedAtUtc = r.FinishedAt,
+                createdAtUtc = Utc(r.CreatedAt),
+                finishedAtUtc = UtcOrNull(r.FinishedAt),
             }).ToList();
             return Results.Ok(new
             {
@@ -347,6 +347,14 @@ SELECT
 
     private static DateTime AsUtc(DateTime value)
         => value.Kind == DateTimeKind.Utc ? value : DateTime.SpecifyKind(value, DateTimeKind.Utc);
+
+    /// <summary>
+    /// 投影用的 UTC 标注：DB <c>datetime2</c> 读出 <see cref="DateTimeKind.Unspecified"/>，
+    /// 直接序列化不带 <c>Z</c>（契约含糊）。仅对响应中的 UTC 时间字段调用，不做全局转换器。
+    /// </summary>
+    private static DateTime Utc(DateTime value) => AsUtc(value);
+
+    private static DateTime? UtcOrNull(DateTime? value) => value is DateTime v ? AsUtc(v) : null;
 
     private static int CountOf(List<StateCountRow> rows, string key)
     {

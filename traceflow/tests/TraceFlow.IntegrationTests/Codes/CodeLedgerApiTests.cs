@@ -526,6 +526,60 @@ VALUES(@orgId,N'MOCK',@taskId,@decision,@kind,@predTask,@evidence,@by,@at)",
             (await client.GetAsync("/api/v1/codes?state=LOST")).StatusCode);
     }
 
+    // ---------------------------------------------------------------- 10. 码前缀 LIKE 字面量（_ / %）
+
+    /// <summary>
+    /// `q` 是用户输入：`_` 必须按字面量匹配（不加转义时 `6900_1` 会命中 `6900211111`）。
+    /// 列表与 CSV 导出共用同一 CTE（Task 4 重构），两条取数路径必须同口径。
+    /// </summary>
+    [Fact]
+    public async Task Code_prefix_treats_underscore_as_literal_in_list_and_export()
+    {
+        const string literal = "6900_11111A";
+        const string wildcardOnly = "690021";
+        await SeedEventAsync(literal, "PURCHASE_IN", "IN", T1);
+        await SeedEventAsync(wildcardOnly, "PURCHASE_IN", "IN", T1);
+
+        var client = await LoginAsync("codes-admin", AdminPassword);
+        var q = Uri.EscapeDataString("6900_1");
+        var (status, list, listText) = await GetAsync(client, "/api/v1/codes?q=" + q);
+        Assert.Equal(HttpStatusCode.OK, status);
+        Assert.Equal(1, list.GetProperty("total").GetInt32());
+        Assert.Equal(literal, Assert.Single(Codes(list)));
+        Assert.DoesNotContain(wildcardOnly, listText);
+
+        // 导出与列表同口径：只含字面量命中行。
+        var export = await client.GetAsync("/api/v1/exports/codes.csv?q=" + q);
+        Assert.Equal(HttpStatusCode.OK, export.StatusCode);
+        var csv = await export.Content.ReadAsStringAsync();
+        Assert.Contains(literal, csv);
+        Assert.DoesNotContain(wildcardOnly, csv);
+    }
+
+    /// <summary>`6900%11` 只匹配含字面量 `%` 的码（转义前会把 `%` 当通配符，命中 `6900222111111`）。</summary>
+    [Fact]
+    public async Task Code_prefix_treats_percent_as_literal_in_list_and_export()
+    {
+        const string literal = "6900%11111A";
+        const string wildcardOnly = "6900222111111";
+        await SeedEventAsync(literal, "SALE", "OUT", T1);
+        await SeedEventAsync(wildcardOnly, "SALE", "OUT", T1);
+
+        var client = await LoginAsync("codes-admin", AdminPassword);
+        var q = Uri.EscapeDataString("6900%11");
+        var (status, list, listText) = await GetAsync(client, "/api/v1/codes?q=" + q);
+        Assert.Equal(HttpStatusCode.OK, status);
+        Assert.Equal(1, list.GetProperty("total").GetInt32());
+        Assert.Equal(literal, Assert.Single(Codes(list)));
+        Assert.DoesNotContain(wildcardOnly, listText);
+
+        var export = await client.GetAsync("/api/v1/exports/codes.csv?q=" + q);
+        Assert.Equal(HttpStatusCode.OK, export.StatusCode);
+        var csv = await export.Content.ReadAsStringAsync();
+        Assert.Contains(literal, csv);
+        Assert.DoesNotContain(wildcardOnly, csv);
+    }
+
     private sealed record SessionResp(SessionData Data);
     private sealed record SessionData(bool Authenticated, string CsrfToken);
 }

@@ -73,7 +73,7 @@ public static class CodesEndpoints
             var args = new DynamicParameters();
             args.Add("orgId", orgId);
             args.Add("env", targetEnv);
-            if (prefix is not null) args.Add("prefix", prefix);
+            if (prefix is not null) args.Add("prefix", EscapeLikePrefix(prefix));
             if (typeFilter is not null) args.Add("eventType", typeFilter);
             if (fromUtc is DateTime f) args.Add("from", f);
             if (toUtc is DateTime t) args.Add("to", t);
@@ -296,13 +296,22 @@ ORDER BY r.observed_at DESC, r.id DESC",
     {
         var sb = new StringBuilder();
         if (hasPrefix)
+            // @prefix 已由 EscapeLikePrefix 转成字面量模式（含尾部 %）：用户输入的 %/_/[ 不得当通配符。
             sb.Append($" AND {alias}.code_id IN (SELECT tc.id FROM dbo.trace_code tc ")
-              .Append("WHERE tc.code_normalized LIKE @prefix + N'%')");
+              .Append("WHERE tc.code_normalized LIKE @prefix ESCAPE '\\')");
         if (hasType) sb.Append($" AND {alias}.event_type=@eventType");
         if (hasFrom) sb.Append($" AND {alias}.occurred_at>=@from");
         if (hasTo) sb.Append(toExclusive ? $" AND {alias}.occurred_at<@to" : $" AND {alias}.occurred_at<=@to");
         return sb.ToString();
     }
+
+    /// <summary>
+    /// 用户码前缀 → LIKE 字面量模式（尾部追加 <c>%</c>）：先按 <c>\ % _ [</c> 顺序转义，
+    /// 配合 SQL 的 <c>ESCAPE '\'</c>（SQL Server 2008 R2 支持）让 <c>69_0</c>/<c>69%</c> 只匹配字面量，
+    /// 不再被当成通配符。列表与 CSV 导出共用同一模式（同一取数口径）。
+    /// </summary>
+    internal static string EscapeLikePrefix(string q)
+        => q.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_").Replace("[", "\\[") + "%";
 
     /// <summary>占用状态谓词（作用于 CTE ev）：ACTIVE / RELEASED（无激活且有释放）/ NONE（无任何占用）。</summary>
     internal static string StatePredicate(string? state)

@@ -46,6 +46,20 @@ describe('useEscapeClose', () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it('IME 组合态 Esc 不触发回调（组合结束后仍可关闭）', () => {
+    const onClose = vi.fn();
+    render(<Harness open onClose={onClose} />);
+    // 输入法组合中按 Esc = 取消候选，不应关闭弹窗。
+    fireEvent.keyDown(document, { key: 'Escape', isComposing: true });
+    expect(onClose).not.toHaveBeenCalled();
+    // 旧浏览器/合成事件只有 keyCode=229（VK_PROCESSKEY）：同样忽略。
+    fireEvent.keyDown(document, { key: 'Escape', keyCode: 229 });
+    expect(onClose).not.toHaveBeenCalled();
+    // 组合结束后 Esc 正常关闭。
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
   it('onClose 更换后仍调用最新回调', () => {
     const first = vi.fn();
     const second = vi.fn();

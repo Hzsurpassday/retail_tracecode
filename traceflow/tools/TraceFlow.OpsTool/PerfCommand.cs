@@ -50,8 +50,25 @@ internal static class PerfCommand
         var saleLines = cli.GetInt("sale-lines", 100_000);
         var iterations = cli.GetInt("iterations", 30);
         var warmup = cli.GetInt("warmup", 3, min: 0);
-        var outPath = string.IsNullOrWhiteSpace(cli.Get("out")) ? DefaultOut : cli.Get("out")!;
         var keep = cli.Flag("keep");
+
+        // --out 缺省解析到仓库根（从程序集位置/当前目录向上找含 traceflow/db/migrations 的目录），
+        // 始终按绝对路径落盘与打印：不随 shell 工作目录漂移，日志里也不会出现含糊的相对路径。
+        var outArg = cli.Get("out");
+        string fullOut;
+        if (!string.IsNullOrWhiteSpace(outArg))
+        {
+            fullOut = Path.GetFullPath(outArg);
+        }
+        else
+        {
+            var root = FindRepositoryRoot();
+            if (root is null)
+                throw new CommandException(
+                    "找不到仓库根（应包含 traceflow/db/migrations）；请用 --out 显式指定输出文件", 2);
+            fullOut = Path.GetFullPath(Path.Combine(root, DefaultOut));
+        }
+        Console.WriteLine($"[perf] 结果文件（绝对路径）{fullOut}");
 
         if (saleLines % documents != 0)
             throw new CommandException("--sale-lines 必须能被 --documents 整除（每单行数一致）", 2);
@@ -69,6 +86,7 @@ internal static class PerfCommand
         var targetConn = DbCommands.BuildConnection(baseConn, dbName);
 
         WebApplicationFactory<global::Program>? factory = null;
+        var seedCommitted = false;
         try
         {
             Console.WriteLine($"[perf] 基准库 {dbName}（{dbName.Length} 字符）");
@@ -95,9 +113,11 @@ internal static class PerfCommand
 
                 var seedWatch = Stopwatch.StartNew();
                 var seed = await PerfSeeder.SeedAsync(targetConn, products, documents, saleLines, CancellationToken.None);
+                seedCommitted = true; // 种子已在单事务内提交；--keep 只在这之后才生效
                 seedWatch.Stop();
                 Console.WriteLine($"[perf] 种子完成 products={seed.Products} documents={seed.Documents} " +
-                                  $"saleLines={seed.SaleLines} codes={seed.SaleLines} 用时 {seedWatch.Elapsed.TotalSeconds:0.0}s");
+                                  $"saleLines={seed.SaleLines} codes={seed.SaleLines} returnTasks={seed.ReturnTasks} " +
+                                  $"用时 {seedWatch.Elapsed.TotalSeconds:0.0}s");
                 Console.WriteLine($"[perf] 业务时间窗 {seed.OldestBusinessUtc:O} ~ {seed.NewestBusinessUtc:O}");
 
                 var password = "Perf-" + Guid.NewGuid().ToString("N");
@@ -133,6 +153,8 @@ internal static class PerfCommand
                         Documents = seed.Documents,
                         SaleLines = seed.SaleLines,
                         Codes = seed.SaleLines,
+                        // 退货负载（CONSUMER_RETURN_116 任务 + 分片 + 确认行）：/returns 不再空表。
+                        ReturnTasks = seed.ReturnTasks,
                     },
                     Iterations = iterations,
                     Warmup = warmup,
@@ -159,16 +181,16 @@ internal static class PerfCommand
                         "端点实际路由为 POST /api/v1/reconciliation-runs（brief 写作 /api/v1/reconciliation/runs）。",
                         "GET /api/v1/codes 的 q 至少 4 字符（CodesEndpoints.MinPrefixLength=4），故用前缀 6900（命中全部 100000 码）而非 q=69（会被 400 拒绝）。",
                         "pass = 所有样本 HTTP 2xx 且 p95 ≤ 2000ms（状态码非 2xx 也判 FAIL，避免错误响应被误判为快）。",
+                        "种子额外写入 200 个 CONSUMER_RETURN_116 任务（每个 1 个分片；约 2/3 带 return_confirmation），/api/v1/returns 不再空表。",
                     },
                 };
 
                 var json = JsonSerializer.Serialize(payload, JsonOptions());
-                var fullOut = Path.GetFullPath(outPath);
                 Directory.CreateDirectory(Path.GetDirectoryName(fullOut)!);
                 await File.WriteAllTextAsync(fullOut, json + System.Environment.NewLine);
 
                 PrintTable(results, recon.Ms, productVersion, engineVerified, dbName);
-                Console.WriteLine($"[perf] 结果文件 {fullOut}");
+                Console.WriteLine($"[perf] 结果已写出（绝对路径）{fullOut}");
                 Console.WriteLine($"[perf] 基准库 {dbName}（keep={keep}）");
 
                 var failed = results.Any(r => !r.Pass);
@@ -183,7 +205,8 @@ internal static class PerfCommand
         {
             factory?.Dispose();
             SqlConnection.ClearAllPools();
-            if (!keep)
+            // --keep 只在种子成功提交后生效：种子失败或回滚时必须删库，避免留下半套数据被后续复用。
+            if (!keep || !seedCommitted)
             {
                 try
                 {
@@ -195,6 +218,21 @@ internal static class PerfCommand
                 }
             }
         }
+    }
+
+    /// <summary>从程序集目录与当前目录向上找含 traceflow/db/migrations 的仓库根；找不到返回 null。</summary>
+    private static string? FindRepositoryRoot()
+    {
+        foreach (var start in new[] { AppContext.BaseDirectory, Directory.GetCurrentDirectory() })
+        {
+            if (string.IsNullOrWhiteSpace(start)) continue;
+            for (var dir = new DirectoryInfo(start); dir is not null; dir = dir.Parent)
+            {
+                if (Directory.Exists(Path.Combine(dir.FullName, "traceflow", "db", "migrations")))
+                    return dir.FullName;
+            }
+        }
+        return null;
     }
 
     // ---------------------------------------------------------------- 计测

@@ -128,7 +128,9 @@ if ($LASTEXITCODE -ne 0) { Fail ("create-db 失败（退出码 " + $LASTEXITCODE
 
 # ---------------------------------------------------------------- 4. 迁移（DbMigrator 输出目录不含脚本，显式传脚本目录）
 Write-Host "[2/4] 执行迁移（db/migrations 0001-0009）..."
-& dotnet run --project $MigratorProject -c Release -- $script:FullConn $MigrationsDir
+# 连接串走环境变量 TRACEFLOW_MIGRATE_CONN：不出现在命令行参数里，也就不会落到进程表/日志。
+$env:TRACEFLOW_MIGRATE_CONN = $script:FullConn
+& dotnet run --project $MigratorProject -c Release -- --dir $MigrationsDir
 if ($LASTEXITCODE -ne 0) { Fail ("迁移失败（退出码 " + $LASTEXITCODE + "）。") $LASTEXITCODE }
 
 # ---------------------------------------------------------------- 5. 管理员（可选）

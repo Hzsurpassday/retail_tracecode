@@ -3,7 +3,7 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { api, ApiError } from '../api';
 import EnvBadge from '../components/EnvBadge';
 import { useEscapeClose } from '../hooks/useEscapeClose';
-import { reasonZh } from '../utils/statusReason';
+import { saleReasonZh } from '../utils/statusReason';
 import { fmtShanghai } from '../utils/time';
 
 interface ListPage<T> { items: T[]; page: number; pageSize: number; total: number }
@@ -56,11 +56,7 @@ const TASK_STATE_ZH: Record<string, string> = {
   PartialSuccess: '部分成功', ResultUnresolved: '结果未决', Succeeded: '成功',
   Failed: '失败', ManualAction: '需人工核对', Cancelled: '已取消',
 };
-// 逐码核验的 FAILED 原因带 `VERIFY_FAILED:{明细}` 前缀：本页展开为“核验失败：{明细}”，其余走统一映射。
-function saleReasonZh(reason: string | null): string {
-  if (reason && reason.startsWith('VERIFY_FAILED:')) return `核验失败：${reason.slice('VERIFY_FAILED:'.length)}`;
-  return reasonZh(reason);
-}
+// 逐码核验的 FAILED 原因带 `VERIFY_FAILED:{明细}` 前缀：统一在 utils/statusReason 里展开为“核验失败：{明细}”。
 function stateZh(state: string | null, dict: Record<string, string>): string {
   if (!state) return '—';
   return dict[state] ?? state;

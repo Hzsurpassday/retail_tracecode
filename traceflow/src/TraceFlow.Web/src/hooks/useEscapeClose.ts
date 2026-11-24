@@ -14,6 +14,9 @@ export function useEscapeClose(open: boolean, onClose: () => void): void {
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (e: KeyboardEvent): void => {
+      // IME 组合态（中文/日文输入法）里 Esc 是取消候选，不是关闭弹窗：
+      // 兼容 isComposing 与旧浏览器/合成事件上的 keyCode 229。
+      if (e.isComposing || e.keyCode === 229) return;
       if (e.key === 'Escape') handlerRef.current();
     };
     document.addEventListener('keydown', onKeyDown);

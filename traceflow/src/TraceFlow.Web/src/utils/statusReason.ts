@@ -28,3 +28,13 @@ export function reasonZh(reason: string | null, empty = '—'): string {
   if (!reason) return empty;
   return REASON_ZH[reason] ?? reason;
 }
+
+/**
+ * 逐码核验的失败原因带 `VERIFY_FAILED:{明细}` 前缀（映射表里没有该键）：
+ * 展开为“核验失败：{明细}”，其余一律走 {@link reasonZh}（未知代码仍原样返回）。
+ */
+export function saleReasonZh(reason: string | null): string {
+  if (reason && reason.startsWith('VERIFY_FAILED:'))
+    return `核验失败：${reason.slice('VERIFY_FAILED:'.length)}`;
+  return reasonZh(reason);
+}

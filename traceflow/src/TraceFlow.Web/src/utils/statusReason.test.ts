@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { REASON_ZH, reasonZh } from './statusReason';
+import { REASON_ZH, reasonZh, saleReasonZh } from './statusReason';
 
 describe('reasonZh', () => {
   it('已知键返回中文', () => {
@@ -53,5 +53,21 @@ describe('reasonZh', () => {
     expect(REASON_ZH.VERIFY_CHANGED_AFTER_SEND).toBe('发送后核验变更');
     expect(REASON_ZH.VERIFY_CHANGED_WHILE_DISPATCHING).toBe('发送中核验变更');
     expect(REASON_ZH.RETURN_CONFIRMED).toBe('已确认');
+  });
+});
+
+describe('saleReasonZh', () => {
+  it('VERIFY_FAILED:{明细} 展开为「核验失败：明细」', () => {
+    expect(saleReasonZh('VERIFY_FAILED:平台码不存在')).toBe('核验失败：平台码不存在');
+    expect(saleReasonZh('VERIFY_FAILED:')).toBe('核验失败：');
+    expect(saleReasonZh('VERIFY_FAILED:a:b')).toBe('核验失败：a:b');
+  });
+
+  it('非 VERIFY_FAILED 前缀沿用统一映射（不重复加前缀）', () => {
+    expect(saleReasonZh('PLATFORM_REJECTED')).toBe('平台拒绝');
+    expect(saleReasonZh('VERIFY_FAILED')).toBe('VERIFY_FAILED');
+    expect(saleReasonZh('SOME_NEW_REASON')).toBe('SOME_NEW_REASON');
+    expect(saleReasonZh(null)).toBe('—');
+    expect(saleReasonZh('')).toBe('—');
   });
 });

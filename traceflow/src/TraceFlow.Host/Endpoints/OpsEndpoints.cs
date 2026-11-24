@@ -59,11 +59,13 @@ public static class OpsEndpoints
             if (row is null)
                 return Results.Json(new { code = "NOT_FOUND", message = "作业不存在", retryable = false, requestId = ctx.TraceIdentifier }, statusCode: 404);
             // M4 Task 5 增量字段：env/createdAtUtc/finishedAtUtc/maxAttempts（其余字段与 M2 携带项不变）。
+            // UTC 字段显式标注 Kind=Utc（datetime2 读出为 Unspecified，否则 JSON 不带 Z）。
             return Results.Ok(new { data = new { jobId = row.id.ToString(), jobKind = row.job_kind, intentKey = row.intent_key,
                 jobState = row.job_state, attemptCount = row.attempt_count, maxAttempts = row.max_attempts,
-                nextRunAtUtc = row.next_run_at, lastError = row.last_error, leaseOwner = row.lease_owner,
-                fencingToken = row.fencing_token, env = row.env, createdAtUtc = row.created_at,
-                finishedAtUtc = row.finished_at }, requestId = ctx.TraceIdentifier });
+                nextRunAtUtc = NormalizeUtc(row.next_run_at), lastError = row.last_error, leaseOwner = row.lease_owner,
+                fencingToken = row.fencing_token, env = row.env, createdAtUtc = NormalizeUtc(row.created_at),
+                finishedAtUtc = row.finished_at is DateTime finished ? NormalizeUtc(finished) : (DateTime?)null },
+                requestId = ctx.TraceIdentifier });
         }).WithMetadata(new RequirePermissionAttribute(PermissionCatalog.TraceRead));
 
         app.MapGet("/api/v1/audit-logs", async (HttpContext ctx, int? page, int? pageSize,
