@@ -1,0 +1,105 @@
+{
+  "generatedAtUtc": "2026-11-24T02:03:13.3768263Z",
+  "productVersion": "15.0.2000.5",
+  "engineVerified2008R2": false,
+  "dbName": "TraceFlow_Perf_20261124020247",
+  "volumes": {
+    "products": 10000,
+    "documents": 2000,
+    "saleLines": 100000,
+    "codes": 100000
+  },
+  "iterations": 30,
+  "warmup": 3,
+  "results": [
+    {
+      "endpoint": "/api/v1/pos-sales?page=1",
+      "p50Ms": 114.8,
+      "p95Ms": 125.6,
+      "maxMs": 127.7,
+      "pass": true,
+      "statusCodes": [
+        "200"
+      ],
+      "samples": 30
+    },
+    {
+      "endpoint": "/api/v1/pos-sales?page=20",
+      "p50Ms": 116.7,
+      "p95Ms": 126.3,
+      "maxMs": 129.6,
+      "pass": true,
+      "statusCodes": [
+        "200"
+      ],
+      "samples": 30
+    },
+    {
+      "endpoint": "/api/v1/returns?page=1",
+      "p50Ms": 7.8,
+      "p95Ms": 12.6,
+      "maxMs": 28.1,
+      "pass": true,
+      "statusCodes": [
+        "200"
+      ],
+      "samples": 30
+    },
+    {
+      "endpoint": "/api/v1/upload-tasks?page=1",
+      "p50Ms": 12.8,
+      "p95Ms": 19.5,
+      "maxMs": 20.2,
+      "pass": true,
+      "statusCodes": [
+        "200"
+      ],
+      "samples": 30
+    },
+    {
+      "endpoint": "/api/v1/codes?q=6900",
+      "p50Ms": 113.5,
+      "p95Ms": 129.3,
+      "maxMs": 132.2,
+      "pass": true,
+      "statusCodes": [
+        "200"
+      ],
+      "samples": 30
+    },
+    {
+      "endpoint": "/api/v1/ops/metrics",
+      "p50Ms": 8.8,
+      "p95Ms": 17.9,
+      "maxMs": 19.7,
+      "pass": true,
+      "statusCodes": [
+        "200"
+      ],
+      "samples": 30
+    },
+    {
+      "endpoint": "/api/v1/dashboard",
+      "p50Ms": 15.5,
+      "p95Ms": 20.8,
+      "maxMs": 28.7,
+      "pass": true,
+      "statusCodes": [
+        "200"
+      ],
+      "samples": 30
+    }
+  ],
+  "reconciliationRunMs": 39.2,
+  "reconciliationStatus": 202,
+  "environment": {
+    "processorCount": 16,
+    "osDescription": "Microsoft Windows 10.0.26300",
+    "dotnetVersion": ".NET 8.0.31"
+  },
+  "deviations": [
+    "端点实际路由为 POST /api/v1/reconciliation-runs（brief 写作 /api/v1/reconciliation/runs）。",
+    "GET /api/v1/codes 的 q 至少 4 字符（CodesEndpoints.MinPrefixLength=4），故用前缀 6900（命中全部 100000 码）而非 q=69（会被 400 拒绝）。",
+    "pass = 所有样本 HTTP 2xx 且 p95 ≤ 2000ms（状态码非 2xx 也判 FAIL，避免错误响应被误判为快）。"
+  ]
+}
