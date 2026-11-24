@@ -8,7 +8,10 @@
     只操作 TraceFlow_Trial_Drill_<Stamp>（白名单 ^TraceFlow_(Trial|Perf)_[A-Za-z0-9_]{1,60}$ +
     前缀自检 + 保护库/测试库/系统库硬拒绝）；任何其它库名以退出码 2 拒绝。
     连接一律走 sqlcmd -E（集成认证）/ OpsTool 环境变量，脚本不回显任何连接串或密码。
-    finally 块保证：库先回到 MULTI_USER 再删除（除非 -Keep），未由本次运行创建的库永不删除。
+    建库前先用 DB_ID 预检：库已存在（-Stamp 重复）时直接 exit 2，绝不复用或删除既有库
+    （OpsTool create-db 是幂等的，不预检就会静默复用旧库）。
+    finally 块保证：库先回到 MULTI_USER 再删除（除非 -Keep；-Keep 时也确保库回到 MULTI_USER
+    以可正常使用），未由本次运行创建的库永不删除，并清除本脚本设置的连接环境变量。
     .bak 默认写到 traceflow/tools/trial/.runtime/（git-ignored）；该目录不可写时回退到实例默认备份目录。
 
     事实边界：本脚本验证的是数据库层备份/恢复，不涉及平台（G-TOP）与 LIVE 对账流程；
@@ -205,14 +208,23 @@ try {
     }
 
     # ------------------------------------------------------------ 2. 建库 + 迁移
-    Write-Host '[2/8] 创建演练库并执行迁移 0001-0009 ...'
+    Write-Host '[2/8] 预检演练库是否已存在（DB_ID），再创建并执行迁移 0001-0009 ...'
+    # create-db 是幂等的（库已存在时退出码 0），若 -Stamp 重复会静默复用旧库：
+    # 那既让本次断言毫无意义，也让 finally 的"只删本次创建"判断失真——故先显式预检并拒绝。
+    $dbIdState = Get-Scalar -Database 'master' -Query ("SET NOCOUNT ON; SELECT CASE WHEN DB_ID(N'" + $DbName + "') IS NULL THEN N'ABSENT' ELSE N'PRESENT' END") -What '预检演练库是否已存在（DB_ID）'
+    if ($dbIdState -ne 'ABSENT') {
+        Write-Host ('[拒绝] 演练库已存在（-Stamp 重复）；拒绝复用/删除，请换 -Stamp 或先人工确认：' + $DbName) -ForegroundColor Red
+        exit 2
+    }
+    Write-Host '  预检通过：演练库不存在，将由本次运行创建。'
+
     $env:TRACEFLOW_TRIAL_CONN = $Base
     $create = Invoke-Dotnet $OpsToolProject @('create-db', $DbName)
     if ($create.ExitCode -ne 0) {
         throw ('OpsTool create-db 失败（退出码 ' + $create.ExitCode + '）：' + (Hide-SecretText $create.Text))
     }
     Write-Host ('  ' + (Hide-SecretText $create.Text))
-    # 仅在 create-db 成功后登记"本次创建"，finally 只删这里登记过的库。
+    # 仅"预检证明不存在 + create-db 退出 0"后才登记"本次创建"；finally 只删这里登记过的库。
     $script:DbCreated = $true
 
     $builder = New-Object System.Data.SqlClient.SqlConnectionStringBuilder($Base)
@@ -408,11 +420,21 @@ catch {
     $exitCode = 1
 }
 finally {
-    # 释放连接：清除本脚本设置的环境变量（避免污染父进程以外的后续调用）
-    Remove-Item Env:\TRACEFLOW_MIGRATE_CONN -ErrorAction SilentlyContinue
-
     if ($script:DbCreated) {
         if ($Keep) {
+            # -Keep：库要留下来给人用，必须保证不是 SINGLE_USER 残留（第 6 步恢复时曾置单用户，
+            # 中途失败会停在单用户）。先确认库确实存在，再回多用户。
+            try {
+                $exists = Get-Scalar -Database 'master' -Query ("SET NOCOUNT ON; SELECT CASE WHEN DB_ID(N'" + $DbName + "') IS NULL THEN N'ABSENT' ELSE N'PRESENT' END") -What '清理时确认演练库存在'
+                if ($exists -eq 'PRESENT') {
+                    $r = Invoke-SqlBatch -Database 'master' -Query "ALTER DATABASE [$DbName] SET MULTI_USER;"
+                    if ($r.ExitCode -ne 0) { Write-Host ('[清理] -Keep 下 MULTI_USER 未成功：' + (Hide-SecretText $r.Text)) -ForegroundColor Yellow }
+                } else {
+                    Write-Host '[清理] 演练库已不存在（无需恢复多用户）。' -ForegroundColor Yellow
+                }
+            } catch {
+                Write-Host ('[清理] -Keep 下 MULTI_USER 异常：' + (Hide-SecretText $_.Exception.Message)) -ForegroundColor Yellow
+            }
             Write-Host ('[清理] -Keep 指定：保留演练库 ' + $DbName)
         } else {
             # 先确保多用户，再删除（删除只针对本次创建且匹配演练前缀的库）。
@@ -453,6 +475,10 @@ finally {
     foreach ($f in @((New-SqlPath 'drill-seed'), (New-SqlPath 'drill-mutate'))) {
         if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
     }
+
+    # 释放连接：清除本脚本设置的两个环境变量（避免污染父进程以外的后续调用）。
+    Remove-Item Env:\TRACEFLOW_MIGRATE_CONN -ErrorAction SilentlyContinue
+    Remove-Item Env:\TRACEFLOW_TRIAL_CONN -ErrorAction SilentlyContinue
 }
 
 if ($exitCode -eq 0) {

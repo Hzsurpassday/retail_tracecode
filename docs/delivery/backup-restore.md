@@ -124,11 +124,11 @@ DBCC CHECKDB(N'TraceFlow') WITH NO_INFOMSGS;
 | 演练脚本 | `traceflow/tools/trial/Backup-Restore-Drill.ps1`（PowerShell 5.1，`sqlcmd -b -I -h -1 -W`） |
 | 执行命令 | `powershell -NoProfile -ExecutionPolicy Bypass -File traceflow/tools/trial/Backup-Restore-Drill.ps1 -Base "Server=localhost;Integrated Security=true;Encrypt=true;TrustServerCertificate=true"` |
 | 引擎 | SQL Server 2019（`ProductVersion` 15.0.2000.5）；**2008 R2 未验证（AT-070）** |
-| 演练库 | `TraceFlow_Trial_Drill_<UTC 时间戳>`（运行结束已删除，无残留） |
+| 演练库 | `TraceFlow_Trial_Drill_<UTC 时间戳>`（建库前 `DB_ID` 预检；`-Stamp` 重复时 exit 2 拒绝复用/删除；本次运行结束已删除，无残留） |
 | 备份 | `BACKUP ... WITH INIT, COPY_ONLY, CHECKSUM` + `RESTORE VERIFYONLY ... WITH CHECKSUM`；文件字节数与耗时见 JSON |
 | 恢复 | 单用户 → `RESTORE ... WITH REPLACE, RECOVERY, CHECKSUM` → 多用户；`DBCC CHECKDB` 无错误 |
 | 断言 | 备份前标记存在 / 备份后标记不存在 / organization 名称恢复 / `upload_task` 同 id 恢复 / `schema_version` 9 行且 `success=1` / VERIFYONLY 与 CHECKDB 均 exit 0 |
-| 实测结果 | 全部通过，见 `docs/delivery/backup-restore-drill.json`（`checks` 数组逐项记录 expected/actual/method） |
+| 实测结果 | 8/8 断言通过：库 `TraceFlow_Trial_Drill_20261124040342`、备份 4,575,232 字节（160.1 ms）、恢复 597.2 ms、`generatedAtUtc=2026-11-24T04:03:49.4162039Z`；见 `docs/delivery/backup-restore-drill.json`（`checks` 数组逐项记录 expected/actual/method） |
 
 边界说明：
 

@@ -30,7 +30,7 @@ public static class MasterEndpoints
             var par = new DynamicParameters();
             par.Add("org", orgId);
             if (!string.IsNullOrWhiteSpace(keyword))
-            { where.Append(" AND (p.name LIKE @kw OR p.spid LIKE @kw OR p.display_code LIKE @kw OR p.barcode LIKE @kw)"); par.Add("kw", $"%{keyword}%"); }
+            { where.Append(" AND (p.name LIKE @kw ESCAPE '\\' OR p.spid LIKE @kw ESCAPE '\\' OR p.display_code LIKE @kw ESCAPE '\\' OR p.barcode LIKE @kw ESCAPE '\\')"); par.Add("kw", EscapeLikeContains(keyword)); }
             if (!string.IsNullOrWhiteSpace(classification))
             { where.Append(" AND p.trace_classification=@cls"); par.Add("cls", classification); }
             if (!string.IsNullOrWhiteSpace(mappingState))
@@ -103,7 +103,7 @@ SELECT id,spid,display_code,barcode,name,approval_no_raw,approval_no_norm,manufa
             var par = new DynamicParameters();
             par.Add("org", orgId);
             if (!string.IsNullOrWhiteSpace(keyword))
-            { where.Append(" AND (s.name LIKE @kw OR s.dwbh LIKE @kw OR s.credit_code LIKE @kw)"); par.Add("kw", $"%{keyword}%"); }
+            { where.Append(" AND (s.name LIKE @kw ESCAPE '\\' OR s.dwbh LIKE @kw ESCAPE '\\' OR s.credit_code LIKE @kw ESCAPE '\\')"); par.Add("kw", EscapeLikeContains(keyword)); }
             if (!string.IsNullOrWhiteSpace(mappingState))
             { where.Append(" AND ISNULL(sm.state,N'NONE')=@ms"); par.Add("ms", mappingState); }
             const string from = @"
@@ -468,6 +468,10 @@ SELECT @id,supplier_id,enterprise_version_id,N'DISABLED',evidence_json,@by,@reas
 
     private static string Err(HttpContext ctx, string code, string message) =>
         JsonSerializer.Serialize(new { code, message, retryable = false, requestId = ctx.TraceIdentifier });
+
+    /// <summary>用户关键字 → LIKE 字面量包含模式：转义 \ % _ [，配合 ESCAPE '\' 防止通配符注入。</summary>
+    private static string EscapeLikeContains(string keyword)
+        => "%" + keyword.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_").Replace("[", "\\[") + "%";
 
     private static async Task<(string Ver, int Version)> ReadMappingVersionAsync(SqlConnection conn, SqlTransaction tx, string table, long id, CancellationToken ct)
     {

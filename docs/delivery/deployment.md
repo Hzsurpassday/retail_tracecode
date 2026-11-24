@@ -164,7 +164,7 @@ sc.exe start $ServiceName
   设置账号：`sc.exe config $ServiceName obj= "<MACHINE或域>\<账号>" password= "<由管理员交互输入，不入文档>"`。
 - 进程内环境变量：服务注册表 `HKLM\SYSTEM\CurrentControlSet\Services\TraceFlow\Environment`（REG_MULTI_SZ）
   可注入 `ASPNETCORE_URLS` / `ConnectionStrings__TraceFlow`；也可只用 `appsettings.Production.json`。
-- 单进程即单门店：`--web-only` / `--worker-only` 用于拆分 Web 与后台作业（`Program.cs:21-22`）。
+- 单进程即单门店：`--web-only` / `--worker-only` 用于拆分 Web 与后台作业（`Program.cs:23-24`）。
   默认同时运行 Web 与 Worker（`WorkerHostedService` + `SyncSchedulerHostedService`）。
 
 ### 3.7 健康检查

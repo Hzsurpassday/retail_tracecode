@@ -242,4 +242,46 @@ VALUES(@org,@sid,@ev,N'AUTO_CONFIRMED')", new { org = orgId, sid, ev = evId });
         Assert.Contains("D201", none);
         Assert.DoesNotContain("D200", none);
     }
+
+    // F1：用户关键字中的 %/_ 必须按字面量匹配（ESCAPE '\'），不得当通配符吞掉整个列表。
+    // Products：关键字 "_%" 只有按字面量解释才有意义——只命中名字里真的含 "_%" 的 CPW1；
+    // CPW2 不含该子串故不命中（旧的未转义写法会退化成 "%_%%"，两者都命中、total=2）。
+    // 注：brief 给的种子名 "测试_药%甲" 的 "_" 与 "%" 并不相邻（实际不含 "_%" 子串），
+    // 与 brief 自己要求的 total=1 冲突；此处把名字调成 "测试_%药甲" 以保留 brief 的断言口径。
+    [Fact]
+    public async Task Products_keyword_treats_wildcards_as_literal()
+    {
+        await SeedProductAsync("CPW1", "测试_%药甲");
+        await SeedProductAsync("CPW2", "测试药甲乙");
+        var (client, _) = await LoginAsync("clsadmin", "Cls-Password-123");
+
+        var resp = await client.GetAsync("/api/v1/products?keyword=" + Uri.EscapeDataString("_%"));
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var body = await resp.Content.ReadAsStringAsync();
+        Assert.Contains("\"total\":1", body);
+        Assert.Contains("CPW1", body);
+        Assert.DoesNotContain("CPW2", body);
+    }
+
+    // Suppliers：关键字 "%" 只应命中名字里含字面 "%" 的 DW1，不应命中 DW2。
+    [Fact]
+    public async Task Suppliers_keyword_treats_percent_as_literal()
+    {
+        var (orgId, sysId) = await OrgAsync();
+        await using (var c = await _fx.OpenAsync())
+        {
+            await c.ExecuteAsync("INSERT INTO dbo.supplier(org_id,source_system_id,dwbh,name) VALUES(@org,@sys,N'DW1',N'华东%医药')",
+                new { org = orgId, sys = sysId });
+            await c.ExecuteAsync("INSERT INTO dbo.supplier(org_id,source_system_id,dwbh,name) VALUES(@org,@sys,N'DW2',N'华东南医药')",
+                new { org = orgId, sys = sysId });
+        }
+        var (client, _) = await LoginAsync("clsadmin", "Cls-Password-123");
+
+        var resp = await client.GetAsync("/api/v1/suppliers?keyword=" + Uri.EscapeDataString("%"));
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var body = await resp.Content.ReadAsStringAsync();
+        Assert.Contains("\"total\":1", body);
+        Assert.Contains("DW1", body);
+        Assert.DoesNotContain("DW2", body);
+    }
 }

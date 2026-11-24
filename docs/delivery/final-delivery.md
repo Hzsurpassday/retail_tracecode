@@ -52,19 +52,30 @@
 | 集成测试 | 490 / 490（默认 collation）+ 490 / 490（BIN2 变体），SQL Server 2019 授权降级 |
 | 前端 | vitest 29 / 29；`tsc -b && vite build` 通过（53 modules） |
 | 性能基准 | 7 / 7 端点 p95 11.5–134.8 ms（上限 2000 ms，10000 商品 / 100000 销售行，`/returns` 非空） |
-| 备份/恢复演练 | 8 / 8 断言通过；备份 4,575,232 字节、恢复 636.6 ms、`DBCC CHECKDB` 无错误 |
+| 备份/恢复演练 | 8 / 8 断言通过；备份 4,575,232 字节（160.1 ms）、恢复 597.2 ms、`DBCC CHECKDB` 无错误；重复 `-Stamp` 拒绝 exit 2 |
 | 迁移 | 0001–0009 双 collation（中文默认 + BIN2）回归通过，checksum 未变 |
 
 ## 五、用户待办
 
-1. 填写 `secrets\appsecrets.env`（`top.appkey` / `top.appsecret` / `erp.connection` 等），**不要在聊天/文档/截图中传播**；
+以下各项全部**未完成**，均需用户提供/确认：
+
+1. **凭证与配置**：把下列项填进 `E:\Viding\Retail Trace Code\secrets\appsecrets.env`（该文件不入 Git，
+   **不要在聊天/文档/截图中传播**）：
+   - AppKey / AppSecret（`top.appkey` / `top.appsecret`）；
+   - `ent_id` / `ref_ent_id`（平台侧企业标识，当前无 API，须 DBA 直更）；
+   - 门店名称（`organization` 单活行的门店名称）；
+   - KSOA 只读连接串与 KSOA 版本（`erp.connection`，只读账号）；
+   - 初始管理员密码（`--init-admin` 初始化用）；
+   - 服务账号（`MACHINE\traceflow` 或域账号）；
+   - 监听地址（`ASPNETCORE_URLS` / `appsettings.Production.json`）。
+
    写入后仅能通过设置页写入（只写不回显），并确认审计无明文。
-2. 提供一台 **SQL Server 2008 R2** 实例，重跑 490 集成用例 + 性能基准 + 备份/恢复演练（AT-070 缺口）。
-3. 提供平台侧取证材料：TOP 方法名/入参/错误码/限值/回执样例（G-TOP）、ERP 视图与只读账号（G-ERP），
+2. 提供一台**真实 SQL Server 2008 R2**（10.50.x）实例，重跑集成用例 + 性能基准 + 备份/恢复演练（AT-070 缺口）。
+3. **平台取证配合**：G-TOP 方法名/入参/错误码/限值/回执样例、G-ERP 视图与只读账号，
    以及 G-POS / G-RETURN / G-OPENING 的字段与样例数据。
-4. 提供 202 采购退货的来源字段与样例（当前只接服务/测试路径）。
-5. 安排 **≥7 天试运行**：`trial-run-plan.md` 的登记表当前仅"冒烟"一行，其余 `待填`。
-6. 在目标机完成 G-DEPLOY 取证（`deployment.md` §8 清单 8 项全部未取证），**上线前必须**把
+4. 提供 **202 采购退货**的来源字段与样例（当前只接服务/测试路径）。
+5. 安排 **≥7 天试运行**，并填写 `trial-run-plan.md` 的登记表（当前仅"冒烟"一行，其余 `待填`）。
+6. 在目标部署机完成 **G-DEPLOY 8 项取证**（`deployment.md` §8 清单全部未取证），**上线前必须**把
    `Program.cs` 的 `Cookie.SecurePolicy` 由 `SameAsRequest` 改为 `Always` 并配置 TLS。
 7. 确认备份保留期 / RPO / RTO（`backup-restore.md` §3 为 `待用户确认`），并锁定备份目录访问权限。
 

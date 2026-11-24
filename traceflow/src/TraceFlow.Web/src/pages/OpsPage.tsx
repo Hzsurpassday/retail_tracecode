@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
-import { Link, useSearchParams } from 'react-router-dom';
+import { Link, useLocation, useSearchParams } from 'react-router-dom';
 import { api, ApiError } from '../api';
 import EnvBadge from '../components/EnvBadge';
 import { useEscapeClose } from '../hooks/useEscapeClose';
@@ -58,6 +58,7 @@ function limitText(limit: number | null): string { return limit === null ? '未�
 
 export default function OpsPage() {
   const [searchParams] = useSearchParams();
+  const location = useLocation();
   const stateParam = searchParams.get('state') ?? '';
   // 仅接受已知状态值（与下拉框同一白名单），非法值按“全部”处理。
   const stateFromUrl = STATE_OPTIONS.indexOf(stateParam) > 0 ? stateParam : '';
@@ -74,17 +75,20 @@ export default function OpsPage() {
   const [openJobId, setOpenJobId] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const seqRef = useRef(0);
-  // 已应用到 state 的 URL 参数：初值即挂载时的参数，故挂载不会二次取数。
-  const appliedStateParamRef = useRef(stateParam);
+  // 已应用到 state 的 URL 标识（location.key + 参数）：初值即挂载时的值，故挂载不会二次取数。
+  // 用 location.key 而非仅参数：已在 /ops 时再次点击同一 /ops?state=X 也视为新的一次导航，
+  // 即使 URL 文本未变（用户可能已手动改过下拉框），也要重新应用 URL 状态。
+  const appliedUrlRef = useRef(`${location.key}|${stateParam}`);
 
   // 深链（如告警里的 /ops?state=FAILED）在已在 /ops 时点链接也要生效：
-  // 参数变化 → 同步筛选状态；取数由 loadJobs 的依赖变化驱动，这里不额外请求。
+  // 导航标识变化 → 同步筛选状态；取数由 loadJobs 的依赖变化驱动，这里不额外请求。
   useEffect(() => {
-    if (appliedStateParamRef.current === stateParam) return;
-    appliedStateParamRef.current = stateParam;
+    const key = `${location.key}|${stateParam}`;
+    if (appliedUrlRef.current === key) return;
+    appliedUrlRef.current = key;
     setState(stateFromUrl);
     setPage(1);
-  }, [stateParam, stateFromUrl]);
+  }, [location.key, stateParam, stateFromUrl]);
 
   useEffect(() => {
     let active = true;

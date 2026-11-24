@@ -153,16 +153,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File traceflow/tools/trial/Backup
 真实输出（节选）：
 
 ```
-[drill] 演练库 TraceFlow_Trial_Drill_20261124034421（实例 localhost）
+[drill] 演练库 TraceFlow_Trial_Drill_20261124040342（实例 localhost）
 [1/8] 读取 SQL Server 版本 ...
   Microsoft SQL Server 2019 (RTM) - 15.0.2000.5 (X64) (ProductVersion 15.0.2000.5)
-[2/8] 创建演练库并执行迁移 0001-0009 ... 迁移成功行数：9
+[2/8] 预检演练库是否已存在（DB_ID），再创建并执行迁移 0001-0009 ...
+  预检通过：演练库不存在，将由本次运行创建。
+  已创建库 TraceFlow_Trial_Drill_20261124040342（默认排序规则）
+  迁移成功行数：9
 [3/8] 写入备份前标记数据 ... 种子完成：org_id=1 preTaskId=1
 [4/8] 备份（COPY_ONLY + CHECKSUM）并 VERIFYONLY ...
-  备份文件：...\TraceFlow_Trial_Drill_20261124034421.bak（4575232 字节，167.2 ms）
+  备份文件：...\TraceFlow_Trial_Drill_20261124040342.bak（4575232 字节，160.1 ms）
   VERIFYONLY 通过：文件 1 上的备份集有效。
 [5/8] 备份后变更数据 ... 变更后：pre=0 post=1（恢复前）
-[6/8] 单用户模式恢复（REPLACE + RECOVERY），再回多用户 ... 恢复完成（636.6 ms）
+[6/8] 单用户模式恢复（REPLACE + RECOVERY），再回多用户 ... 恢复完成（597.2 ms）
   DBCC CHECKDB 无错误。
 [7/8] 恢复后断言 ...
   [PASS] pre_backup_marker_present：expected=1 actual=1
@@ -174,13 +177,26 @@ powershell -NoProfile -ExecutionPolicy Bypass -File traceflow/tools/trial/Backup
   [PASS] dbcc_checkdb_clean：expected=exit 0 actual=exit 0
   [PASS] backup_file_nonempty：expected=>0 actual=4575232
 [8/8] 写入实测 JSON ... 已写入：docs/delivery/backup-restore-drill.json
-[清理] 已删除演练库 TraceFlow_Trial_Drill_20261124034421
+[清理] 已删除演练库 TraceFlow_Trial_Drill_20261124040342
 [清理] 已删除备份文件 ...
 [drill] 结论 PASS：备份/恢复断言全部通过（引擎 15.0.2000.5）。
 ```
 
-**结果：8/8 断言通过；备份 4,575,232 字节（167.2 ms）、恢复 636.6 ms、`DBCC CHECKDB` 无错误、`schema_version` 9/9 `success=1`。
-演练库与 .bak 已清理，`sys.databases` 无 `TraceFlow_Trial_Drill_*` 残留。实测值见 `docs/delivery/backup-restore-drill.json`（`engineVerified2008R2=false`）。**
+**结果：8/8 断言通过；备份 4,575,232 字节（160.1 ms）、恢复 597.2 ms、`DBCC CHECKDB` 无错误、`schema_version` 9/9 `success=1`。
+演练库与 .bak 已清理，`sys.databases` 无 `TraceFlow_Trial_Drill_*` 残留。实测值见 `docs/delivery/backup-restore-drill.json`
+（`generatedAtUtc=2026-11-24T04:03:49.4162039Z`、`dbName=TraceFlow_Trial_Drill_20261124040342`、`engineVerified2008R2=false`）。**
+
+**重复 `-Stamp` 的拒绝（exit 2）已实测**：先用 `-Keep -Stamp 20261124050000` 保留演练库，再用同一 `-Stamp`
+不带 `-Keep` 重跑（`create-db` 幂等，不预检就会静默复用旧库）：
+
+```
+[2/8] 预检演练库是否已存在（DB_ID），再创建并执行迁移 0001-0009 ...
+[拒绝] 演练库已存在（-Stamp 重复）；拒绝复用/删除，请换 -Stamp 或先人工确认：TraceFlow_Trial_Drill_20261124050000
+[清理] 演练库未由本次运行创建，跳过删除。
+```
+
+进程退出码 **2**；`sys.databases` 中 `TraceFlow_Trial_Drill_20261124050000` 仍在（`MULTI_USER` / `ONLINE`，未被复用或删除），
+随后由人工用 OpsTool `drop-db ... --yes` 删除。
 
 ### 8. 导出/审计算子（AT-069 / AT-074）
 
@@ -244,6 +260,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File traceflow/tools/trial/Backup
 2. `OpsTool` 只接受 `TraceFlow_Trial_*` / `TraceFlow_Perf_*`；**生产库建库不受该白名单约束**，须 DBA 手工执行并记录。
 3. `DbMigrator` 本身不解析库名（无名称守卫），"只连 TraceFlow 目标库"是执行纪律；本任务已在 `deployment.md` 写明。
 4. 单门店 `Organization` 行由启动引导 `OrgBootstrap.EnsureAsync` 幂等补齐（`org_code='DEFAULT'`），
-   `ent_id`/`ref_ed_id` 仍须 DBA 直更（无 API）。
+   `ent_id`/`ref_ent_id` 仍须 DBA 直更（无 API）。
 5. 代码中 `Program.cs:11 UseWindowsService()`、`Program.cs:131 Cookie.SecurePolicy` 与 brief 引用一致；
    brief 中 `Program.cs:11` 的行号在 `deployment.md` 中按实际文件引用。

@@ -1,14 +1,14 @@
 {
-    "generatedAtUtc":  "2026-11-24T03:44:28.0151177Z",
+    "generatedAtUtc":  "2026-11-24T04:03:49.4162039Z",
     "serverVersion":  "Microsoft SQL Server 2019 (RTM) - 15.0.2000.5 (X64) (ProductVersion 15.0.2000.5)",
     "productVersion":  "15.0.2000.5",
     "engineVerified2008R2":  false,
-    "dbName":  "TraceFlow_Trial_Drill_20261124034421",
+    "dbName":  "TraceFlow_Trial_Drill_20261124040342",
     "databaseCreatedByRun":  true,
-    "backupPath":  "E:\\Viding\\Retail Trace Code\\traceflow\\tools\\trial\\.runtime\\TraceFlow_Trial_Drill_20261124034421.bak",
+    "backupPath":  "E:\\Viding\\Retail Trace Code\\traceflow\\tools\\trial\\.runtime\\TraceFlow_Trial_Drill_20261124040342.bak",
     "backupFileBytes":  4575232,
-    "backupDurationMs":  167.2,
-    "restoreDurationMs":  636.6,
+    "backupDurationMs":  160.1,
+    "restoreDurationMs":  597.2,
     "restoreVerified":  true,
     "backupVerifyOnlyOk":  true,
     "dbccCheckDbClean":  true,
@@ -80,9 +80,9 @@
                        "pass":  true
                    }
                ],
-    "backupOutput":  "已为数据库 \u0027TraceFlow_Trial_Drill_20261124034421\u0027，文件 \u0027TraceFlow_Trial_Drill_20261124034421\u0027 (位于文件 1 上)处理了 544 页。\n已为数据库 \u0027TraceFlow_Trial_Drill_20261124034421\u0027，文件 \u0027TraceFlow_Trial_Drill_20261124034421_log\u0027 (位于文件 1 上)处理了 2 页。\nBACKUP DATABASE 成功处理了 546 页，花费 0.044 秒(96.857 MB/秒)。",
+    "backupOutput":  "已为数据库 \u0027TraceFlow_Trial_Drill_20261124040342\u0027，文件 \u0027TraceFlow_Trial_Drill_20261124040342\u0027 (位于文件 1 上)处理了 544 页。\n已为数据库 \u0027TraceFlow_Trial_Drill_20261124040342\u0027，文件 \u0027TraceFlow_Trial_Drill_20261124040342_log\u0027 (位于文件 1 上)处理了 2 页。\nBACKUP DATABASE 成功处理了 546 页，花费 0.040 秒(106.542 MB/秒)。",
     "verifyOutput":  "文件 1 上的备份集有效。",
-    "restoreOutput":  "已为数据库 \u0027TraceFlow_Trial_Drill_20261124034421\u0027，文件 \u0027TraceFlow_Trial_Drill_20261124034421\u0027 (位于文件 1 上)处理了 544 页。\n已为数据库 \u0027TraceFlow_Trial_Drill_20261124034421\u0027，文件 \u0027TraceFlow_Trial_Drill_20261124034421_log\u0027 (位于文件 1 上)处理了 2 页。\nRESTORE DATABASE 成功处理了 546 页，花费 0.011 秒(387.428 MB/秒)。",
+    "restoreOutput":  "已为数据库 \u0027TraceFlow_Trial_Drill_20261124040342\u0027，文件 \u0027TraceFlow_Trial_Drill_20261124040342\u0027 (位于文件 1 上)处理了 544 页。\n已为数据库 \u0027TraceFlow_Trial_Drill_20261124040342\u0027，文件 \u0027TraceFlow_Trial_Drill_20261124040342_log\u0027 (位于文件 1 上)处理了 2 页。\nRESTORE DATABASE 成功处理了 546 页，花费 0.022 秒(193.714 MB/秒)。",
     "notes":  [
                   "本次演练在真实本机实例执行；若 productVersion 不是 10.50.x，则 SQL Server 2008 R2 未验证（AT-070 未完成），不构成 2008 R2 证据。",
                   "演练只覆盖数据库层备份/恢复（BACKUP COPY_ONLY + CHECKSUM / RESTORE VERIFYONLY / RESTORE WITH REPLACE, RECOVERY / DBCC CHECKDB）；未执行任何平台（G-TOP）调用。",
