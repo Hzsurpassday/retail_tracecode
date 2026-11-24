@@ -8,10 +8,10 @@ info:
     M0/M1 端点（/auth/*、/admin/*、/dashboard、/health、/products、/suppliers、/imports*、
     /product-mappings/*、/supplier-mappings/*、/products/{id}/trace-policy、/sync-jobs、
     /jobs/{id}、/audit-logs、/settings*）、M2 端点（/upstream-bills*、/inbounds*）与
-    M3 端点（/pos-sales*、/returns*、/upload-tasks*）与 M4 日对账端点
-    （/reconciliation-runs*、POST /reconciliation-differences/{id}/resolve）均按真实代码形状描述
+    M3 端点（/pos-sales*、/returns*、/upload-tasks*）与 M4 端点
+    （/reconciliation-runs*、POST /reconciliation-differences/{id}/resolve、GET /codes*）均按真实代码形状描述
     （traceflow/src/TraceFlow.Host/Endpoints/*.cs，以代码为准）。
-    x-phase 标注契约归属阶段：M0/M1/M2/M3 与上述 M4 对账端点为已实现；
+    x-phase 标注契约归属阶段：M0/M1/M2/M3 与上述 M4 端点为已实现；
     其余 x-phase: M4 条目仍为计划契约（未实现，不提供端点）。
     已认证请求的所有 /api 变更方法（POST/PUT/DELETE/PATCH）必须携带 X-CSRF-TOKEN 头
     （全局 antiforgery 中间件，AUTH-02）；/auth/login 与 /auth/logout 匿名可达但自行校验 CSRF。
@@ -1005,6 +1005,123 @@ components:
             resolvedBy: { type: string }
             resolvedAt: { type: string, format: date-time }
         requestId: { type: string }
+    CodeLedgerRow:
+      type: object
+      required: [code, codeRaw, format, firstSeenAt, firstEventAt, lastEventAt, eventCount, latestEventType, claimState, claimScope, billCode]
+      properties:
+        code: { type: string, description: code_normalized（BIN2 精确/前缀匹配列） }
+        codeRaw: { type: string, description: trace_code.code_raw }
+        format: { type: string, description: 码格式 token（如 S8P20） }
+        firstSeenAt: { type: string, format: date-time, description: trace_code.first_seen_at（UTC） }
+        firstEventAt: { type: string, format: date-time, description: 筛选后事件集合的最早 occurred_at（UTC） }
+        lastEventAt: { type: string, format: date-time, description: 筛选后事件集合的最晚 occurred_at（UTC） }
+        eventCount: { type: integer, description: 筛选后事件数 }
+        latestEventType: { type: string, nullable: true, enum: [PURCHASE_IN, SALE, CONSUMER_RETURN, PURCHASE_RETURN] }
+        claimState: { type: string, enum: [ACTIVE, RELEASED, NONE], description: 激活占用优先，否则曾释放，否则无占用 }
+        claimScope: { type: string, nullable: true, description: 当前展示占用的 event_scope }
+        billCode: { type: string, nullable: true, description: 激活占用任务任一 分片 bill_code（仅 ACTIVE；无则 null） }
+    CodeLedgerListResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [items, page, pageSize, total, env]
+          properties:
+            items: { type: array, items: { $ref: '#/components/schemas/CodeLedgerRow' } }
+            page: { type: integer }
+            pageSize: { type: integer }
+            total: { type: integer, description: 同过滤条件的独立 COUNT（无事件的码不计） }
+            env: { type: string, enum: [LIVE, MOCK], description: 实际查询环境 }
+        requestId: { type: string }
+    CodeLedgerDetailResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [code, events, claims, results, confirmations, relations]
+          properties:
+            code:
+              type: object
+              required: [code, codeRaw, format, firstSeenAt, env]
+              properties:
+                code: { type: string }
+                codeRaw: { type: string }
+                format: { type: string }
+                firstSeenAt: { type: string, format: date-time }
+                env: { type: string, enum: [LIVE, MOCK] }
+            events:
+              type: array
+              description: 升序 occurred_at,id；上限 500
+              items:
+                type: object
+                required: [eventId, eventType, direction, occurredAt, sourceLineId]
+                properties:
+                  eventId: { type: string, description: 内部事件 id（API-01 字符串） }
+                  eventType: { type: string, enum: [PURCHASE_IN, SALE, CONSUMER_RETURN, PURCHASE_RETURN] }
+                  direction: { type: string, enum: [IN, OUT] }
+                  occurredAt: { type: string, format: date-time }
+                  businessDatetime: { type: string, format: date-time, nullable: true }
+                  sourceSnapshotId: { type: integer, format: int64, nullable: true, description: JSON number（与 M2/M3 一致） }
+                  sourceLineId: { type: integer, format: int64, description: 0 = 外部证据事件（无本地来源行） }
+                  uploadTaskId: { type: integer, format: int64, nullable: true, description: JSON number }
+                  predecessorEventId: { type: string, nullable: true, description: 前序事件 id（字符串）；无则 null }
+            claims:
+              type: array
+              description: 升序 claimed_at；上限 200
+              items:
+                type: object
+                properties:
+                  claimState: { type: string, enum: [ACTIVE, RELEASED] }
+                  eventScope: { type: string }
+                  uploadTaskId: { type: integer, format: int64, nullable: true }
+                  claimedAt: { type: string, format: date-time }
+                  releasedAt: { type: string, format: date-time, nullable: true }
+                  releasedBy: { type: string, nullable: true }
+            results:
+              type: array
+              description: recorded_at DESC,id DESC；上限 200；不含 platform_evidence/raw_response
+              items:
+                type: object
+                required: [taskId, result, recordedAt]
+                properties:
+                  taskId: { type: string }
+                  result: { type: string, enum: [SUCCESS, FAILED, UNKNOWN] }
+                  reason: { type: string, nullable: true }
+                  recordedAt: { type: string, format: date-time }
+                  billCode: { type: string, description: 同 task+env 分片账单码 }
+                  partState: { type: string }
+                  taskState: { type: string }
+                  requestId: { type: string, nullable: true, description: upload_attempt.request_id }
+                  httpStatus: { type: integer, nullable: true }
+            confirmations:
+              type: array
+              description: 该码关联任务的 return_confirmation（同 env）；confirmed_at DESC；上限 50
+              items:
+                type: object
+                required: [taskId, decision, relationKind, confirmedBy, confirmedAt]
+                properties:
+                  taskId: { type: string }
+                  decision: { type: string, enum: [CONFIRMED, REJECTED] }
+                  relationKind: { type: string, enum: [SALE, PURCHASE_IN] }
+                  predecessorTaskId: { type: string, nullable: true }
+                  confirmedBy: { type: string }
+                  confirmedAt: { type: string, format: date-time }
+            relations:
+              type: object
+              required: [parents, children]
+              properties:
+                parents: { type: array, description: 本码为 child 的父码（上限 100）, items: { $ref: '#/components/schemas/CodeRelationRow' } }
+                children: { type: array, description: 本码为 parent 的子码（上限 100）, items: { $ref: '#/components/schemas/CodeRelationRow' } }
+        requestId: { type: string }
+    CodeRelationRow:
+      type: object
+      required: [code, relationSource, observedAt]
+      properties:
+        code: { type: string }
+        relationSource: { type: string }
+        observedAt: { type: string, format: date-time }
   responses:
     Unauthorized: { description: 未登录, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
     Forbidden: { description: 无权限, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
@@ -1512,6 +1629,37 @@ paths:
         '200': { description: 退货详情（计划）, content: { application/json: { schema: { type: object, properties: { data: { type: object }, requestId: { type: string } } } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+  /codes:
+    get:
+      x-phase: M4
+      description: 追溯码台账列表（权限 trace:read，逐请求校验，匿名 401；UI-08/DB-05）。只读：不存在任何改结果/释放占用入口（释放属 code:release）。基础集合 = 本 org+env 中满足 q/eventType/from/to 的 code_event 所属 distinct code_id；无事件的码不出现在列表。firstEventAt/lastEventAt/eventCount/latestEventType 均基于筛选后的事件集合；claimState=激活占用 ACTIVE → 否则曾释放 RELEASED → 否则 NONE；billCode 仅取激活占用任务的分片（无则 null）。排序 lastEventAt DESC, code_id DESC；分页 ROW_NUMBER 区间（2008 R2，无 OFFSET/FETCH）；total 为同过滤条件的独立 COUNT。
+      parameters:
+        - { $ref: '#/components/parameters/Page' }
+        - { name: pageSize, in: query, schema: { type: integer, minimum: 1, default: 50 }, description: '1..100；>100 收敛为 100' }
+        - { name: q, in: query, schema: { type: string, minLength: 4 }, description: '码前缀（code_normalized BIN2 前缀匹配，LIKE @prefix + ''%''）；长度 <4 → 400' }
+        - { name: eventType, in: query, schema: { type: string, enum: [PURCHASE_IN, SALE, CONSUMER_RETURN, PURCHASE_RETURN] }, description: '事件类型（非法值 400）' }
+        - { name: from, in: query, schema: { type: string }, description: 'code_event.occurred_at ≥ from；ISO-8601（仅日期按当日 0 点起）' }
+        - { name: to, in: query, schema: { type: string }, description: 'code_event.occurred_at ≤ to；仅日期按整日包含（转次日 0 点排他）' }
+        - { name: state, in: query, schema: { type: string, enum: [ACTIVE, RELEASED, NONE] }, description: '占用状态：ACTIVE=存在激活占用；RELEASED=无激活且曾释放；NONE=无任何占用（非法值 400）' }
+        - { name: env, in: query, schema: { type: string, enum: [LIVE, MOCK] }, description: 环境视图；缺省=当前宿主环境（非法值 400） }
+      responses:
+        '200': { description: 分页码台账, content: { application/json: { schema: { $ref: '#/components/schemas/CodeLedgerListResponse' } } } }
+        '400': { description: VALIDATION（page/pageSize/q 过短/eventType/state/from/to/env 非法）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /codes/{code}:
+    get:
+      x-phase: M4
+      description: 单码钻取（权限 trace:read；UI-08）。路径参数为码原文，URL 解码后与 trace_code.code_normalized 精确比较（BIN2）；仅当本 org+env 存在该码事件才可见，否则 404（只在 MOCK 有事件的码在 LIVE 视图 404）。events 升序 occurred_at,id（上限 500；sourceLineId=0 表示外部证据事件）；claims 升序 claimed_at（上限 200）；results 按 recorded_at DESC,id DESC（上限 200，JOIN 同 task+env 分片/任务/尝试，绝不返回 platform_evidence/raw_response）；confirmations 取该码关联任务（code_result.task_id ∪ code_event.upload_task_id）的退货确认，上限 50；relations 父/子码各上限 100。eventId/taskId 等对象标识为 JSON 字符串，sourceSnapshotId/uploadTaskId 为 JSON number（与 M2/M3 一致）。无任何写入口。
+      parameters:
+        - { name: code, in: path, required: true, schema: { type: string }, description: 码原文（解码后与 code_normalized 精确匹配） }
+        - { name: env, in: query, schema: { type: string, enum: [LIVE, MOCK] }, description: 环境视图；缺省=当前宿主环境（非法值 400） }
+      responses:
+        '200': { description: 码台账详情, content: { application/json: { schema: { $ref: '#/components/schemas/CodeLedgerDetailResponse' } } } }
+        '400': { description: VALIDATION（env 非法）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
   /verifications/{id}/recheck:
     post:
       x-phase: M4
@@ -1551,7 +1699,7 @@ paths:
   /trace-codes/{code}/events:
     get:
       x-phase: M4
-      description: 码事件链（权限 trace:read，DB-05/UI-08）。精确码（normalized）；授权后完整事件链与关联快照；一个码多事件合法，不仅显示最后状态。
+      description: '（计划契约，M4 Task 2 由 GET /codes/{code} 取代，未单独实现）码事件链（权限 trace:read，DB-05/UI-08）。交付形状见 /codes/{code} 的 events（升序 occurred_at,id，上限 500，含 direction/predecessorEventId/sourceLineId）。'
       parameters:
         - { name: code, in: path, required: true, schema: { type: string }, description: 规范化追溯码（精确匹配，字符串） }
         - { $ref: '#/components/parameters/Page' }

@@ -175,6 +175,7 @@ if (!workerOnly)
     app.MapOpsEndpoints(connectionString, env);
     app.MapInboundEndpoints(connectionString, env);
     app.MapSalesEndpoints(connectionString, env);
+    app.MapCodesEndpoints(connectionString, env);
     app.MapUploadEndpoints(connectionString, env);
     app.MapUpstreamEndpoints(connectionString, env);
     app.MapReconciliationEndpoints(connectionString, env);
