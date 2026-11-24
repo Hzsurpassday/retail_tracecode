@@ -17,8 +17,20 @@ public static class AdminInitializer
         Console.Write("再次输入: "); var p2 = ReadHidden();
         if (p1 != p2 || p1.Length < 10) { Console.Error.WriteLine("两次不一致或长度不足"); return 2; }
         var conn = config.GetConnectionString("TraceFlow")!;
+        return await CreateAsync(conn, username, p1);
+    }
+
+    /// <summary>
+    /// 非交互建管理员（OpsTool init-admin 复用）：同样的校验/权限/审计与错误码，仅去掉交互输入。
+    /// 失败原因写入 stderr，<b>绝不回显密码</b>。
+    /// </summary>
+    public static async Task<int> CreateAsync(string connectionString, string username, string password)
+    {
+        if (string.IsNullOrEmpty(username)) { Console.Error.WriteLine("用法: init-admin <username>"); return 2; }
+        if (username.Length > 64) { Console.Error.WriteLine("用户名不得超过 64 位"); return 2; }
+        if (password.Length < 10) { Console.Error.WriteLine("密码长度不足（≥10位）"); return 2; }
         var hasher = new PasswordHasher<string>();
-        await using var c = new SqlConnection(conn);
+        await using var c = new SqlConnection(connectionString);
         await c.OpenAsync();
         await using var tx = (SqlTransaction)await c.BeginTransactionAsync();
         long id;
@@ -26,7 +38,7 @@ public static class AdminInitializer
         {
             id = await c.ExecuteScalarAsync<long>(
                 "INSERT INTO dbo.app_user(username,display_name,password_hash) OUTPUT inserted.id VALUES(@u,@u,@h)",
-                new { u = username, h = hasher.HashPassword(username, p1) }, tx);
+                new { u = username, h = hasher.HashPassword(username, password) }, tx);
         }
         catch (SqlException ex) when (ex.Number is 2601 or 2627)
         {

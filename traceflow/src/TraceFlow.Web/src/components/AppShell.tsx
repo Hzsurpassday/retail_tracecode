@@ -12,9 +12,10 @@ const NAV = [
   { to: '/inbounds', label: '入库关联', ready: true },
   { to: '/sales', label: 'POS 销售', ready: true },
   { to: '/returns', label: '退货', ready: true },
-  { to: '/codes', label: '码台账', ready: false },
+  { to: '/codes', label: '码台账', ready: true },
   { to: '/uploads', label: '上传中心', ready: true },
-  { to: '/exceptions', label: '人工补配与异常', ready: false },
+  { to: '/ops', label: '作业状态', ready: true },
+  { to: '/exceptions', label: '人工补配与异常', ready: true },
   { to: '/settings', label: '设置', ready: true },
   { to: '/audit', label: '审计', ready: false },
 ];

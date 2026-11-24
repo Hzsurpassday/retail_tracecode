@@ -1,0 +1,92 @@
+{
+    "generatedAtUtc":  "2026-11-24T04:03:49.4162039Z",
+    "serverVersion":  "Microsoft SQL Server 2019 (RTM) - 15.0.2000.5 (X64) (ProductVersion 15.0.2000.5)",
+    "productVersion":  "15.0.2000.5",
+    "engineVerified2008R2":  false,
+    "dbName":  "TraceFlow_Trial_Drill_20261124040342",
+    "databaseCreatedByRun":  true,
+    "backupPath":  "E:\\Viding\\Retail Trace Code\\traceflow\\tools\\trial\\.runtime\\TraceFlow_Trial_Drill_20261124040342.bak",
+    "backupFileBytes":  4575232,
+    "backupDurationMs":  160.1,
+    "restoreDurationMs":  597.2,
+    "restoreVerified":  true,
+    "backupVerifyOnlyOk":  true,
+    "dbccCheckDbClean":  true,
+    "preMarkerRestored":  true,
+    "postMarkerAbsent":  true,
+    "organizationRestored":  true,
+    "preTaskId":  1,
+    "preOrgId":  1,
+    "preTaskRestored":  true,
+    "schemaVersions":  9,
+    "schemaVersionSuccess":  9,
+    "appliedMigrations":  9,
+    "elapsedSeconds":  6.9,
+    "checks":  [
+                   {
+                       "name":  "pre_backup_marker_present",
+                       "expected":  "1",
+                       "actual":  "1",
+                       "method":  "sqlcmd -h -1 -W COUNT(*) audit_log pre-backup",
+                       "pass":  true
+                   },
+                   {
+                       "name":  "post_backup_marker_absent",
+                       "expected":  "0",
+                       "actual":  "0",
+                       "method":  "sqlcmd -h -1 -W COUNT(*) audit_log post-backup",
+                       "pass":  true
+                   },
+                   {
+                       "name":  "organization_name_restored",
+                       "expected":  "MATCH",
+                       "actual":  "MATCH",
+                       "method":  "sqlcmd -h -1 -W organization.name = 演练门店",
+                       "pass":  true
+                   },
+                   {
+                       "name":  "upload_task_same_pre_id_present",
+                       "expected":  "1",
+                       "actual":  "1",
+                       "method":  "sqlcmd -h -1 -W COUNT(*) upload_task id=preTaskId",
+                       "pass":  true
+                   },
+                   {
+                       "name":  "schema_version_rows_and_success",
+                       "expected":  "9|9",
+                       "actual":  "9|9",
+                       "method":  "sqlcmd -h -1 -W COUNT(*)|SUM(success=1) schema_version",
+                       "pass":  true
+                   },
+                   {
+                       "name":  "restore_verifyonly_checksum",
+                       "expected":  "exit 0",
+                       "actual":  "exit 0",
+                       "method":  "sqlcmd -b RESTORE VERIFYONLY WITH CHECKSUM",
+                       "pass":  true
+                   },
+                   {
+                       "name":  "dbcc_checkdb_clean",
+                       "expected":  "exit 0",
+                       "actual":  "exit 0",
+                       "method":  "sqlcmd -b DBCC CHECKDB WITH NO_INFOMSGS",
+                       "pass":  true
+                   },
+                   {
+                       "name":  "backup_file_nonempty",
+                       "expected":  "\u003e0",
+                       "actual":  "4575232",
+                       "method":  "Get-Item Length",
+                       "pass":  true
+                   }
+               ],
+    "backupOutput":  "已为数据库 \u0027TraceFlow_Trial_Drill_20261124040342\u0027，文件 \u0027TraceFlow_Trial_Drill_20261124040342\u0027 (位于文件 1 上)处理了 544 页。\n已为数据库 \u0027TraceFlow_Trial_Drill_20261124040342\u0027，文件 \u0027TraceFlow_Trial_Drill_20261124040342_log\u0027 (位于文件 1 上)处理了 2 页。\nBACKUP DATABASE 成功处理了 546 页，花费 0.040 秒(106.542 MB/秒)。",
+    "verifyOutput":  "文件 1 上的备份集有效。",
+    "restoreOutput":  "已为数据库 \u0027TraceFlow_Trial_Drill_20261124040342\u0027，文件 \u0027TraceFlow_Trial_Drill_20261124040342\u0027 (位于文件 1 上)处理了 544 页。\n已为数据库 \u0027TraceFlow_Trial_Drill_20261124040342\u0027，文件 \u0027TraceFlow_Trial_Drill_20261124040342_log\u0027 (位于文件 1 上)处理了 2 页。\nRESTORE DATABASE 成功处理了 546 页，花费 0.022 秒(193.714 MB/秒)。",
+    "notes":  [
+                  "本次演练在真实本机实例执行；若 productVersion 不是 10.50.x，则 SQL Server 2008 R2 未验证（AT-070 未完成），不构成 2008 R2 证据。",
+                  "演练只覆盖数据库层备份/恢复（BACKUP COPY_ONLY + CHECKSUM / RESTORE VERIFYONLY / RESTORE WITH REPLACE, RECOVERY / DBCC CHECKDB）；未执行任何平台（G-TOP）调用。",
+                  "NFR-08 恢复后顺序（保持发送停止 -\u003e 先对账 -\u003e 修复差异/补录证据 -\u003e 再开放发送）需在目标环境按 docs/delivery/backup-restore.md 执行，脚本不覆盖该流程。",
+                  "LIVE 平台对账与真实事务未执行；G-TOP/G-ERP 未取证。"
+              ]
+}

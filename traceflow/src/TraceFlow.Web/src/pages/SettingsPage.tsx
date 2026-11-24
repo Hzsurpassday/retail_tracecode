@@ -2,23 +2,10 @@ import { useCallback, useEffect, useState, type CSSProperties } from 'react';
 import { api, ApiError } from '../api';
 import type { ConnectionTestResult, SettingView } from '../m1types';
 import type { ServiceAccount, TopBudgetView } from '../m2types';
+import { fmtShanghai } from '../utils/time';
 
 function idem(): Record<string, string> { return { 'Idempotency-Key': crypto.randomUUID() }; }
 function errMsg(e: unknown): string { return e instanceof ApiError ? `${e.code}: ${e.message}` : '网络错误'; }
-// 后端 datetime2 出网不带偏移量（"YYYY-MM-DDTHH:mm:ss"），故无偏移时显式按 UTC 解释，再转 Asia/Shanghai 显示
-const SHANGHAI = new Intl.DateTimeFormat('en-US', {
-  timeZone: 'Asia/Shanghai', hourCycle: 'h23',
-  year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
-});
-function fmt(d: string | null): string {
-  if (!d) return '—';
-  const iso = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(d) ? d : d.length === 10 ? `${d}T00:00:00Z` : `${d}Z`;
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) return d.replace('T', ' ').slice(0, 19);
-  const parts = SHANGHAI.formatToParts(new Date(t));
-  const part = (type: Intl.DateTimeFormatPartTypes): string => parts.find((p) => p.type === type)?.value ?? '';
-  return `${part('year')}-${part('month')}-${part('day')} ${part('hour')}:${part('minute')}:${part('second')}`;
-}
 // §4.7：限值 NULL=本地不设帽（与 T12 裁定一致），不虚构数字
 const limit = (n: number | null): string => (n === null ? '—（不设帽）' : String(n));
 
@@ -100,7 +87,7 @@ export default function SettingsPage() {
                   <td>{b.dayCount} / {limit(b.dayLimit)}</td>
                   <td>{b.minuteCount} / {limit(b.minuteLimit)}</td>
                   <td>{b.secondCount} / {limit(b.secondLimit)}</td>
-                  <td>{fmt(b.nextAllowedAtUtc)}</td>
+                  <td>{fmtShanghai(b.nextAllowedAtUtc)}</td>
                 </tr>
               ))}
             </tbody>
@@ -110,7 +97,7 @@ export default function SettingsPage() {
               <h4>生效中的授权暂停</h4>
               <ul>
                 {activePauses.map((p) => (
-                  <li key={p.id}>{p.scopeKey} · {p.reason} · {p.pausedBy} 于 {fmt(p.pausedAtUtc)}（恢复须管理员人工动作，M3 交付入口）</li>
+                  <li key={p.id}>{p.scopeKey} · {p.reason} · {p.pausedBy} 于 {fmtShanghai(p.pausedAtUtc)}（恢复须管理员人工动作，M3 交付入口）</li>
                 ))}
               </ul>
             </>
@@ -129,7 +116,7 @@ export default function SettingsPage() {
                   {s.isSecret ? (s.hasSecretValue ? '••••（已保存，只写）' : '（未设置）') : (s.valueJson ?? '（默认）')}
                 </td>
                 <td>{s.protectionScope ?? '—'}</td>
-                <td>{s.version}</td><td>{fmt(s.updatedAtUtc)}</td><td>{s.updatedBy ?? '—'}</td><td>{s.reason ?? '—'}</td>
+                <td>{s.version}</td><td>{fmtShanghai(s.updatedAtUtc)}</td><td>{s.updatedBy ?? '—'}</td><td>{s.reason ?? '—'}</td>
                 <td style={{ whiteSpace: 'nowrap' }}>
                   <button onClick={() => setEditTarget(s)}>编辑</button>{' '}
                   {s.key === 'erp.connection' && <button disabled={s.id === 0 || busyKey === s.key} onClick={() => void testConnection(s)}>连接测试</button>}{' '}

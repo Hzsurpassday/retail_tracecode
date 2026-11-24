@@ -2,6 +2,9 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties } from 're
 import { Link, useSearchParams } from 'react-router-dom';
 import { api, ApiError } from '../api';
 import EnvBadge from '../components/EnvBadge';
+import { useEscapeClose } from '../hooks/useEscapeClose';
+import { saleReasonZh } from '../utils/statusReason';
+import { fmtShanghai } from '../utils/time';
 
 interface ListPage<T> { items: T[]; page: number; pageSize: number; total: number }
 
@@ -39,20 +42,6 @@ interface SaleDetail {
 const PAGE_SIZE = 20;
 const ENV_OPTIONS = ['', 'MOCK', 'LIVE'];
 function errMsg(e: unknown): string { return e instanceof ApiError ? `${e.code}: ${e.message}` : '网络错误'; }
-// 后端 datetime2 出网不带偏移量，无偏移时按 UTC 解释，再转 Asia/Shanghai 显示（与既有页面一致）。
-const SHANGHAI = new Intl.DateTimeFormat('en-US', {
-  timeZone: 'Asia/Shanghai', hourCycle: 'h23',
-  year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
-});
-function fmtShanghai(d: string | null): string {
-  if (!d) return '—';
-  const iso = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(d) ? d : d.length === 10 ? `${d}T00:00:00Z` : `${d}Z`;
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) return d.replace('T', ' ').slice(0, 19);
-  const parts = SHANGHAI.formatToParts(new Date(t));
-  const part = (type: Intl.DateTimeFormatPartTypes): string => parts.find((p) => p.type === type)?.value ?? '';
-  return `${part('year')}-${part('month')}-${part('day')} ${part('hour')}:${part('minute')}:${part('second')}`;
-}
 
 // 核验/逐码状态与原因的中文映射：未知代码原样展示（绝不把 UNKNOWN 当成功）。
 const VERIFY_STATE_ZH: Record<string, string> = {
@@ -67,23 +56,7 @@ const TASK_STATE_ZH: Record<string, string> = {
   PartialSuccess: '部分成功', ResultUnresolved: '结果未决', Succeeded: '成功',
   Failed: '失败', ManualAction: '需人工核对', Cancelled: '已取消',
 };
-const REASON_ZH: Record<string, string> = {
-  PLATFORM_NOT_FOUND: '平台无此码', PLATFORM_REJECTED: '平台拒绝查询', PLATFORM_INSTORE: '平台在店',
-  PLATFORM_UNAVAILABLE: '平台不可用', WAIT_DEPENDENCY: '等待采购入库依赖',
-  DEPENDENCY_PURCHASE_IN_SUCCEEDED: '采购入库已成功', MISSING_CODE: '缺少追溯码',
-  CODE_FORMAT: '码格式错误', DUPLICATE_CODE: '码重复', UNKNOWN_CLASSIFICATION: '商品分类未知',
-  RETURN_CONFIRM_REQUIRED: '待首次人工确认', RETURN_CONFIRM_REJECTED: '人工确认已驳回',
-  RETURN_CONFIRM_REJECTED_SUPERSEDED: '驳回后被新快照撤销', RETURN_CONFIRMED: '已确认',
-  NO_UPLOADABLE_LINES: '无可上传行', VERIFY_CHANGED_AFTER_SEND: '发送后核验结果变更',
-  VERIFY_CHANGED_WHILE_DISPATCHING: '发送中核验结果变更', SALE_LINES_REMOVED: '销售行已移除',
-  RULE_VERSION_CHANGED: '规则版本变更', PREDECESSOR_MISSING: '缺少前序销售事件',
-  PREDECESSOR_AMBIGUOUS: '前序销售事件不唯一', ALREADY_RETURNED: '该码已退货',
-};
-function reasonZh(reason: string | null): string {
-  if (!reason) return '—';
-  if (reason.startsWith('VERIFY_FAILED:')) return `核验失败：${reason.slice('VERIFY_FAILED:'.length)}`;
-  return REASON_ZH[reason] ?? reason;
-}
+// 逐码核验的 FAILED 原因带 `VERIFY_FAILED:{明细}` 前缀：统一在 utils/statusReason 里展开为“核验失败：{明细}”。
 function stateZh(state: string | null, dict: Record<string, string>): string {
   if (!state) return '—';
   return dict[state] ?? state;
@@ -212,6 +185,8 @@ function SaleDetailDialog({ snapshotId, env, onClose }: {
   const [detail, setDetail] = useState<SaleDetail | null>(null);
   const [error, setError] = useState('');
   const [reloadKey, setReloadKey] = useState(0);
+  // 弹窗仅在打开时挂载：Esc 复用同一 onClose（父级只清 detail），不另造关闭路径。
+  useEscapeClose(true, onClose);
 
   useEffect(() => {
     let active = true;
@@ -250,7 +225,7 @@ function SaleDetailDialog({ snapshotId, env, onClose }: {
               <p>
                 核验结论：<strong>{stateZh(detail.verification.state, VERIFY_STATE_ZH)}</strong>
                 {' · 规则版本 '}{detail.verification.ruleVersion}
-                {detail.verification.verifyReason ? ` · 原因：${reasonZh(detail.verification.verifyReason)}` : ''}
+                {detail.verification.verifyReason ? ` · 原因：${saleReasonZh(detail.verification.verifyReason)}` : ''}
                 {detail.verification.failCode ? ` · 失败码：${detail.verification.failCode}` : ''}
                 {' · 核验时间 '}{fmtShanghai(detail.verification.verifiedAt)}
               </p>
@@ -264,7 +239,7 @@ function SaleDetailDialog({ snapshotId, env, onClose }: {
               <p>
                 上传任务：<Link to={`/uploads?taskId=${detail.task.taskId}`}>#{detail.task.taskId}</Link>
                 {' · '}{detail.task.taskType} · 状态 {stateZh(detail.task.state, TASK_STATE_ZH)}
-                {detail.task.stateReason ? `（${reasonZh(detail.task.stateReason)}）` : ''}
+                {detail.task.stateReason ? `（${saleReasonZh(detail.task.stateReason)}）` : ''}
               </p>
             ) : <p>尚无上传任务。</p>}
             <h4>单据行</h4>
@@ -292,7 +267,7 @@ function SaleDetailDialog({ snapshotId, env, onClose }: {
                     <tr key={c.codeId} style={{ background: c.result === 'UNKNOWN' ? '#fff3cd' : c.result === 'FAIL' ? '#f8d7da' : undefined }}>
                       <td style={{ fontFamily: 'monospace' }}>{c.codeNormalized}</td>
                       <td>{stateZh(c.result, CODE_RESULT_ZH)}</td>
-                      <td>{reasonZh(c.reason)}</td>
+                      <td>{saleReasonZh(c.reason)}</td>
                       <td>{c.sourceLineId}</td>
                       <td>{fmtShanghai(c.checkedAt)}</td>
                     </tr>

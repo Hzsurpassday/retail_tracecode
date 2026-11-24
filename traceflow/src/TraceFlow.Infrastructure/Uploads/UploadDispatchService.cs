@@ -47,41 +47,20 @@ public sealed class UploadDispatchService
     private readonly TopClientService _top;
     private readonly IJobQueue _queue;
     private readonly ISendRecoveryService _recovery;
+    /// <summary>故障注入观察者（仅测试构造注入；生产 DI 不注册，null = 无操作）。</summary>
+    private readonly IUploadDispatchObserver? _observer;
 
-    public UploadDispatchService(string connectionString, TopClientService top, IJobQueue queue, ISendRecoveryService recovery)
+    public UploadDispatchService(string connectionString, TopClientService top, IJobQueue queue,
+        ISendRecoveryService recovery, IUploadDispatchObserver? observer = null)
     {
         _conn = connectionString;
         _top = top;
         _queue = queue;
         _recovery = recovery;
+        _observer = observer;
     }
 
-    // ---------------------------------------------------------------- 故障注入钩子（仅测试可见）
-
-    /// <summary>
-    /// 故障注入钩子（internal，仅测试程序集可见）：在"尝试行已提交 + 分片已置 Dispatching"之后、
-    /// 调网关之前执行，用于模拟进程在此刻消失（请求从未发出）。生产路径从不赋值。
-    /// </summary>
-    internal Func<Task>? BeforeSend { get; set; }
-
-    /// <summary>
-    /// 故障注入钩子：网关调用已返回（含限流/暂停归一）之后、进入 T3 写回之前执行，
-    /// 用于模拟"请求可能已发出、回执尚未落库"的崩溃。生产路径从不赋值。
-    /// </summary>
-    internal Func<Task>? AfterSend { get; set; }
-
-    /// <summary>
-    /// 故障注入钩子：T3 内回执/状态已写入事务、但提交之前执行；抛出的异常令整个 T3 回滚，
-    /// 使尝试行保持未收尾（模拟提交前进程消失）。生产路径从不赋值。
-    /// 注意：钩子在 T3 尚未提交的事务内触发；钩子实现不得在另一连接上读取或等待同一任务/分片行，
-    /// 否则会与事务内尚未释放的写锁互相等待。
-    /// </summary>
-    internal Func<Task>? BeforeCommit { get; set; }
-
-    private static async Task RunHookAsync(Func<Task>? hook)
-    {
-        if (hook is not null) await hook();
-    }
+    // ---------------------------------------------------------------- 故障注入窄缝（仅测试注入）
 
     /// <summary>发送一个分片。任何异常都不得在此吞掉（尤其网关/未取证异常）。</summary>
     public async Task<DispatchOutcome> DispatchAsync(long partId, string workerId, long fencingToken, CancellationToken ct)
@@ -99,7 +78,7 @@ public sealed class UploadDispatchService
         var claim = await OpenAttemptAsync(head, workerId, fencingToken, ct);
         if (claim is null) return DispatchOutcome.StaleRejected;
 
-        await RunHookAsync(BeforeSend); // 仅测试注入：此刻崩溃 = 尝试行已落、请求未发出
+        await (_observer?.BeforeSendAsync(ct) ?? Task.CompletedTask); // 仅测试注入：此刻崩溃 = 尝试行已落、请求未发出
 
         TopOutcome outcome;
         try
@@ -117,7 +96,7 @@ public sealed class UploadDispatchService
             outcome = new TopOutcome(TopOutcomeKind.AuthError, null, null, ex.Message, null, null, null);
         }
 
-        await RunHookAsync(AfterSend); // 仅测试注入：此刻崩溃 = 请求可能已发出、回执未落库
+        await (_observer?.AfterSendAsync(ct) ?? Task.CompletedTask); // 仅测试注入：此刻崩溃 = 请求可能已发出、回执未落库
 
         return await ApplyReceiptAsync(new AttemptReceipt(claim.Value.AttemptId, partId, head.TaskId, head.Env,
             workerId, fencingToken, outcome, HttpStatusFor(outcome.Kind)), ct);
@@ -214,7 +193,10 @@ WHERE job_kind=N'upload-dispatch' AND intent_key=@intent AND job_state=N'RUNNING
                     error = ErrorKind(receipt.Outcome.Kind) + ": " + (receipt.Outcome.Message ?? ""),
                 }, tx, cancellationToken: ct));
 
-        await RunHookAsync(BeforeCommit); // 仅测试注入：此刻崩溃 = 回执已写入事务但未提交，整个 T3 回滚
+        // 仅测试注入：此刻崩溃 = 回执已写入事务但未提交，整个 T3 回滚。
+        // 注意：观察者在 T3 尚未提交的事务内触发；实现不得在另一连接上读取或等待同一任务/分片行，
+        // 否则会与事务内尚未释放的写锁互相等待。
+        await (_observer?.BeforeCommitAsync(ct) ?? Task.CompletedTask);
         await tx.CommitAsync(ct);
         return mapped.Outcome;
     }

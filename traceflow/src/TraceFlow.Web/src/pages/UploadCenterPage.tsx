@@ -2,6 +2,9 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties } from 're
 import { Link, useSearchParams } from 'react-router-dom';
 import { api, ApiError } from '../api';
 import EnvBadge from '../components/EnvBadge';
+import { useEscapeClose } from '../hooks/useEscapeClose';
+import { reasonZh } from '../utils/statusReason';
+import { fmtShanghai } from '../utils/time';
 
 interface ListPage<T> { items: T[]; page: number; pageSize: number; total: number }
 
@@ -58,40 +61,10 @@ const CODE_RESULT_ZH: Record<string, string> = { SUCCESS: '成功', FAILED: '失
 const VERIFY_STATE_ZH: Record<string, string> = {
   PASSED: '核验通过', FAILED: '核验失败', UNRESOLVED: '核验未决', WAIT_RETRY: '等待重试',
 };
-const REASON_ZH: Record<string, string> = {
-  PLATFORM_NOT_FOUND: '平台无此码', PLATFORM_REJECTED: '平台拒绝', VERIFY_CHANGED_AFTER_SEND: '发送后核验变更',
-  VERIFY_CHANGED_WHILE_DISPATCHING: '发送中核验变更', NO_UPLOADABLE_LINES: '无可上传行',
-  RETURN_CONFIRM_REQUIRED: '待首次人工确认', RETURN_CONFIRM_REJECTED: '人工确认已驳回',
-  RETURN_CONFIRM_REJECTED_SUPERSEDED: '驳回后被新快照撤销', RETURN_CONFIRMED: '已确认',
-  SALE_LINES_REMOVED: '销售行已移除', RETURN_LINES_REMOVED: '退货行已移除',
-  RULE_VERSION_CHANGED: '规则版本变更', WAIT_DEPENDENCY: '等待采购入库依赖',
-  PREDECESSOR_MISSING: '缺少前序销售事件', PREDECESSOR_AMBIGUOUS: '前序销售事件不唯一',
-  ALREADY_RETURNED: '该码已退货',
-  // 平台/投递侧状态原因：未知值保留原文（绝不臆造中文含义）。
-  PARTIAL_ACCEPTED: '部分受理', DELIVERY_FAILED: '投递失败', MANUAL_REQUIRED: '需人工处置',
-  PLATFORM_ACCEPTED: '平台已受理', ACCEPTANCE_UNKNOWN: '受理未知', RESULT_UNRESOLVED: '结果未决',
-};
-function reasonZh(reason: string | null): string {
-  if (!reason) return '—';
-  return REASON_ZH[reason] ?? reason;
-}
 const RETRY_BLOCK_REASON = '受控重试通道未取证（top.retryPathCertified=false），禁止重发；请等待回查或联系平台';
 // 在途发送（RETRY_IN_FLIGHT）：发送结果未知时只能走发送恢复→受理未知→回查，UI 只提示等待。
 const RETRY_IN_FLIGHT_REASON = '存在在途发送作业，待其结束后再重试';
 function errMsg(e: unknown): string { return e instanceof ApiError ? `${e.code}: ${e.message}` : '网络错误'; }
-const SHANGHAI = new Intl.DateTimeFormat('en-US', {
-  timeZone: 'Asia/Shanghai', hourCycle: 'h23',
-  year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
-});
-function fmtShanghai(d: string | null): string {
-  if (!d) return '—';
-  const iso = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(d) ? d : d.length === 10 ? `${d}T00:00:00Z` : `${d}Z`;
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) return d.replace('T', ' ').slice(0, 19);
-  const parts = SHANGHAI.formatToParts(new Date(t));
-  const part = (type: Intl.DateTimeFormatPartTypes): string => parts.find((p) => p.type === type)?.value ?? '';
-  return `${part('year')}-${part('month')}-${part('day')} ${part('hour')}:${part('minute')}:${part('second')}`;
-}
 
 export default function UploadCenterPage() {
   const [env, setEnv] = useState('');
@@ -114,9 +87,12 @@ export default function UploadCenterPage() {
     return () => { active = false; };
   }, []);
 
-  // 销售页“任务链接”钻取：/uploads?taskId=xxx 直接打开抽屉。
+  // 销售页/异常队列“任务链接”钻取：/uploads?taskId=xxx[&env=LIVE|MOCK] 直接按对应环境打开抽屉。
+  // env 必须带入筛选，否则跨环境 id 会按宿主环境详情 404（M4 Task 3 深链）。
   useEffect(() => {
     const fromQuery = searchParams.get('taskId');
+    const fromEnv = searchParams.get('env');
+    if (fromEnv === 'LIVE' || fromEnv === 'MOCK') setEnvFilter(fromEnv);
     if (fromQuery) setOpenId(fromQuery);
     // 仅首次读入查询参数；后续由本地状态控制。
   }, []);
@@ -250,6 +226,8 @@ function UploadDrawer({ taskId, envFilter, hostEnv, onClose, onChanged }: {
   // 幂等键按「一次提交」轮换：失败重试沿用同一 key（网络重试不会重复提交），
   // 成功后立刻换新 key，避免同一 Failed 视图里再次点击时服务端重放旧 200 响应。
   const [retryKey, setRetryKey] = useState(() => crypto.randomUUID());
+  // 抽屉仅在打开时挂载：Esc 复用同一 closeDrawer（清 openId 并移除 ?taskId），不另造关闭路径。
+  useEscapeClose(true, onClose);
 
   useEffect(() => {
     let active = true;

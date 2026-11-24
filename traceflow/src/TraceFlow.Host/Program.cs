@@ -87,6 +87,13 @@ builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Uploads.BillQue
     sp.GetRequiredService<IAuditLog>()));
 builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Jobs.BillQueryJobHandler(
     sp.GetRequiredService<TraceFlow.Infrastructure.Uploads.BillQueryService>(), connectionString));
+// 日对账（REC-01/02/03）：服务 + 作业处理器 + 调度器。未注册处理器则 recon:run 作业会永久 PENDING。
+builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Reconciliation.ReconciliationService(
+    connectionString, sp.GetRequiredService<IAuditLog>()));
+builder.Services.AddSingleton<IJobHandler>(sp => new TraceFlow.Infrastructure.Reconciliation.ReconciliationJobHandler(
+    sp.GetRequiredService<TraceFlow.Infrastructure.Reconciliation.ReconciliationService>()));
+builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Reconciliation.ReconciliationScheduler(
+    connectionString, sp.GetRequiredService<IJobQueue>(), sp.GetRequiredService<IAuditLog>()));
 builder.Services.AddSingleton(sp => new TraceFlow.Infrastructure.Upstream.UpstreamDownloadService(
     connectionString, sp.GetRequiredService<TraceFlow.Infrastructure.Top.TopClientService>(),
     sp.GetRequiredService<IJobQueue>(), sp.GetRequiredService<IAuditLog>()));
@@ -166,10 +173,15 @@ if (!workerOnly)
     app.MapImportEndpoints(connectionString, env);
     app.MapMasterEndpoints(connectionString);
     app.MapOpsEndpoints(connectionString, env);
+    app.MapOpsStatusEndpoints(connectionString, env);
     app.MapInboundEndpoints(connectionString, env);
     app.MapSalesEndpoints(connectionString, env);
+    app.MapCodesEndpoints(connectionString, env);
     app.MapUploadEndpoints(connectionString, env);
     app.MapUpstreamEndpoints(connectionString, env);
+    app.MapReconciliationEndpoints(connectionString, env);
+    app.MapExportEndpoints(connectionString, env);
+    app.MapExceptionsEndpoints(connectionString, env);
     app.MapDashboardEndpoints(connectionString, env);
     app.MapHealthEndpoints(connectionString, env);
     app.MapFallbackToFile("index.html");

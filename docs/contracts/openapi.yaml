@@ -8,9 +8,14 @@ info:
     M0/M1 端点（/auth/*、/admin/*、/dashboard、/health、/products、/suppliers、/imports*、
     /product-mappings/*、/supplier-mappings/*、/products/{id}/trace-policy、/sync-jobs、
     /jobs/{id}、/audit-logs、/settings*）、M2 端点（/upstream-bills*、/inbounds*）与
-    M3 端点（/pos-sales*、/returns*、/upload-tasks*）均按真实代码形状描述
+    M3 端点（/pos-sales*、/returns*、/upload-tasks*）与 M4 端点
+    （/reconciliation-runs*、POST /reconciliation-differences/{id}/resolve、GET /codes*、
+    GET /exceptions*、POST /exceptions/{category}/{id}/resolve、GET /ops/metrics、GET /ops/jobs、
+    GET /ops/alerts、GET /exports/codes.csv、GET /exports/reconciliation-runs/{id}/differences.csv、
+    GET /exports/audit-logs.csv）均按真实代码形状描述
     （traceflow/src/TraceFlow.Host/Endpoints/*.cs，以代码为准）。
-    x-phase 标注契约归属阶段：M0/M1/M2/M3 为已实现；M4 为计划契约（未实现，不提供端点）。
+    x-phase 标注契约归属阶段：M0/M1/M2/M3 与上述 M4 端点为已实现；
+    其余 x-phase: M4 条目为未实现（本阶段不交付，不提供端点）。
     已认证请求的所有 /api 变更方法（POST/PUT/DELETE/PATCH）必须携带 X-CSRF-TOKEN 头
     （全局 antiforgery 中间件，AUTH-02）；/auth/login 与 /auth/logout 匿名可达但自行校验 CSRF。
     失败统一 code/message/fieldErrors/retryable/requestId；401 未登录、403 无权、
@@ -168,6 +173,25 @@ components:
             pendingJobs: { type: integer, description: 当前 env 下 outbox_job PENDING 计数 }
             uploadTasksByState: { type: object, additionalProperties: { type: integer }, description: 当前 env 下 upload_task 按 state 分组计数 }
             lastActivityUtc: { type: string, format: date-time, nullable: true, description: audit_log 最近 occurred_at（UTC） }
+            queue:
+              type: object
+              description: M4 Task 5 增量：待办队列计数，与 /exceptions counts 同谓词（INGEST 按 org；RECON/TASK 按宿主 env；MAPPING 两表 CONFLICT）
+              properties:
+                ingestOpen: { type: integer }
+                reconOpen: { type: integer }
+                taskOpen: { type: integer }
+                mappingOpen: { type: integer }
+            openDifferences: { type: integer, description: 同 queue.reconOpen（宿主 env 的 OPEN 对账差异全量计数） }
+            failedJobs24h: { type: integer, description: 当前 env 下 finished_at>=now-24h 的 FAILED 作业数 }
+            activePauses: { type: integer, description: 当前 env 下 top_channel_pause is_active=1 行数 }
+            alertsCount: { type: integer, description: 与 GET /ops/alerts 的 alerts 条数同源（同一派生加载器） }
+            todayUploads:
+              type: object
+              description: 今日（Asia/Shanghai 00:00 起，换算为 UTC 参数）新建 upload_task 口径
+              properties:
+                total: { type: integer, description: 今日新建任务数（全部状态） }
+                succeeded: { type: integer, description: 今日新建且 state=Succeeded 的任务数 }
+                successRate: { type: number, nullable: true, description: 'succeeded/(succeeded+failed)，保留 4 位小数；分母 0 → null（前端显示"—"）' }
         requestId: { type: string }
     HealthResponse:
       type: object
@@ -215,7 +239,7 @@ components:
       properties:
         windowStart: { type: string, format: date-time }
         windowEnd: { type: string, format: date-time }
-        businessType: { type: string, description: 业务类型（有界枚举） }
+        businessType: { type: string, enum: [SALE, RETURN], description: 业务类型（有界枚举，大小写敏感） }
     ConnectionTestRequest:
       type: object
       required: [configId]
@@ -589,10 +613,14 @@ components:
             intentKey: { type: string }
             jobState: { type: string, enum: [PENDING, RUNNING, DONE, FAILED, CANCELLED] }
             attemptCount: { type: integer }
+            maxAttempts: { type: integer, description: 'M4 Task 5 增量：outbox_job.max_attempts' }
             nextRunAtUtc: { type: string, format: date-time }
             lastError: { type: string, nullable: true }
             leaseOwner: { type: string, nullable: true }
             fencingToken: { type: integer, format: int64, description: 'JSON number（int64 内部代理；API-01 字符串约定仅适用外部平台 ID/rowversion，裁决 #9）' }
+            env: { type: string, enum: [LIVE, MOCK], description: 'M4 Task 5 增量：作业所属环境' }
+            createdAtUtc: { type: string, format: date-time, description: 'M4 Task 5 增量：outbox_job.created_at' }
+            finishedAtUtc: { type: string, format: date-time, nullable: true, description: 'M4 Task 5 增量：outbox_job.finished_at（未结束为 null）' }
         requestId: { type: string }
     # ---- M3 已实现端点真实响应形状（T10 回写；以 SalesEndpoints.cs / UploadEndpoints.cs 为准） ----
     PosSalesRow:
@@ -924,6 +952,393 @@ components:
             retryAllowed: { type: boolean, description: 恒 true（在途发送已在写入前 409 RETRY_IN_FLIGHT 拒绝） }
             jobsReset: { type: integer, description: 复位/新建的 upload-dispatch 作业数 }
             partIds: { type: array, items: { type: string }, description: 被复核的 Failed 分片（成功分片绝不重发） }
+        requestId: { type: string }
+    # ---- M4 日对账已实现端点真实响应形状（REC-01/02/03） ----
+    ReconciliationRunListResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [items, page, pageSize, total]
+          properties:
+            items: { type: array, items: { $ref: '#/components/schemas/ReconciliationRunRow' } }
+            page: { type: integer }
+            pageSize: { type: integer }
+            total: { type: integer }
+        requestId: { type: string }
+    ReconciliationRunRow:
+      type: object
+      required: [runId, windowStart, windowEnd, businessType, status, differenceCount]
+      properties:
+        runId: { type: string, description: 'reconciliation_run.id 字符串' }
+        windowStart: { type: string, format: date-time }
+        windowEnd: { type: string, format: date-time }
+        businessType: { type: string, enum: [SALE, RETURN] }
+        status: { type: string, enum: [RUNNING, COMPLETE, INCOMPLETE] }
+        startedAt: { type: string, format: date-time }
+        finishedAt: { type: string, format: date-time, nullable: true }
+        differenceCount: { type: integer, description: 差异总数（OPEN+RESOLVED） }
+    ReconciliationRunDetailResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [run, differences]
+          properties:
+            run:
+              allOf:
+                - { $ref: '#/components/schemas/ReconciliationRunRow' }
+                - type: object
+                  properties:
+                    env: { type: string, description: 'LIVE 或 MOCK（宿主环境）' }
+                    localSummary: { type: object, nullable: true, description: '本地侧汇总：documents/saleLines/codes/tasks/parts/succeeded/failed/partial/unknown' }
+                    platformSummary: { type: object, nullable: true, description: '平台侧汇总（仅由持久化上传证据计算）：partsByState/succeededParts/failedParts/partialParts/unresolvedParts/unavailable/unavailableReason' }
+            differences: { type: array, items: { $ref: '#/components/schemas/ReconciliationDifferenceRow' } }
+        requestId: { type: string }
+    ReconciliationDifferenceRow:
+      type: object
+      required: [differenceId, diffType, severity, objectRef, status]
+      properties:
+        differenceId: { type: string }
+        diffType: { type: string, description: '11 种差异类型之一' }
+        severity: { type: string, enum: [HIGH, MEDIUM] }
+        objectRef: { type: string, description: 对象引用（注明层级；≤200 字符） }
+        status: { type: string, enum: [OPEN, RESOLVED] }
+        ownerRole: { type: string }
+        nextAction: { type: string }
+        foundAt: { type: string, format: date-time }
+        evidence: { type: object, nullable: true, description: '证据（请求号/HTTP 状态/计数等；不含密钥与原始平台响应）' }
+        resolutionEvidence: { type: string, nullable: true }
+        resolvedBy: { type: string, nullable: true }
+        resolvedAt: { type: string, format: date-time, nullable: true }
+    ReconciliationResolveRequest:
+      type: object
+      required: [resolutionEvidence]
+      properties:
+        resolutionEvidence: { type: string, description: '处置留证，必填且 ≤4000 字符' }
+    ReconciliationResolveResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [differenceId, status, resolvedBy, resolvedAt]
+          properties:
+            differenceId: { type: string }
+            status: { type: string, enum: [RESOLVED] }
+            resolvedBy: { type: string }
+            resolvedAt: { type: string, format: date-time }
+        requestId: { type: string }
+    CodeLedgerRow:
+      type: object
+      required: [code, codeRaw, format, firstSeenAt, firstEventAt, lastEventAt, eventCount, latestEventType, claimState, claimScope, billCode]
+      properties:
+        code: { type: string, description: code_normalized（BIN2 精确/前缀匹配列） }
+        codeRaw: { type: string, description: trace_code.code_raw }
+        format: { type: string, description: 码格式 token（如 S8P20） }
+        firstSeenAt: { type: string, format: date-time, description: trace_code.first_seen_at（UTC） }
+        firstEventAt: { type: string, format: date-time, description: 筛选后事件集合的最早 occurred_at（UTC） }
+        lastEventAt: { type: string, format: date-time, description: 筛选后事件集合的最晚 occurred_at（UTC） }
+        eventCount: { type: integer, description: 筛选后事件数 }
+        latestEventType: { type: string, nullable: true, enum: [PURCHASE_IN, SALE, CONSUMER_RETURN, PURCHASE_RETURN] }
+        claimState: { type: string, enum: [ACTIVE, RELEASED, NONE], description: 激活占用优先，否则曾释放，否则无占用 }
+        claimScope: { type: string, nullable: true, description: 当前展示占用的 event_scope }
+        billCode: { type: string, nullable: true, description: 激活占用任务任一 分片 bill_code（仅 ACTIVE；无则 null） }
+    CodeLedgerListResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [items, page, pageSize, total, env]
+          properties:
+            items: { type: array, items: { $ref: '#/components/schemas/CodeLedgerRow' } }
+            page: { type: integer }
+            pageSize: { type: integer }
+            total: { type: integer, description: 同过滤条件的独立 COUNT（无事件的码不计） }
+            env: { type: string, enum: [LIVE, MOCK], description: 实际查询环境 }
+        requestId: { type: string }
+    CodeLedgerDetailResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [code, events, claims, results, confirmations, relations]
+          properties:
+            code:
+              type: object
+              required: [code, codeRaw, format, firstSeenAt, env]
+              properties:
+                code: { type: string }
+                codeRaw: { type: string }
+                format: { type: string }
+                firstSeenAt: { type: string, format: date-time }
+                env: { type: string, enum: [LIVE, MOCK] }
+            events:
+              type: array
+              description: 升序 occurred_at,id；上限 500
+              items:
+                type: object
+                required: [eventId, eventType, direction, occurredAt, sourceLineId]
+                properties:
+                  eventId: { type: string, description: 内部事件 id（API-01 字符串） }
+                  eventType: { type: string, enum: [PURCHASE_IN, SALE, CONSUMER_RETURN, PURCHASE_RETURN] }
+                  direction: { type: string, enum: [IN, OUT] }
+                  occurredAt: { type: string, format: date-time }
+                  businessDatetime: { type: string, format: date-time, nullable: true }
+                  sourceSnapshotId: { type: integer, format: int64, nullable: true, description: JSON number（与 M2/M3 一致） }
+                  sourceLineId: { type: integer, format: int64, description: 0 = 外部证据事件（无本地来源行） }
+                  uploadTaskId: { type: integer, format: int64, nullable: true, description: JSON number }
+                  predecessorEventId: { type: string, nullable: true, description: 前序事件 id（字符串）；无则 null }
+            claims:
+              type: array
+              description: 升序 claimed_at；上限 200
+              items:
+                type: object
+                properties:
+                  claimState: { type: string, enum: [ACTIVE, RELEASED] }
+                  eventScope: { type: string }
+                  uploadTaskId: { type: integer, format: int64, nullable: true }
+                  claimedAt: { type: string, format: date-time }
+                  releasedAt: { type: string, format: date-time, nullable: true }
+                  releasedBy: { type: string, nullable: true }
+            results:
+              type: array
+              description: recorded_at DESC,id DESC；上限 200；不含 platform_evidence/raw_response
+              items:
+                type: object
+                required: [taskId, result, recordedAt]
+                properties:
+                  taskId: { type: string }
+                  result: { type: string, enum: [SUCCESS, FAILED, UNKNOWN] }
+                  reason: { type: string, nullable: true }
+                  recordedAt: { type: string, format: date-time }
+                  billCode: { type: string, description: 同 task+env 分片账单码 }
+                  partState: { type: string }
+                  taskState: { type: string }
+                  requestId: { type: string, nullable: true, description: upload_attempt.request_id }
+                  httpStatus: { type: integer, nullable: true }
+            confirmations:
+              type: array
+              description: 该码关联任务的 return_confirmation（同 env）；confirmed_at DESC；上限 50
+              items:
+                type: object
+                required: [taskId, decision, relationKind, confirmedBy, confirmedAt]
+                properties:
+                  taskId: { type: string }
+                  decision: { type: string, enum: [CONFIRMED, REJECTED] }
+                  relationKind: { type: string, enum: [SALE, PURCHASE_IN] }
+                  predecessorTaskId: { type: string, nullable: true }
+                  confirmedBy: { type: string }
+                  confirmedAt: { type: string, format: date-time }
+            relations:
+              type: object
+              required: [parents, children]
+              properties:
+                parents: { type: array, description: 本码为 child 的父码（上限 100）, items: { $ref: '#/components/schemas/CodeRelationRow' } }
+                children: { type: array, description: 本码为 parent 的子码（上限 100）, items: { $ref: '#/components/schemas/CodeRelationRow' } }
+        requestId: { type: string }
+    CodeRelationRow:
+      type: object
+      required: [code, relationSource, observedAt]
+      properties:
+        code: { type: string }
+        relationSource: { type: string }
+        observedAt: { type: string, format: date-time }
+    # ---- M4 统一异常队列（spec §4.2） ----
+    ExceptionQueueItem:
+      type: object
+      required: [category, id, status, title, detailSnippet, createdAt]
+      properties:
+        category: { type: string, enum: [INGEST, RECON, TASK, MAPPING] }
+        id: { type: string, description: '类内唯一键：INGEST/RECON/TASK 为十进制 id；MAPPING 为 product:{product_mapping.id} 或 supplier:{supplier_mapping.id}' }
+        status: { type: string, enum: [OPEN, RESOLVED], description: 'TASK/MAPPING 恒 OPEN' }
+        title: { type: string, description: 'INGEST=exception_type；RECON=diff_type；TASK=state；MAPPING=商品映射冲突/供应商映射冲突' }
+        detailSnippet: { type: string, maxLength: 200, description: '去敏原文截断（≤200）：INGEST=detail、RECON=next_action、TASK=state_reason、MAPPING=名称' }
+        objectRef: { type: string, nullable: true, description: 'INGEST=source_document_key；RECON=object_ref；TASK=event_key；MAPPING=spid/dwbh' }
+        createdAt: { type: string, format: date-time, nullable: true, description: 'RECON=found_at；TASK=created_at；MAPPING=product.updated_at（供应商映射无时间列 → null，不臆造）' }
+        env: { type: string, nullable: true, description: 'RECON/TASK 为行 env；INGEST/MAPPING 恒 null' }
+        deepLink: { type: string, nullable: true, description: 'INGEST=/imports；TASK=/uploads?taskId={id}&env={env}；MAPPING=/products 或 /suppliers；RECON=null（详情抽屉即解决面）' }
+    ExceptionQueueCounts:
+      type: object
+      required: [ingestOpen, reconOpen, taskOpen, mappingOpen]
+      properties:
+        ingestOpen: { type: integer, description: 全量 OPEN 计数（不受分页与 status 过滤影响） }
+        reconOpen: { type: integer, description: 宿主 env 作用域内 OPEN 差异数 }
+        taskOpen: { type: integer, description: 'ManualAction/ResultUnresolved/AcceptanceUnknown，宿主 env 作用域' }
+        mappingOpen: { type: integer, description: 'product_mapping + supplier_mapping 的 CONFLICT 数' }
+    ExceptionQueueListResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [items, counts, page, pageSize, total, env]
+          properties:
+            items: { type: array, items: { $ref: '#/components/schemas/ExceptionQueueItem' } }
+            counts: { $ref: '#/components/schemas/ExceptionQueueCounts' }
+            page: { type: integer }
+            pageSize: { type: integer }
+            total: { type: integer }
+            env: { type: string, enum: [LIVE, MOCK], description: 列表作用环境（仅 RECON/TASK 受影响） }
+        requestId: { type: string }
+    ExceptionQueueDetailResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [item, detail]
+          properties:
+            item: { $ref: '#/components/schemas/ExceptionQueueItem' }
+            detail:
+              type: object
+              description: '按类别：INGEST {detailText≤4000, resolutionEvidence, resolvedBy/resolvedAt}；RECON {diffType,severity,objectRef,ownerRole,nextAction,evidence(解析 JSON) 或 evidenceText(超长/非 JSON 时纯文本≤4000),resolutionEvidence 或 resolutionEvidenceText,run{runId,env,windowStart,windowEnd,businessType,status,startedAt,finishedAt}}；TASK {state,stateReason,taskType,eventKey,env,createdAt,version,attempts[≤5]{attemptKind,attemptNo,httpStatus,requestId,startedAt,finishedAt}}（绝不含 raw_response）；MAPPING {side,local,platform,mapping,evidence 或 evidenceText≤4000}'
+        requestId: { type: string }
+    ExceptionResolveRequest:
+      type: object
+      required: [resolutionEvidence]
+      properties:
+        resolutionEvidence: { type: string, description: '留证，必填且 ≤4000 字符' }
+    ExceptionResolveResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [category, id, status, resolvedAt]
+          properties:
+            category: { type: string, enum: [INGEST, RECON] }
+            id: { type: string }
+            status: { type: string, enum: [RESOLVED] }
+            resolvedAt: { type: string, format: date-time }
+        requestId: { type: string }
+    # ---- M4 Task 5 可观测性只读面（以 OpsStatusEndpoints.cs 为准） ----
+    OpsMetricsResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [env, jobs, attempts24h, uploadsToday, perJobKind, rateBudget, pauses, leaseRecoveries24h, recon]
+          properties:
+            env: { type: string, enum: [LIVE, MOCK] }
+            jobs:
+              type: object
+              properties:
+                pending: { type: integer }
+                running: { type: integer }
+                done: { type: integer }
+                failed: { type: integer }
+                cancelled: { type: integer }
+                backlog: { type: integer, description: 等于 pending }
+                oldestPendingAgeSeconds: { type: integer, description: 'PENDING 最小 next_run_at 距 now 的秒数；未来时间或空闲 → 0' }
+                failureRate24h: { type: number, nullable: true, description: 'finished_at>=now-24h 的 FAILED/(DONE+FAILED)，保留 4 位小数；分母 0 → null' }
+            attempts24h:
+              type: object
+              properties:
+                upload: { type: integer, description: 'upload_attempt.attempt_kind=UPLOAD 且 started_at>=now-24h' }
+                query: { type: integer, description: 'upload_attempt.attempt_kind=QUERY 且 started_at>=now-24h' }
+            uploadsToday:
+              type: object
+              properties:
+                total: { type: integer }
+                succeeded: { type: integer }
+                failed: { type: integer }
+                successRate: { type: number, nullable: true, description: 'succeeded/(succeeded+failed)；分母 0 → null' }
+            perJobKind:
+              type: array
+              items:
+                type: object
+                properties:
+                  jobKind: { type: string }
+                  backlog: { type: integer, description: 该类型 PENDING 数 }
+                  lastDoneAtUtc: { type: string, format: date-time, nullable: true, description: 该类型最近 DONE 的 finished_at }
+            rateBudget:
+              type: array
+              description: 本 env 全部行原样回显；limit 为 null 表示本地未设帽（前端显示"未取证"），不计算/不虚构限值
+              items:
+                type: object
+                properties:
+                  budgetKey: { type: string }
+                  dayCount: { type: integer }
+                  dayLimit: { type: integer, nullable: true }
+                  minuteCount: { type: integer }
+                  minuteLimit: { type: integer, nullable: true }
+                  secondCount: { type: integer }
+                  secondLimit: { type: integer, nullable: true }
+                  nextAllowedAtUtc: { type: string, format: date-time, nullable: true }
+            pauses:
+              type: array
+              description: top_channel_pause is_active=1（本 env），按 scope_key 升序
+              items:
+                type: object
+                properties:
+                  scopeKey: { type: string }
+                  reason: { type: string }
+                  pausedAtUtc: { type: string, format: date-time }
+                  pausedBy: { type: string }
+            leaseRecoveries24h: { type: integer, description: 'audit_log action=job.lease.recovered 且 env=宿主 env、occurred_at>=now-24h（回收审计按作业 env 落库）' }
+            recon:
+              type: object
+              properties:
+                incomplete24h: { type: integer, description: 本 env 且 started_at>=now-24h 的 INCOMPLETE 运行数 }
+                openDifferences: { type: integer, description: 本 env 的 OPEN 差异全量计数（不限时间） }
+        requestId: { type: string }
+    OpsJobsResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [items, page, pageSize, total, env]
+          properties:
+            items:
+              type: array
+              items:
+                type: object
+                required: [jobId, jobKind, jobState, attemptCount, maxAttempts, createdAtUtc]
+                properties:
+                  jobId: { type: string, description: outbox_job.id（本地 int64 以字符串返回） }
+                  jobKind: { type: string }
+                  jobState: { type: string, enum: [PENDING, RUNNING, DONE, FAILED, CANCELLED] }
+                  attemptCount: { type: integer }
+                  maxAttempts: { type: integer }
+                  nextRunAtUtc: { type: string, format: date-time }
+                  lastError: { type: string, nullable: true, description: 'LEFT(last_error,200)' }
+                  createdAtUtc: { type: string, format: date-time }
+                  finishedAtUtc: { type: string, format: date-time, nullable: true }
+            page: { type: integer }
+            pageSize: { type: integer }
+            total: { type: integer }
+            env: { type: string, enum: [LIVE, MOCK] }
+        requestId: { type: string }
+    OpsAlert:
+      type: object
+      required: [code, severity, title, detail, count, deepLink]
+      properties:
+        code: { type: string, enum: [CHANNEL_PAUSED, LEASE_RECOVERED_24H, JOB_BACKLOG_HIGH, JOBS_FAILED_24H, RECON_INCOMPLETE_24H, RECON_DIFFERENCES_OPEN, RATE_BUDGET_WAITING] }
+        severity: { type: string, enum: [HIGH, MEDIUM] }
+        title: { type: string }
+        detail: { type: string, description: 站内可读说明（时间按 Asia/Shanghai 标注），不含密钥/原始平台响应 }
+        count: { type: integer }
+        deepLink: { type: string, description: '站内可达面（如 /ops、/ops?state=FAILED、/audit、/exceptions?category=RECON）' }
+    OpsAlertsResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [env, alerts]
+          properties:
+            env: { type: string, enum: [LIVE, MOCK] }
+            alerts:
+              type: array
+              description: 无告警 → 空数组（不返回"一切正常"伪告警）
+              items: { $ref: '#/components/schemas/OpsAlert' }
         requestId: { type: string }
   responses:
     Unauthorized: { description: 未登录, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
@@ -1426,16 +1841,47 @@ paths:
   /returns/{id}:
     get:
       x-phase: M4
-      description: '（M3 未实现，计划契约）退货任务详情（权限：登录）。M3 的退货展示由 GET /returns 列表（含 predecessorCandidates）与 GET /pos-sales/{id} 销售钻取覆盖；独立退货详情端点留待 M4。'
+      description: '（M3 未实现，计划契约）退货任务详情（权限：登录）。M3 的退货展示由 GET /returns 列表（含 predecessorCandidates）与 GET /pos-sales/{id} 销售钻取覆盖；独立退货详情端点 M4 亦未交付（当前无实现）。'
       parameters: [{ $ref: '#/components/parameters/ResourceId' }]
       responses:
         '200': { description: 退货详情（计划）, content: { application/json: { schema: { type: object, properties: { data: { type: object }, requestId: { type: string } } } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+  /codes:
+    get:
+      x-phase: M4
+      description: 追溯码台账列表（权限 trace:read，逐请求校验，匿名 401；UI-08/DB-05）。只读：不存在任何改结果/释放占用入口（释放属 code:release）。基础集合 = 本 org+env 中满足 q/eventType/from/to 的 code_event 所属 distinct code_id；无事件的码不出现在列表。firstEventAt/lastEventAt/eventCount/latestEventType 均基于筛选后的事件集合；claimState=激活占用 ACTIVE → 否则曾释放 RELEASED → 否则 NONE；billCode 仅取激活占用任务的分片（无则 null）。排序 lastEventAt DESC, code_id DESC；分页 ROW_NUMBER 区间（2008 R2，无 OFFSET/FETCH）；total 为同过滤条件的独立 COUNT。
+      parameters:
+        - { $ref: '#/components/parameters/Page' }
+        - { name: pageSize, in: query, schema: { type: integer, minimum: 1, default: 50 }, description: '1..100；>100 收敛为 100' }
+        - { name: q, in: query, schema: { type: string, minLength: 4 }, description: '码前缀（code_normalized BIN2 前缀匹配，LIKE @prefix + ''%''）；长度 <4 → 400' }
+        - { name: eventType, in: query, schema: { type: string, enum: [PURCHASE_IN, SALE, CONSUMER_RETURN, PURCHASE_RETURN] }, description: '事件类型（非法值 400）' }
+        - { name: from, in: query, schema: { type: string }, description: 'code_event.occurred_at ≥ from；ISO-8601（仅日期按当日 0 点起）' }
+        - { name: to, in: query, schema: { type: string }, description: 'code_event.occurred_at ≤ to；仅日期按整日包含（转次日 0 点排他）' }
+        - { name: state, in: query, schema: { type: string, enum: [ACTIVE, RELEASED, NONE] }, description: '占用状态：ACTIVE=存在激活占用；RELEASED=无激活且曾释放；NONE=无任何占用（非法值 400）' }
+        - { name: env, in: query, schema: { type: string, enum: [LIVE, MOCK] }, description: 环境视图；缺省=当前宿主环境（非法值 400） }
+      responses:
+        '200': { description: 分页码台账, content: { application/json: { schema: { $ref: '#/components/schemas/CodeLedgerListResponse' } } } }
+        '400': { description: VALIDATION（page/pageSize/q 过短/eventType/state/from/to/env 非法）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /codes/{code}:
+    get:
+      x-phase: M4
+      description: 单码钻取（权限 trace:read；UI-08）。路径参数为码原文，URL 解码后与 trace_code.code_normalized 精确比较（BIN2）；仅当本 org+env 存在该码事件才可见，否则 404（只在 MOCK 有事件的码在 LIVE 视图 404）。events 升序 occurred_at,id（上限 500；sourceLineId=0 表示外部证据事件）；claims 升序 claimed_at（上限 200）；results 按 recorded_at DESC,id DESC（上限 200，JOIN 同 task+env 分片/任务/尝试，绝不返回 platform_evidence/raw_response）；confirmations 取该码关联任务（code_result.task_id ∪ code_event.upload_task_id）的退货确认，上限 50；relations 父/子码各上限 100。eventId/taskId 等对象标识为 JSON 字符串，sourceSnapshotId/uploadTaskId 为 JSON number（与 M2/M3 一致）。无任何写入口。
+      parameters:
+        - { name: code, in: path, required: true, schema: { type: string }, description: 码原文（解码后与 code_normalized 精确匹配） }
+        - { name: env, in: query, schema: { type: string, enum: [LIVE, MOCK] }, description: 环境视图；缺省=当前宿主环境（非法值 400） }
+      responses:
+        '200': { description: 码台账详情, content: { application/json: { schema: { $ref: '#/components/schemas/CodeLedgerDetailResponse' } } } }
+        '400': { description: VALIDATION（env 非法）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
   /verifications/{id}/recheck:
     post:
       x-phase: M4
-      description: '（M3 未实现，计划契约）重新核验（权限 upload:query，SALE-02）。M3 的核验由 sale-verify 作业（COMPLETE 快照入队）与 SyncScheduler 兜底自动触发；人工重核入口留待 M4。'
+      description: '（M3 未实现，计划契约）重新核验（权限 upload:query，SALE-02）。核验由 sale-verify 作业（COMPLETE 快照入队）与 SyncScheduler 兜底自动触发；未实现：本阶段不交付（回查/核验由作业自动完成）。'
       parameters:
         - { $ref: '#/components/parameters/ResourceId' }
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -1471,7 +1917,7 @@ paths:
   /trace-codes/{code}/events:
     get:
       x-phase: M4
-      description: 码事件链（权限 trace:read，DB-05/UI-08）。精确码（normalized）；授权后完整事件链与关联快照；一个码多事件合法，不仅显示最后状态。
+      description: '（计划契约，M4 Task 2 由 GET /codes/{code} 取代，未单独实现）码事件链（权限 trace:read，DB-05/UI-08）。交付形状见 /codes/{code} 的 events（升序 occurred_at,id，上限 500，含 direction/predecessorEventId/sourceLineId）。'
       parameters:
         - { name: code, in: path, required: true, schema: { type: string }, description: 规范化追溯码（精确匹配，字符串） }
         - { $ref: '#/components/parameters/Page' }
@@ -1549,7 +1995,7 @@ paths:
   /upload-tasks/{id}/query:
     post:
       x-phase: M4
-      description: '（M3 未实现，计划契约）手动状态回查（权限 upload:query，IDEM-04/05）。M3 的回查由 bill-query 作业（发送/核对后入队 + query:scan 兜底）自动执行，无手动入口；端点留待 M4。'
+      description: '（M3 未实现，计划契约）手动状态回查（权限 upload:query，IDEM-04/05）。回查由 bill-query 作业（发送/核对后入队 + query:scan 兜底）自动执行，无手动入口；未实现：本阶段不交付（回查/核验由作业自动完成）。'
       parameters:
         - { $ref: '#/components/parameters/ResourceId' }
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -1567,7 +2013,7 @@ paths:
   /upload-tasks/{id}/retry:
     post:
       x-phase: M4
-      description: '（M3 未实现，计划契约）通用重试。M3 只提供受控重试 POST /upload-tasks/{id}/controlled-retry（合同门禁 fail-closed）；不提供绕过门禁的通用重发入口，本端点仅为 M4 预留，当前无实现且不得用于生产。'
+      description: '（M3 未实现，计划契约）通用重试。M3 只提供受控重试 POST /upload-tasks/{id}/controlled-retry（合同门禁 fail-closed）；不提供绕过门禁的通用重发入口，本端点 M4 亦未实现，且不得用于生产。'
       parameters:
         - { $ref: '#/components/parameters/ResourceId' }
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -1585,7 +2031,7 @@ paths:
   /reconciliation-runs:
     post:
       x-phase: M4
-      description: 触发日对账（权限 system:manage 或 audit:read 按配置，REC-01/03）。日期窗+业务类型有界参数；202 入队；持久差异结果；统计口径未核对时 INCOMPLETE 不显示"无差异"。
+      description: 触发日对账（权限 system:manage，REC-01/03）。日期窗+业务类型有界参数；Idempotency-Key 控制重复提交；202 入队，作业按窗口粒度与业务类型去重（intent recon:run:{yyyyMMddHHmm}:{businessType}）。对账仅基于已持久化上传证据计算（不调用 TOP）；存在非终态分片时 run 状态 INCOMPLETE，不得显示"无差异"。触发审计 env=LIVE（控制面人工动作）。
       parameters:
         - { $ref: '#/components/parameters/IdempotencyKey' }
         - { $ref: '#/components/parameters/CsrfToken' }
@@ -1598,7 +2044,51 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
-        '422': { $ref: '#/components/responses/Unprocessable' }
+        '422': { description: 'VALIDATION（windowStart/windowEnd/businessType 非法或参数越界）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    get:
+      x-phase: M4
+      description: 对账运行列表（权限 audit:read，REC-02）。按宿主环境过滤（env 为宿主口径，不接受跨环境查询）；ROW_NUMBER 区间分页（pageSize 上限 100，默认 20，排序 started_at DESC, id DESC）；每行附差异总数（OPEN+RESOLVED）。
+      parameters:
+        - { $ref: '#/components/parameters/Page' }
+        - { name: pageSize, in: query, schema: { type: integer, minimum: 1, default: 20 }, description: '1..100；>100 收敛为 100' }
+        - { name: status, in: query, schema: { type: string, enum: [RUNNING, COMPLETE, INCOMPLETE] }, description: '非法值 422 VALIDATION（大小写敏感）' }
+        - { name: from, in: query, schema: { type: string }, description: 'ISO-8601；过滤 window_start >= from（非法值 400）' }
+        - { name: to, in: query, schema: { type: string }, description: 'ISO-8601；过滤 window_start < to（非法值 400）' }
+      responses:
+        '200': { description: 分页对账运行, content: { application/json: { schema: { $ref: '#/components/schemas/ReconciliationRunListResponse' } } } }
+        '400': { description: 'VALIDATION（page/pageSize/from/to 非法）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { description: VALIDATION（status 非法）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /reconciliation-runs/{id}:
+    get:
+      x-phase: M4
+      description: 对账运行详情（权限 audit:read，REC-02）。含本地/平台侧汇总 JSON 与差异明细（最多 2000 条，按 found_at, id 排序；differenceCount 为总数）。平台侧仅由已持久化上传证据计算；存在非终态分片时 platformSummary.unavailable=true 且给出原因，不得解读为"平台无记录"。跨环境/不存在均 404。
+      parameters: [{ $ref: '#/components/parameters/ResourceId' }]
+      responses:
+        '200': { description: 对账运行详情, content: { application/json: { schema: { $ref: '#/components/schemas/ReconciliationRunDetailResponse' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /reconciliation-differences/{id}/resolve:
+    post:
+      x-phase: M4
+      description: 处置对账差异（权限 system:manage，REC-03）。仅 OPEN→RESOLVED；resolutionEvidence 必填（≤4000 字符）；已处置重复提交返回 409 DIFFERENCE_ALREADY_RESOLVED；跨环境/不存在 404。审计动作 recon.difference.resolved，env=LIVE（控制面人工动作），actor=当前用户。
+      parameters:
+        - { $ref: '#/components/parameters/ResourceId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ReconciliationResolveRequest' } } }
+      responses:
+        '200': { description: 差异已处置, content: { application/json: { schema: { $ref: '#/components/schemas/ReconciliationResolveResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: DIFFERENCE_ALREADY_RESOLVED, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: 'VALIDATION（resolutionEvidence 为空或超长）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
   /jobs/{id}:
     get:
       x-phase: M1
@@ -1623,6 +2113,49 @@ paths:
         '200': { description: 分页审计记录, content: { application/json: { schema: { $ref: '#/components/schemas/PageMeta' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+  /exports/codes.csv:
+    get:
+      x-phase: M4
+      description: '码台账 CSV 导出（权限 data:export，DEF-07/AT-074）。参数与 /codes 一致（q/eventType/from/to/state/env），与列表同一聚合口径与排序（lastEventAt DESC, code_id DESC），不分页全量流式输出。响应 text/csv; charset=utf-8，正文以 UTF-8 BOM 开头、行尾 CRLF；文本单元格一律双引号包裹、内部引号双写，首字符为 = + - @ / TAB / CR 的文本前置单引号防公式注入，事件数走数值列不加前缀；时间列为 UTC ISO（yyyy-MM-ddTHH:mm:ss.fffZ）。列：码,格式,最近事件类型,事件数,最近事件时间,占用状态,占用范围,单号。单次上限 50,000 行，预计超限 → 422 EXPORT_TOO_LARGE（写任何字节前拒绝）。成功导出写审计 data.exported（env 恒 LIVE，object_type=export，object_id=codes）。流式写 Response.Body，不落临时文件；GET 无需 CSRF。'
+      parameters:
+        - { name: q, in: query, schema: { type: string, minLength: 4 }, description: '码前缀（长度 <4 → 400）' }
+        - { name: eventType, in: query, schema: { type: string, enum: [PURCHASE_IN, SALE, CONSUMER_RETURN, PURCHASE_RETURN] }, description: '事件类型（非法值 400）' }
+        - { name: from, in: query, schema: { type: string }, description: 'ISO-8601；code_event.occurred_at >= from' }
+        - { name: to, in: query, schema: { type: string }, description: 'ISO-8601；仅日期按整日包含' }
+        - { name: state, in: query, schema: { type: string, enum: [ACTIVE, RELEASED, NONE] }, description: '占用状态（非法值 400）' }
+        - { name: env, in: query, schema: { type: string, enum: [LIVE, MOCK] }, description: 环境视图；缺省=当前宿主环境（非法值 400） }
+      responses:
+        '200': { description: 'CSV 附件（Content-Disposition: attachment; filename="codes-yyyyMMddHHmmss.csv"）', content: { text/csv: { schema: { type: string } } } }
+        '400': { description: VALIDATION（q 过短/eventType/state/from/to/env 非法）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { description: 'EXPORT_TOO_LARGE（超过 50,000 行）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /exports/reconciliation-runs/{id}/differences.csv:
+    get:
+      x-phase: M4
+      description: '对账单差异 CSV 导出（权限 data:export，DEF-07/AT-074）。按宿主 env 定界：run.env 必须等于宿主 env，跨环境/不存在一律 404（不暴露另一环境的 run 是否存在）。列：差异类型,严重级,对象,状态,责任角色,下一步,发现时间(UTC ISO),解决证据,解决人,解决时间(UTC ISO)；按 found_at, id 升序；排除 evidence_json（原始证据不外泄）。CSV 规则同上（BOM/CRLF/防公式注入/上限 50,000 行 → 422 EXPORT_TOO_LARGE）。成功导出写审计 data.exported（env 恒 LIVE，object_type=export，object_id=reconciliation-run-{id}-differences）。'
+      parameters: [{ $ref: '#/components/parameters/ResourceId' }]
+      responses:
+        '200': { description: 'CSV 附件（Content-Disposition: attachment; filename="reconciliation-run-{id}-differences-yyyyMMddHHmmss.csv"）', content: { text/csv: { schema: { type: string } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { description: 'EXPORT_TOO_LARGE（超过 50,000 行）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /exports/audit-logs.csv:
+    get:
+      x-phase: M4
+      description: '审计日志 CSV 导出（权限 audit:export，DEF-07/AT-074）。参数与 /audit-logs 一致（action/objectType/objectId/dateStart/dateEnd；全量导出不分页）。列：时间(UTC ISO),环境,操作人,动作,对象类型,对象ID,原因,变更前,变更后；before_digest/after_digest 原样文本经 CSV 防注入处理；按 occurred_at DESC, id DESC；上限 50,000 行 → 422 EXPORT_TOO_LARGE。成功导出写审计 data.exported（env 恒 LIVE，object_type=export，object_id=audit-logs）。'
+      parameters:
+        - { name: action, in: query, schema: { type: string } }
+        - { name: objectType, in: query, schema: { type: string } }
+        - { name: objectId, in: query, schema: { type: string } }
+        - { name: dateStart, in: query, schema: { type: string, format: date } }
+        - { name: dateEnd, in: query, schema: { type: string, format: date } }
+      responses:
+        '200': { description: 'CSV 附件（Content-Disposition: attachment; filename="audit-logs-yyyyMMddHHmmss.csv"）', content: { text/csv: { schema: { type: string } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { description: 'EXPORT_TOO_LARGE（超过 50,000 行）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
   /settings/connections/test:
     post:
       x-phase: M1
@@ -1669,5 +2202,124 @@ paths:
       description: 限流预算用量与授权暂停只读视图（权限 system:manage，§4.7/JOB-03/05）。限值 null=本地不设帽；暂停恢复须人工动作（M3 交付入口）。
       responses:
         '200': { description: 预算与暂停, content: { application/json: { schema: { $ref: '#/components/schemas/TopBudgetsResponse' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  # ================= M4 统一异常队列（spec §4.2） =================
+  /exceptions:
+    get:
+      x-phase: M4
+      description: >
+        统一异常队列（权限 trace:read）。四类聚合：INGEST=ingest_exception（无 env，org 作用域）；
+        RECON=reconciliation_difference JOIN reconciliation_run（env=run.env）；TASK=upload_task 的
+        ManualAction/ResultUnresolved/AcceptanceUnknown（恒 OPEN）；MAPPING=product_mapping/supplier_mapping
+        的 CONFLICT（恒 OPEN）。UNION ALL 后按 createdAt DESC（NULL 置后）、category、id 排序，
+        ROW_NUMBER 区间分页（2008 R2）。counts 为全量 OPEN 计数：不受分页与 status 过滤影响；
+        RECON/TASK 受 env 定界，INGEST/MAPPING 无 env。只读，无副作用。
+      parameters:
+        - { name: category, in: query, schema: { type: string, enum: [INGEST, RECON, TASK, MAPPING] }, description: '非法值 400 VALIDATION（大小写不敏感）' }
+        - { name: status, in: query, schema: { type: string, enum: [OPEN, RESOLVED], default: OPEN }, description: 'TASK/MAPPING 只有 OPEN，RESOLVED 过滤自然为空' }
+        - { $ref: '#/components/parameters/Page' }
+        - { name: pageSize, in: query, schema: { type: integer, minimum: 1, default: 50 }, description: '1..100；>100 收敛为 100' }
+        - { name: env, in: query, schema: { type: string, enum: [LIVE, MOCK] }, description: '仅影响 RECON/TASK；默认宿主 env；非法值 400' }
+      responses:
+        '200': { description: 统一队列分页, content: { application/json: { schema: { $ref: '#/components/schemas/ExceptionQueueListResponse' } } } }
+        '400': { description: 'VALIDATION（category/status/env/page/pageSize 非法）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /exceptions/{category}/{id}:
+    get:
+      x-phase: M4
+      description: >
+        统一队列详情（权限 trace:read）。item 与列表同一行形状；detail 按类别：INGEST 完整 detail（≤4000）；
+        RECON evidence/resolutionEvidence 解析 JSON（超长或非 JSON 时改以 evidenceText 纯文本 ≤4000，截断不产生
+        非法 JSON）+ run 窗口/类型/状态；TASK state/stateReason/taskType/eventKey 与最近 5 次 upload_attempt
+        （attempt_kind/attempt_no/http_status/request_id/started_at/finished_at，不含 raw_response）；
+        MAPPING 本地与平台身份并排 + evidence_json（≤4000）。404 规则：INGEST 按 org；RECON 按 org+宿主 env
+        （跨 env 404）；TASK 按 org+env；MAPPING 仅 state=CONFLICT（已非冲突 → 404）。category 非法 400。
+        任何原始平台响应/密钥不入响应。
+      parameters:
+        - { name: category, in: path, required: true, schema: { type: string, enum: [INGEST, RECON, TASK, MAPPING] } }
+        - { name: id, in: path, required: true, schema: { type: string }, description: 'INGEST/RECON/TASK 十进制 id；MAPPING 为 product:{id} 或 supplier:{id}' }
+        - { name: env, in: query, schema: { type: string, enum: [LIVE, MOCK] }, description: 'RECON/TASK 详情环境；默认宿主 env' }
+      responses:
+        '200': { description: 队列项详情, content: { application/json: { schema: { $ref: '#/components/schemas/ExceptionQueueDetailResponse' } } } }
+        '400': { description: 'VALIDATION（category 非法或 env 非法）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /exceptions/{category}/{id}/resolve:
+    post:
+      x-phase: M4
+      description: >
+        留证关闭（权限 system:manage）。仅 INGEST/RECON 可在此解析：resolutionEvidence 非空且 ≤4000；
+        仅 OPEN→RESOLVED。INGEST 不存在 404、已解决 409 ALREADY_RESOLVED；RECON 与
+        /reconciliation-differences/{id}/resolve 同语义（宿主 env 定界，跨 env 404；已解决 409
+        DIFFERENCE_ALREADY_RESOLVED）。TASK/MAPPING → 422 NOT_RESOLVABLE_VIA_QUEUE，fieldErrors 附 deepLink
+        （处置仍在既有页面）。审计 exception.resolved：object_type=ingest_exception/reconciliation_difference，
+        env=LIVE（控制面人工动作），reason=证据摘要（≤200）。CSRF 与 Idempotency-Key 必填（幂等执行器包裹）。
+      parameters:
+        - { name: category, in: path, required: true, schema: { type: string, enum: [INGEST, RECON, TASK, MAPPING] } }
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: env, in: query, schema: { type: string, enum: [LIVE, MOCK] }, description: '仅用于 TASK 不可解析时的 deepLink 环境；RECON 解析恒按宿主 env' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ExceptionResolveRequest' } } }
+      responses:
+        '200': { description: 已留证关闭, content: { application/json: { schema: { $ref: '#/components/schemas/ExceptionResolveResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: 'ALREADY_RESOLVED / DIFFERENCE_ALREADY_RESOLVED', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: 'VALIDATION（证据为空/超长）或 NOT_RESOLVABLE_VIA_QUEUE（TASK/MAPPING，fieldErrors 附 deepLink）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  # ================= M4 Task 5 可观测性（NFR-06 / UI-01 闭环） =================
+  /ops/metrics:
+    get:
+      x-phase: M4
+      description: >
+        管道健康指标（权限 trace:read；匿名 401）。env 恒为宿主 env（不接受跨 env 查询）。
+        只读：不写库、不发平台外呼。口径：jobs 按 outbox_job 状态分组；oldestPendingAgeSeconds=PENDING 最小
+        next_run_at 距 now 秒数（未来/空闲→0）；failureRate24h=finished_at>=now-24h 的 FAILED/(DONE+FAILED)，
+        分母 0→null；attempts24h 按 upload_attempt.started_at 与 attempt_kind；uploadsToday 按
+        upload_task.created_at>=上海今日 00:00（TimeZoneInfo "China Standard Time" 换算为 UTC 参数），
+        successRate=succeeded/(succeeded+failed)，分母 0→null；rateBudget 原样回显（limit null=未取证）；
+        pauses=is_active=1；leaseRecoveries24h=audit_log action='job.lease.recovered' 且 env 匹配、
+        occurred_at>=now-24h（回收审计按作业 env 落库）；recon.incomplete24h=本 env INCOMPLETE 且
+        started_at>=now-24h，recon.openDifferences=本 env OPEN 差异全量计数。2008 R2 语法。
+      responses:
+        '200': { description: 指标快照, content: { application/json: { schema: { $ref: '#/components/schemas/OpsMetricsResponse' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /ops/jobs:
+    get:
+      x-phase: M4
+      description: >
+        作业状态列表（权限 trace:read；匿名 401）。宿主 env 定界；state 可选（枚举校验，非法 400 VALIDATION）、
+        kind 可选（等值）；ROW_NUMBER 区间分页（2008 R2），排序 created_at DESC, id DESC；pageSize 默认 50、上限 100；
+        lastError 截断到 200 字符。只读。
+      parameters:
+        - { name: state, in: query, schema: { type: string, enum: [PENDING, RUNNING, DONE, FAILED, CANCELLED] }, description: '非法值 400' }
+        - { name: kind, in: query, schema: { type: string }, description: 'job_kind 精确等值' }
+        - { $ref: '#/components/parameters/Page' }
+        - { name: pageSize, in: query, schema: { type: integer, minimum: 1, default: 50 }, description: '1..100；>100 收敛为 100' }
+      responses:
+        '200': { description: 作业分页, content: { application/json: { schema: { $ref: '#/components/schemas/OpsJobsResponse' } } } }
+        '400': { description: 'VALIDATION（state/page/pageSize 非法）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /ops/alerts:
+    get:
+      x-phase: M4
+      description: >
+        派生站内告警（权限 trace:read；匿名 401；只读不写库、不发外呼）。宿主 env 定界。常量阈值：
+        BacklogThreshold=100（PENDING>100 → HIGH，>0 且 ≤100 不报）、FailedJobs24hWarn=1 / FailedJobs24hHigh=10
+        （JOBS_FAILED_24H：≥1 MEDIUM，≥10 HIGH）、LeaseRecoveryWarn=1（LEASE_RECOVERED_24H → HIGH）、
+        IncompleteReconWarn=1（RECON_INCOMPLETE_24H → MEDIUM）。另有 CHANNEL_PAUSED（HIGH，每 scope 一条）、
+        RECON_DIFFERENCES_OPEN（MEDIUM，count>0）、RATE_BUDGET_WAITING（MEDIUM，next_allowed_at>now 的预算行数）。
+        无告警 → alerts: []。deepLink 指向站内可达面（/ops、/ops?state=FAILED、/audit、/exceptions?category=RECON）。
+      responses:
+        '200': { description: 告警列表, content: { application/json: { schema: { $ref: '#/components/schemas/OpsAlertsResponse' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
