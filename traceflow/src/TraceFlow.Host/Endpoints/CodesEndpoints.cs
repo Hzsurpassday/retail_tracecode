@@ -19,7 +19,7 @@ public static class CodesEndpoints
 {
     private const int DefaultPageSize = 50;
     private const int MaxPageSize = 100;
-    private const int MinPrefixLength = 4;
+    internal const int MinPrefixLength = 4;
     private const int MaxEvents = 500;
     private const int MaxClaims = 200;
     private const int MaxResults = 200;
@@ -27,11 +27,11 @@ public static class CodesEndpoints
     private const int MaxRelations = 100;
 
     /// <summary>事件类型取值（与 0005 CK_event_type 一致）。</summary>
-    private static readonly string[] EventTypes =
+    internal static readonly string[] EventTypes =
         { "PURCHASE_IN", "SALE", "CONSUMER_RETURN", "PURCHASE_RETURN" };
 
     /// <summary>占用状态筛选取值：ACTIVE=存在激活占用；RELEASED=仅曾释放；NONE=无任何占用。</summary>
-    private static readonly string[] ClaimStateFilters = { "ACTIVE", "RELEASED", "NONE" };
+    internal static readonly string[] ClaimStateFilters = { "ACTIVE", "RELEASED", "NONE" };
 
     public static void MapCodesEndpoints(this WebApplication app, string connectionString, string env)
     {
@@ -80,20 +80,10 @@ public static class CodesEndpoints
 
             // 基础集合 = 满足 q/eventType/from/to 的事件所属 distinct code_id（无事件的码不入列表）。
             // firstEventAt/lastEventAt/eventCount/latestEventType 均基于同一筛选后事件集合。
-            var filters = EventFilters("e", prefix is not null, typeFilter is not null, fromUtc is not null,
+            var baseCte = BaseCte(prefix is not null, typeFilter is not null, fromUtc is not null,
                 toUtc is not null, toExclusive);
             var filtersLatest = EventFilters("e2", prefix is not null, typeFilter is not null,
                 fromUtc is not null, toUtc is not null, toExclusive);
-            var baseCte = $@"
-;WITH ev AS (
-    SELECT e.code_id,
-           MIN(e.occurred_at) AS firstEventAt,
-           MAX(e.occurred_at) AS lastEventAt,
-           COUNT(*) AS eventCount
-    FROM dbo.code_event e
-    WHERE e.org_id=@orgId AND e.env=@env{filters}
-    GROUP BY e.code_id
-)";
             var statePredicate = StatePredicate(stateFilter);
             var total = await conn.ExecuteScalarAsync<int>(new CommandDefinition(
                 $"{baseCte} SELECT COUNT(*) FROM ev WHERE {statePredicate}",
@@ -282,8 +272,26 @@ ORDER BY r.observed_at DESC, r.id DESC",
 
     // ---------------------------------------------------------------- 辅助
 
+    /// <summary>
+    /// 基础集合 CTE（列表与 CSV 导出共用，口径一致）：满足筛选的事件所属 distinct code_id 及聚合。
+    /// </summary>
+    internal static string BaseCte(bool hasPrefix, bool hasType, bool hasFrom, bool hasTo, bool toExclusive)
+    {
+        var filters = EventFilters("e", hasPrefix, hasType, hasFrom, hasTo, toExclusive);
+        return $@"
+;WITH ev AS (
+    SELECT e.code_id,
+           MIN(e.occurred_at) AS firstEventAt,
+           MAX(e.occurred_at) AS lastEventAt,
+           COUNT(*) AS eventCount
+    FROM dbo.code_event e
+    WHERE e.org_id=@orgId AND e.env=@env{filters}
+    GROUP BY e.code_id
+)";
+    }
+
     /// <summary>事件筛选片段（按别名复用：基础集合用 e，最新事件 APPLY 用 e2）。</summary>
-    private static string EventFilters(string alias, bool hasPrefix, bool hasType, bool hasFrom, bool hasTo,
+    internal static string EventFilters(string alias, bool hasPrefix, bool hasType, bool hasFrom, bool hasTo,
         bool toExclusive)
     {
         var sb = new StringBuilder();
@@ -297,7 +305,7 @@ ORDER BY r.observed_at DESC, r.id DESC",
     }
 
     /// <summary>占用状态谓词（作用于 CTE ev）：ACTIVE / RELEASED（无激活且有释放）/ NONE（无任何占用）。</summary>
-    private static string StatePredicate(string? state)
+    internal static string StatePredicate(string? state)
     {
         const string any = "SELECT 1 FROM dbo.code_claim c " +
                            "WHERE c.code_id=ev.code_id AND c.org_id=@orgId AND c.env=@env";
@@ -330,14 +338,14 @@ ORDER BY r.observed_at DESC, r.id DESC",
         return true;
     }
 
-    private static string? ResolveEnv(string? requested, string current)
+    internal static string? ResolveEnv(string? requested, string current)
     {
         if (string.IsNullOrWhiteSpace(requested)) return current;
         var value = requested.Trim().ToUpperInvariant();
         return value is "LIVE" or "MOCK" ? value : null;
     }
 
-    private static bool TryParseDateFrom(string? raw, out DateTime? value)
+    internal static bool TryParseDateFrom(string? raw, out DateTime? value)
     {
         value = null;
         if (string.IsNullOrWhiteSpace(raw)) return true;
@@ -348,7 +356,7 @@ ORDER BY r.observed_at DESC, r.id DESC",
     }
 
     /// <summary>to 仅日期时按「整日包含」转成次日 0 点排他；带时间时按闭区间。</summary>
-    private static bool TryParseDateTo(string? raw, out DateTime? value, out bool exclusive)
+    internal static bool TryParseDateTo(string? raw, out DateTime? value, out bool exclusive)
     {
         value = null;
         exclusive = false;

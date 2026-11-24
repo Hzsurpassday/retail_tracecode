@@ -1963,6 +1963,49 @@ paths:
         '200': { description: 分页审计记录, content: { application/json: { schema: { $ref: '#/components/schemas/PageMeta' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+  /exports/codes.csv:
+    get:
+      x-phase: M4
+      description: '码台账 CSV 导出（权限 data:export，DEF-07/AT-074）。参数与 /codes 一致（q/eventType/from/to/state/env），与列表同一聚合口径与排序（lastEventAt DESC, code_id DESC），不分页全量流式输出。响应 text/csv; charset=utf-8，正文以 UTF-8 BOM 开头、行尾 CRLF；文本单元格一律双引号包裹、内部引号双写，首字符为 = + - @ / TAB / CR 的文本前置单引号防公式注入，事件数走数值列不加前缀；时间列为 UTC ISO（yyyy-MM-ddTHH:mm:ss.fffZ）。列：码,格式,最近事件类型,事件数,最近事件时间,占用状态,占用范围,单号。单次上限 50,000 行，预计超限 → 422 EXPORT_TOO_LARGE（写任何字节前拒绝）。成功导出写审计 data.exported（env 恒 LIVE，object_type=export，object_id=codes）。流式写 Response.Body，不落临时文件；GET 无需 CSRF。'
+      parameters:
+        - { name: q, in: query, schema: { type: string, minLength: 4 }, description: '码前缀（长度 <4 → 400）' }
+        - { name: eventType, in: query, schema: { type: string, enum: [PURCHASE_IN, SALE, CONSUMER_RETURN, PURCHASE_RETURN] }, description: '事件类型（非法值 400）' }
+        - { name: from, in: query, schema: { type: string }, description: 'ISO-8601；code_event.occurred_at >= from' }
+        - { name: to, in: query, schema: { type: string }, description: 'ISO-8601；仅日期按整日包含' }
+        - { name: state, in: query, schema: { type: string, enum: [ACTIVE, RELEASED, NONE] }, description: '占用状态（非法值 400）' }
+        - { name: env, in: query, schema: { type: string, enum: [LIVE, MOCK] }, description: 环境视图；缺省=当前宿主环境（非法值 400） }
+      responses:
+        '200': { description: 'CSV 附件（Content-Disposition: attachment; filename="codes-yyyyMMddHHmmss.csv"）', content: { text/csv: { schema: { type: string } } } }
+        '400': { description: VALIDATION（q 过短/eventType/state/from/to/env 非法）, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { description: 'EXPORT_TOO_LARGE（超过 50,000 行）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /exports/reconciliation-runs/{id}/differences.csv:
+    get:
+      x-phase: M4
+      description: '对账单差异 CSV 导出（权限 data:export，DEF-07/AT-074）。按宿主 env 定界：run.env 必须等于宿主 env，跨环境/不存在一律 404（不暴露另一环境的 run 是否存在）。列：差异类型,严重级,对象,状态,责任角色,下一步,发现时间(UTC ISO),解决证据,解决人,解决时间(UTC ISO)；按 found_at, id 升序；排除 evidence_json（原始证据不外泄）。CSV 规则同上（BOM/CRLF/防公式注入/上限 50,000 行 → 422 EXPORT_TOO_LARGE）。成功导出写审计 data.exported（env 恒 LIVE，object_type=export，object_id=reconciliation-run-{id}-differences）。'
+      parameters: [{ $ref: '#/components/parameters/ResourceId' }]
+      responses:
+        '200': { description: 'CSV 附件（Content-Disposition: attachment; filename="reconciliation-run-{id}-differences-yyyyMMddHHmmss.csv"）', content: { text/csv: { schema: { type: string } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { description: 'EXPORT_TOO_LARGE（超过 50,000 行）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /exports/audit-logs.csv:
+    get:
+      x-phase: M4
+      description: '审计日志 CSV 导出（权限 audit:export，DEF-07/AT-074）。参数与 /audit-logs 一致（action/objectType/objectId/dateStart/dateEnd；全量导出不分页）。列：时间(UTC ISO),环境,操作人,动作,对象类型,对象ID,原因,变更前,变更后；before_digest/after_digest 原样文本经 CSV 防注入处理；按 occurred_at DESC, id DESC；上限 50,000 行 → 422 EXPORT_TOO_LARGE。成功导出写审计 data.exported（env 恒 LIVE，object_type=export，object_id=audit-logs）。'
+      parameters:
+        - { name: action, in: query, schema: { type: string } }
+        - { name: objectType, in: query, schema: { type: string } }
+        - { name: objectId, in: query, schema: { type: string } }
+        - { name: dateStart, in: query, schema: { type: string, format: date } }
+        - { name: dateEnd, in: query, schema: { type: string, format: date } }
+      responses:
+        '200': { description: 'CSV 附件（Content-Disposition: attachment; filename="audit-logs-yyyyMMddHHmmss.csv"）', content: { text/csv: { schema: { type: string } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { description: 'EXPORT_TOO_LARGE（超过 50,000 行）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
   /settings/connections/test:
     post:
       x-phase: M1

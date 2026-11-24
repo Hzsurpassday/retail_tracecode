@@ -179,6 +179,7 @@ if (!workerOnly)
     app.MapUploadEndpoints(connectionString, env);
     app.MapUpstreamEndpoints(connectionString, env);
     app.MapReconciliationEndpoints(connectionString, env);
+    app.MapExportEndpoints(connectionString, env);
     app.MapExceptionsEndpoints(connectionString, env);
     app.MapDashboardEndpoints(connectionString, env);
     app.MapHealthEndpoints(connectionString, env);

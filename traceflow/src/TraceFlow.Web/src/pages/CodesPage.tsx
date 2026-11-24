@@ -102,6 +102,7 @@ export default function CodesPage() {
   const [page, setPage] = useState(1);
   const [data, setData] = useState<ListPage<CodeItem> | null>(null);
   const [error, setError] = useState('');
+  const [exporting, setExporting] = useState(false);
   const [openCode, setOpenCode] = useState<string | null>(null);
   const seqRef = useRef(0);
 
@@ -129,6 +130,44 @@ export default function CodesPage() {
     setEventType(''); setClaimState('');
     setDateFrom(''); setDateTo(''); setEnvFilter('');
     setPage(1); setError('');
+  }
+
+  // CSV 导出（AT-074）：携带当前筛选（含 env），blob 下载；文件名取响应头 Content-Disposition，缺失则本地时间戳。
+  // 导出中禁用按钮；失败统一展示 {code}: {message}（如 EXPORT_TOO_LARGE 提示缩小筛选）。
+  async function exportCsv() {
+    if (exporting) return;
+    const qs = new URLSearchParams();
+    if (prefix) qs.set('q', prefix);
+    if (eventType) qs.set('eventType', eventType);
+    if (claimState) qs.set('state', claimState);
+    if (envFilter) qs.set('env', envFilter);
+    if (dateFrom) qs.set('from', `${dateFrom}T00:00:00+08:00`);
+    if (dateTo) qs.set('to', `${dateTo}T23:59:59.999+08:00`);
+    setExporting(true);
+    try {
+      const resp = await fetch(`/api/v1/exports/codes.csv?${qs.toString()}`, { credentials: 'include' });
+      if (!resp.ok) {
+        const json = await resp.json().catch(() => null) as { code?: string; message?: string } | null;
+        throw new ApiError(resp.status, json?.code ?? `HTTP_${resp.status}`, json?.message ?? '导出失败', false);
+      }
+      const blob = await resp.blob();
+      const disposition = resp.headers.get('Content-Disposition') ?? '';
+      const matched = /filename="?([^";]+)"?/i.exec(disposition);
+      const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = matched ? matched[1] : `codes-${stamp}.csv`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      setError('');
+    } catch (e) {
+      setError(errMsg(e));
+    } finally {
+      setExporting(false);
+    }
   }
 
   const load = useCallback(async () => {
@@ -191,6 +230,9 @@ export default function CodesPage() {
           {ENV_OPTIONS.map((v) => <option key={v} value={v}>{v === '' ? '当前环境' : v}</option>)}
         </select>
         <button onClick={reset}>重置</button>
+        <button onClick={() => void exportCsv()} disabled={exporting}>
+          {exporting ? '导出中…' : '导出 CSV'}
+        </button>
       </div>
       {error && <p role="alert">{error}</p>}
       {data === null ? (error ? null : <p>加载中…</p>) : data.items.length === 0 ? (
