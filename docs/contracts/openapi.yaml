@@ -1841,7 +1841,7 @@ paths:
   /returns/{id}:
     get:
       x-phase: M4
-      description: '（M3 未实现，计划契约）退货任务详情（权限：登录）。M3 的退货展示由 GET /returns 列表（含 predecessorCandidates）与 GET /pos-sales/{id} 销售钻取覆盖；独立退货详情端点留待 M4。'
+      description: '（M3 未实现，计划契约）退货任务详情（权限：登录）。M3 的退货展示由 GET /returns 列表（含 predecessorCandidates）与 GET /pos-sales/{id} 销售钻取覆盖；独立退货详情端点 M4 亦未交付（当前无实现）。'
       parameters: [{ $ref: '#/components/parameters/ResourceId' }]
       responses:
         '200': { description: 退货详情（计划）, content: { application/json: { schema: { type: object, properties: { data: { type: object }, requestId: { type: string } } } } } }
@@ -2013,7 +2013,7 @@ paths:
   /upload-tasks/{id}/retry:
     post:
       x-phase: M4
-      description: '（M3 未实现，计划契约）通用重试。M3 只提供受控重试 POST /upload-tasks/{id}/controlled-retry（合同门禁 fail-closed）；不提供绕过门禁的通用重发入口，本端点仅为 M4 预留，当前无实现且不得用于生产。'
+      description: '（M3 未实现，计划契约）通用重试。M3 只提供受控重试 POST /upload-tasks/{id}/controlled-retry（合同门禁 fail-closed）；不提供绕过门禁的通用重发入口，本端点 M4 亦未实现，且不得用于生产。'
       parameters:
         - { $ref: '#/components/parameters/ResourceId' }
         - { $ref: '#/components/parameters/IdempotencyKey' }

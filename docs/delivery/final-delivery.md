@@ -49,7 +49,7 @@
 | --- | --- |
 | Release 构建 | 0 警告 / 0 错误（`TreatWarningsAsErrors`） |
 | 单元测试 | 322 / 322 |
-| 集成测试 | 490 / 490（默认 collation）+ 490 / 490（BIN2 变体），SQL Server 2019 授权降级 |
+| 集成测试 | 495 / 495（默认 collation）+ 495 / 495（BIN2 变体），SQL Server 2019 授权降级 |
 | 前端 | vitest 29 / 29；`tsc -b && vite build` 通过（53 modules） |
 | 性能基准 | 7 / 7 端点 p95 11.5–134.8 ms（上限 2000 ms，10000 商品 / 100000 销售行，`/returns` 非空） |
 | 备份/恢复演练 | 8 / 8 断言通过；备份 4,575,232 字节（160.1 ms）、恢复 597.2 ms、`DBCC CHECKDB` 无错误；重复 `-Stamp` 拒绝 exit 2 |
