@@ -114,9 +114,12 @@ export default function UploadCenterPage() {
     return () => { active = false; };
   }, []);
 
-  // 销售页“任务链接”钻取：/uploads?taskId=xxx 直接打开抽屉。
+  // 销售页/异常队列“任务链接”钻取：/uploads?taskId=xxx[&env=LIVE|MOCK] 直接按对应环境打开抽屉。
+  // env 必须带入筛选，否则跨环境 id 会按宿主环境详情 404（M4 Task 3 深链）。
   useEffect(() => {
     const fromQuery = searchParams.get('taskId');
+    const fromEnv = searchParams.get('env');
+    if (fromEnv === 'LIVE' || fromEnv === 'MOCK') setEnvFilter(fromEnv);
     if (fromQuery) setOpenId(fromQuery);
     // 仅首次读入查询参数；后续由本地状态控制。
   }, []);

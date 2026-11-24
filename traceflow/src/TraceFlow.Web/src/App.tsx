@@ -13,6 +13,7 @@ import SalesPage from './pages/SalesPage';
 import ReturnsPage from './pages/ReturnsPage';
 import UploadCenterPage from './pages/UploadCenterPage';
 import CodesPage from './pages/CodesPage';
+import ExceptionsPage from './pages/ExceptionsPage';
 import SettingsPage from './pages/SettingsPage';
 
 export default function App() {
@@ -38,6 +39,7 @@ export default function App() {
         <Route path="/returns" element={<ReturnsPage />} />
         <Route path="/uploads" element={<UploadCenterPage />} />
         <Route path="/codes" element={<CodesPage />} />
+        <Route path="/exceptions" element={<ExceptionsPage />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="*" element={<p>该模块在后续阶段交付（见路线图），当前未接入。</p>} />
       </Routes>

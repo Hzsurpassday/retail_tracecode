@@ -1122,6 +1122,74 @@ components:
         code: { type: string }
         relationSource: { type: string }
         observedAt: { type: string, format: date-time }
+    # ---- M4 统一异常队列（spec §4.2） ----
+    ExceptionQueueItem:
+      type: object
+      required: [category, id, status, title, detailSnippet, createdAt]
+      properties:
+        category: { type: string, enum: [INGEST, RECON, TASK, MAPPING] }
+        id: { type: string, description: '类内唯一键：INGEST/RECON/TASK 为十进制 id；MAPPING 为 product:{product_mapping.id} 或 supplier:{supplier_mapping.id}' }
+        status: { type: string, enum: [OPEN, RESOLVED], description: 'TASK/MAPPING 恒 OPEN' }
+        title: { type: string, description: 'INGEST=exception_type；RECON=diff_type；TASK=state；MAPPING=商品映射冲突/供应商映射冲突' }
+        detailSnippet: { type: string, maxLength: 200, description: '去敏原文截断（≤200）：INGEST=detail、RECON=next_action、TASK=state_reason、MAPPING=名称' }
+        objectRef: { type: string, nullable: true, description: 'INGEST=source_document_key；RECON=object_ref；TASK=event_key；MAPPING=spid/dwbh' }
+        createdAt: { type: string, format: date-time, nullable: true, description: 'RECON=found_at；TASK=created_at；MAPPING=product.updated_at（供应商映射无时间列 → null，不臆造）' }
+        env: { type: string, nullable: true, description: 'RECON/TASK 为行 env；INGEST/MAPPING 恒 null' }
+        deepLink: { type: string, nullable: true, description: 'INGEST=/imports；TASK=/uploads?taskId={id}&env={env}；MAPPING=/products 或 /suppliers；RECON=null（详情抽屉即解决面）' }
+    ExceptionQueueCounts:
+      type: object
+      required: [ingestOpen, reconOpen, taskOpen, mappingOpen]
+      properties:
+        ingestOpen: { type: integer, description: 全量 OPEN 计数（不受分页与 status 过滤影响） }
+        reconOpen: { type: integer, description: 宿主 env 作用域内 OPEN 差异数 }
+        taskOpen: { type: integer, description: 'ManualAction/ResultUnresolved/AcceptanceUnknown，宿主 env 作用域' }
+        mappingOpen: { type: integer, description: 'product_mapping + supplier_mapping 的 CONFLICT 数' }
+    ExceptionQueueListResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [items, counts, page, pageSize, total, env]
+          properties:
+            items: { type: array, items: { $ref: '#/components/schemas/ExceptionQueueItem' } }
+            counts: { $ref: '#/components/schemas/ExceptionQueueCounts' }
+            page: { type: integer }
+            pageSize: { type: integer }
+            total: { type: integer }
+            env: { type: string, enum: [LIVE, MOCK], description: 列表作用环境（仅 RECON/TASK 受影响） }
+        requestId: { type: string }
+    ExceptionQueueDetailResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [item, detail]
+          properties:
+            item: { $ref: '#/components/schemas/ExceptionQueueItem' }
+            detail:
+              type: object
+              description: '按类别：INGEST {detailText≤4000, resolutionEvidence, resolvedBy/resolvedAt}；RECON {diffType,severity,objectRef,ownerRole,nextAction,evidence(解析 JSON) 或 evidenceText(超长/非 JSON 时纯文本≤4000),resolutionEvidence 或 resolutionEvidenceText,run{runId,env,windowStart,windowEnd,businessType,status,startedAt,finishedAt}}；TASK {state,stateReason,taskType,eventKey,env,createdAt,version,attempts[≤5]{attemptKind,attemptNo,httpStatus,requestId,startedAt,finishedAt}}（绝不含 raw_response）；MAPPING {side,local,platform,mapping,evidence 或 evidenceText≤4000}'
+        requestId: { type: string }
+    ExceptionResolveRequest:
+      type: object
+      required: [resolutionEvidence]
+      properties:
+        resolutionEvidence: { type: string, description: '留证，必填且 ≤4000 字符' }
+    ExceptionResolveResponse:
+      type: object
+      required: [data, requestId]
+      properties:
+        data:
+          type: object
+          required: [category, id, status, resolvedAt]
+          properties:
+            category: { type: string, enum: [INGEST, RECON] }
+            id: { type: string }
+            status: { type: string, enum: [RESOLVED] }
+            resolvedAt: { type: string, format: date-time }
+        requestId: { type: string }
   responses:
     Unauthorized: { description: 未登录, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
     Forbidden: { description: 无权限, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
@@ -1943,3 +2011,73 @@ paths:
         '200': { description: 预算与暂停, content: { application/json: { schema: { $ref: '#/components/schemas/TopBudgetsResponse' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+  # ================= M4 统一异常队列（spec §4.2） =================
+  /exceptions:
+    get:
+      x-phase: M4
+      description: >
+        统一异常队列（权限 trace:read）。四类聚合：INGEST=ingest_exception（无 env，org 作用域）；
+        RECON=reconciliation_difference JOIN reconciliation_run（env=run.env）；TASK=upload_task 的
+        ManualAction/ResultUnresolved/AcceptanceUnknown（恒 OPEN）；MAPPING=product_mapping/supplier_mapping
+        的 CONFLICT（恒 OPEN）。UNION ALL 后按 createdAt DESC（NULL 置后）、category、id 排序，
+        ROW_NUMBER 区间分页（2008 R2）。counts 为全量 OPEN 计数：不受分页与 status 过滤影响；
+        RECON/TASK 受 env 定界，INGEST/MAPPING 无 env。只读，无副作用。
+      parameters:
+        - { name: category, in: query, schema: { type: string, enum: [INGEST, RECON, TASK, MAPPING] }, description: '非法值 400 VALIDATION（大小写不敏感）' }
+        - { name: status, in: query, schema: { type: string, enum: [OPEN, RESOLVED], default: OPEN }, description: 'TASK/MAPPING 只有 OPEN，RESOLVED 过滤自然为空' }
+        - { $ref: '#/components/parameters/Page' }
+        - { name: pageSize, in: query, schema: { type: integer, minimum: 1, default: 50 }, description: '1..100；>100 收敛为 100' }
+        - { name: env, in: query, schema: { type: string, enum: [LIVE, MOCK] }, description: '仅影响 RECON/TASK；默认宿主 env；非法值 400' }
+      responses:
+        '200': { description: 统一队列分页, content: { application/json: { schema: { $ref: '#/components/schemas/ExceptionQueueListResponse' } } } }
+        '400': { description: 'VALIDATION（category/status/env/page/pageSize 非法）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /exceptions/{category}/{id}:
+    get:
+      x-phase: M4
+      description: >
+        统一队列详情（权限 trace:read）。item 与列表同一行形状；detail 按类别：INGEST 完整 detail（≤4000）；
+        RECON evidence/resolutionEvidence 解析 JSON（超长或非 JSON 时改以 evidenceText 纯文本 ≤4000，截断不产生
+        非法 JSON）+ run 窗口/类型/状态；TASK state/stateReason/taskType/eventKey 与最近 5 次 upload_attempt
+        （attempt_kind/attempt_no/http_status/request_id/started_at/finished_at，不含 raw_response）；
+        MAPPING 本地与平台身份并排 + evidence_json（≤4000）。404 规则：INGEST 按 org；RECON 按 org+宿主 env
+        （跨 env 404）；TASK 按 org+env；MAPPING 仅 state=CONFLICT（已非冲突 → 404）。category 非法 400。
+        任何原始平台响应/密钥不入响应。
+      parameters:
+        - { name: category, in: path, required: true, schema: { type: string, enum: [INGEST, RECON, TASK, MAPPING] } }
+        - { name: id, in: path, required: true, schema: { type: string }, description: 'INGEST/RECON/TASK 十进制 id；MAPPING 为 product:{id} 或 supplier:{id}' }
+        - { name: env, in: query, schema: { type: string, enum: [LIVE, MOCK] }, description: 'RECON/TASK 详情环境；默认宿主 env' }
+      responses:
+        '200': { description: 队列项详情, content: { application/json: { schema: { $ref: '#/components/schemas/ExceptionQueueDetailResponse' } } } }
+        '400': { description: 'VALIDATION（category 非法或 env 非法）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /exceptions/{category}/{id}/resolve:
+    post:
+      x-phase: M4
+      description: >
+        留证关闭（权限 system:manage）。仅 INGEST/RECON 可在此解析：resolutionEvidence 非空且 ≤4000；
+        仅 OPEN→RESOLVED。INGEST 不存在 404、已解决 409 ALREADY_RESOLVED；RECON 与
+        /reconciliation-differences/{id}/resolve 同语义（宿主 env 定界，跨 env 404；已解决 409
+        DIFFERENCE_ALREADY_RESOLVED）。TASK/MAPPING → 422 NOT_RESOLVABLE_VIA_QUEUE，fieldErrors 附 deepLink
+        （处置仍在既有页面）。审计 exception.resolved：object_type=ingest_exception/reconciliation_difference，
+        env=LIVE（控制面人工动作），reason=证据摘要（≤200）。CSRF 与 Idempotency-Key 必填（幂等执行器包裹）。
+      parameters:
+        - { name: category, in: path, required: true, schema: { type: string, enum: [INGEST, RECON, TASK, MAPPING] } }
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: env, in: query, schema: { type: string, enum: [LIVE, MOCK] }, description: '仅用于 TASK 不可解析时的 deepLink 环境；RECON 解析恒按宿主 env' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/CsrfToken' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ExceptionResolveRequest' } } }
+      responses:
+        '200': { description: 已留证关闭, content: { application/json: { schema: { $ref: '#/components/schemas/ExceptionResolveResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: 'ALREADY_RESOLVED / DIFFERENCE_ALREADY_RESOLVED', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: 'VALIDATION（证据为空/超长）或 NOT_RESOLVABLE_VIA_QUEUE（TASK/MAPPING，fieldErrors 附 deepLink）', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
