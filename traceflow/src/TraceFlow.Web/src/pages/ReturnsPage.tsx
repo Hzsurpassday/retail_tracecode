@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
 import { api, ApiError } from '../api';
 import EnvBadge from '../components/EnvBadge';
+import { useEscapeClose } from '../hooks/useEscapeClose';
+import { reasonZh } from '../utils/statusReason';
+import { fmtShanghai } from '../utils/time';
 
 interface ListPage<T> { items: T[]; page: number; pageSize: number; total: number }
 
@@ -44,32 +47,13 @@ const STATE_ZH: Record<string, string> = {
   Processing: '平台处理中', RetryWait: '等待重试', PartialSuccess: '部分成功', ResultUnresolved: '结果未决',
   Succeeded: '成功', Failed: '失败', ManualAction: '需人工核对', Cancelled: '已取消',
 };
-const REASON_ZH: Record<string, string> = {
-  RETURN_CONFIRM_REQUIRED: '待首次人工确认', RETURN_CONFIRM_REJECTED: '人工确认已驳回',
-  RETURN_CONFIRM_REJECTED_SUPERSEDED: '驳回后被新快照撤销', RETURN_CONFIRMED: '已确认（符合资格自动上传）',
-  PREDECESSOR_MISSING: '缺少前序销售事件', PREDECESSOR_AMBIGUOUS: '前序销售事件不唯一',
-  PREDECESSOR_INVALID: '前序事件无效', ALREADY_RETURNED: '该码已退货',
-};
 function errMsg(e: unknown): string { return e instanceof ApiError ? `${e.code}: ${e.message}` : '网络错误'; }
-const SHANGHAI = new Intl.DateTimeFormat('en-US', {
-  timeZone: 'Asia/Shanghai', hourCycle: 'h23',
-  year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
-});
-function fmtShanghai(d: string | null): string {
-  if (!d) return '—';
-  const iso = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(d) ? d : d.length === 10 ? `${d}T00:00:00Z` : `${d}Z`;
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) return d.replace('T', ' ').slice(0, 19);
-  const parts = SHANGHAI.formatToParts(new Date(t));
-  const part = (type: Intl.DateTimeFormatPartTypes): string => parts.find((p) => p.type === type)?.value ?? '';
-  return `${part('year')}-${part('month')}-${part('day')} ${part('hour')}:${part('minute')}:${part('second')}`;
-}
 function isPending(r: ReturnItem): boolean {
   return r.state === 'Blocked' && r.stateReason === 'RETURN_CONFIRM_REQUIRED';
 }
+// 前序候选无异常时展示“唯一前序（可确认）”，异常原因走统一映射（未知码原样）。
 function candidateErrorZh(error: string | null): string {
-  if (!error) return '唯一前序（可确认）';
-  return REASON_ZH[error] ?? error;
+  return reasonZh(error, '唯一前序（可确认）');
 }
 
 export default function ReturnsPage() {
@@ -154,7 +138,7 @@ export default function ReturnsPage() {
                     {r.taskType === 'PURCHASE_RETURN_202' && <div style={{ color: '#8a6d3b', fontSize: 12 }}>采购退货采集未接入（G-ERP）</div>}
                   </td>
                   <td>{STATE_ZH[r.state] ?? r.state}</td>
-                  <td>{r.stateReason ? (REASON_ZH[r.stateReason] ?? r.stateReason) : '—'}</td>
+                  <td>{reasonZh(r.stateReason)}</td>
                   <td>
                     {r.predecessorCandidates.length === 0 ? '—' : (
                       <span title={r.predecessorCandidates.map((c) =>
@@ -231,6 +215,8 @@ function ReturnConfirmDialog({ item, onClose, onDone }: {
   const [busy, setBusy] = useState(false);
   // 同一个对话框内重试沿用同一幂等键：网络重试不会造成第二次确认。
   const [idemKey] = useState(() => crypto.randomUUID());
+  // 弹窗仅在打开时挂载：Esc 复用同一 onClose（父级只清 confirmTarget），不另造关闭路径。
+  useEscapeClose(true, onClose);
 
   // 候选里的前序事件去重（每码唯一前序由服务端复核，前端只做勾选回显）。
   const events: { id: string; codeId: string | null }[] = [];
@@ -284,7 +270,7 @@ function ReturnConfirmDialog({ item, onClose, onDone }: {
         <h3>退货首次人工确认 · 任务 #{item.id}</h3>
         <p>
           {TASK_TYPE_ZH[item.taskType] ?? item.taskType} · 当前版本 {item.version} · 状态 {STATE_ZH[item.state] ?? item.state}
-          （{item.stateReason ? REASON_ZH[item.stateReason] ?? item.stateReason : '—'}）
+          （{reasonZh(item.stateReason)}）
         </p>
         {is202 && <p role="alert" style={{ background: '#fff3cd', padding: 8 }}>采购退货采集未接入（G-ERP）：仅支持服务/测试数据的确认，无真实采集入口。</p>}
         <div style={{ display: 'flex', gap: 16, marginBottom: 8 }}>

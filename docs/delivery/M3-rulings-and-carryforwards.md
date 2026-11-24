@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | R-M3-1 | 执行顺序改为 T1 → T3 → T2 → T4 → T5 → T6 → T7 → T8 → T9 → T10（工厂先于核验服务落地，核验服务才可编译调用）。 | 仅提交顺序不同，可回滚分支重排。 |
 | R-M3-2 | `TopResponseParser` 无 `result` 节点时回退 `model` 作为 ResultJson（M2 fixture 与 billstatus 候选结构均用 `model`）。 | 多一层兼容分支，无害。 |
-| R-M3-3 | 仓库无 vitest 基建时不新增测试依赖，前端以构建 + chrome-devtools 浏览器实测截图作为证据。 | 组件测试覆盖推迟到 M4。 |
+| R-M3-3 | 仓库无 vitest 基建时不新增测试依赖，前端以构建 + chrome-devtools 浏览器实测截图作为证据。 | 组件测试覆盖推迟到 M4。**M4 Task 7 已关闭**：vitest 2.1.9 + RTL 16 + jsdom 25 基建落地，26 个用例（4 个测试文件）全通过，`tsc -b && vite build` 0 错误。 |
 | R-M3-4 | 采购退货 202 只做服务/测试支持 + UI 明示"采购退货采集未接入（G-ERP）"，不伪造采集入口。 | 202 真实采集推迟到 G-ERP 取证后，不影响 116 闭环。 |
 | R-M3-5 | 每个 Task 单独提交、按 Task 边界评审；报告与 brief 存 SDD 工作区。 | 仅多几次评审成本。 |
 | R-M3-6 | 0009 在合并前修订（补索引与校验）并同步更新校验和断言——0009 未发布，0001–0008 不动。 | 仅 0009 一次未发布变更，历史迁移仍逐字节不变。 |
@@ -39,7 +39,7 @@
 - **`ReturnConfirmService` 死分支**：`UQ_retconf_task` 唯一冲突 catch 在插入事务外不可达，极窄竞态会 500 而非 409；M4 加固。
 - **M3 设置键未进 Settings API 目录**：`top.query.*` 等当前只能配置文件/直改库；M4 暴露给运维并补权限与审计。
 - **分片收缩不释放同任务丢弃占用**、`DocPayloadJson` 规范化在核验/工厂两处重复、退货候选 >2100 码未分批：低风险，M4 统一。
-- **前端遗留**：`fmtShanghai` 三处重复、Esc 关闭弹窗、组件测试（R-M3-3 推迟）、202 jobId 后续作业状态页。
+- **前端遗留**：~~`fmtShanghai` 多页重复~~（M4 T7：收敛为 `src/utils/time.ts`，9 页改为导入）、~~Esc 关闭弹窗~~（M4 T7：六个 `role="dialog"` 弹窗接入 `useEscapeClose`）、~~组件测试（R-M3-3 推迟）~~（M4 T7：vitest 26 用例）、~~状态原因文案多源~~（M4 T7：`REASON_ZH` 收敛为 `src/utils/statusReason.ts`）、202 jobId 后续作业状态页（未完成）。
 - **平台回传未知码入台账**（终审 Low7）：codedetail/回查中平台返回的未知码当前不写入 `code_result` 台账，M4 与日对账一并设计（需先确认台账口径）。
 - **`/returns` 列表固定宿主 env**（终审 Low8）：退货列表按宿主 env 过滤、不开放 env 切换，保持现状；M4 若需跨 env 视图再扩展到与 `/pos-sales` 一致。
 - **202 采购退货采集未接入**（G-ERP）；**真实 TOP 取证未完成**（G-TOP）；**2008 R2 实跑未验证**（AT-070）——均不得在 M4 前声称已满足。

@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties } from 're
 import { Link, useSearchParams } from 'react-router-dom';
 import { api, ApiError } from '../api';
 import EnvBadge from '../components/EnvBadge';
+import { useEscapeClose } from '../hooks/useEscapeClose';
+import { fmtShanghai } from '../utils/time';
 
 // 统一异常队列（spec §4.2）：接入异常 / 对账差异 / 上传任务 / 映射冲突四类聚合。
 // 队列只做聚合与跳转：TASK/MAPPING 的处置仍在既有页面，仅 INGEST/RECON 可在此留证关闭。
@@ -91,20 +93,6 @@ const TASK_STATE_ZH: Record<string, string> = {
 };
 
 function errMsg(e: unknown): string { return e instanceof ApiError ? `${e.code}: ${e.message}` : '网络错误'; }
-// 后端 datetime2 出网不带偏移量：无偏移按 UTC 解释，再转 Asia/Shanghai 展示（与既有页面一致）。
-const SHANGHAI = new Intl.DateTimeFormat('en-US', {
-  timeZone: 'Asia/Shanghai', hourCycle: 'h23',
-  year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
-});
-function fmtShanghai(d: string | null): string {
-  if (!d) return '—';
-  const iso = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(d) ? d : d.length === 10 ? `${d}T00:00:00Z` : `${d}Z`;
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) return d.replace('T', ' ').slice(0, 19);
-  const parts = SHANGHAI.formatToParts(new Date(t));
-  const part = (type: Intl.DateTimeFormatPartTypes): string => parts.find((p) => p.type === type)?.value ?? '';
-  return `${part('year')}-${part('month')}-${part('day')} ${part('hour')}:${part('minute')}:${part('second')}`;
-}
 function titleZh(item: QueueItem): string {
   if (item.category === 'INGEST') return INGEST_TYPE_ZH[item.title] ?? item.title;
   if (item.category === 'RECON') return DIFF_TYPE_ZH[item.title] ?? item.title;
@@ -280,6 +268,8 @@ function ExceptionDrawer({ item, onClose, onResolved }: {
   const [evidence, setEvidence] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [idemKey, setIdemKey] = useState(() => crypto.randomUUID());
+  // 抽屉仅在打开时挂载：Esc 复用同一 onClose（父级只清 selected），不另造关闭路径。
+  useEscapeClose(true, onClose);
   const canResolve = (item.category === 'INGEST' || item.category === 'RECON') && item.status === 'OPEN';
 
   useEffect(() => {

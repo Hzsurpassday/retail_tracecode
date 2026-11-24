@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
 import { api, ApiError } from '../api';
 import EnvBadge from '../components/EnvBadge';
+import { useEscapeClose } from '../hooks/useEscapeClose';
+import { reasonZh } from '../utils/statusReason';
+import { fmtShanghai } from '../utils/time';
 
 interface ListPage<T> { items: T[]; page: number; pageSize: number; total: number; env: string }
 
@@ -62,33 +65,11 @@ const TASK_STATE_ZH: Record<string, string> = {
 };
 const DECISION_ZH: Record<string, string> = { CONFIRMED: '已确认', REJECTED: '已驳回' };
 const RELATION_KIND_ZH: Record<string, string> = { SALE: '销售（原销售单）', PURCHASE_IN: '采购入库' };
-const REASON_ZH: Record<string, string> = {
-  PLATFORM_NOT_FOUND: '平台无此码', PLATFORM_REJECTED: '平台拒绝查询', PLATFORM_INSTORE: '平台在店',
-  PLATFORM_UNAVAILABLE: '平台不可用',
-};
-function reasonZh(reason: string | null): string {
-  if (!reason) return '—';
-  return REASON_ZH[reason] ?? reason;
-}
 function stateZh(value: string | null, dict: Record<string, string>): string {
   if (!value) return '—';
   return dict[value] ?? value;
 }
 function errMsg(e: unknown): string { return e instanceof ApiError ? `${e.code}: ${e.message}` : '网络错误'; }
-// 后端 datetime2 出网不带偏移量，无偏移时按 UTC 解释，再转 Asia/Shanghai 显示（与 SalesPage 一致）。
-const SHANGHAI = new Intl.DateTimeFormat('en-US', {
-  timeZone: 'Asia/Shanghai', hourCycle: 'h23',
-  year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
-});
-function fmtShanghai(d: string | null): string {
-  if (!d) return '—';
-  const iso = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(d) ? d : d.length === 10 ? `${d}T00:00:00Z` : `${d}Z`;
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) return d.replace('T', ' ').slice(0, 19);
-  const parts = SHANGHAI.formatToParts(new Date(t));
-  const part = (type: Intl.DateTimeFormatPartTypes): string => parts.find((p) => p.type === type)?.value ?? '';
-  return `${part('year')}-${part('month')}-${part('day')} ${part('hour')}:${part('minute')}:${part('second')}`;
-}
 
 export default function CodesPage() {
   const [env, setEnv] = useState('');
@@ -286,6 +267,8 @@ function CodeDrawer({ code, envFilter, onClose }: {
   const [detail, setDetail] = useState<CodeDetail | null>(null);
   const [error, setError] = useState('');
   const [reloadKey, setReloadKey] = useState(0);
+  // 抽屉仅在打开时挂载：Esc 复用同一 onClose（父级只清 openCode），不另造关闭路径。
+  useEscapeClose(true, onClose);
 
   useEffect(() => {
     let active = true;
